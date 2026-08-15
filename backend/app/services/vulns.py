@@ -10,8 +10,13 @@ def dedupe_by_cve(entries: list[dict]) -> list[dict]:
 
     OSV routinely carries several records for one CVE -- a GHSA and a PYSEC
     entry, say -- and listing both makes an audit look twice as bad as it is.
-    We keep the highest score (worst case wins) but the *lowest* fixed version,
-    because that is the smallest upgrade that resolves it.
+
+    The highest score wins, and so does the **highest** fixed version. Those
+    records can disagree about which release actually fixed the issue: lodash
+    CVE-2021-23337 is filed once as 7.2/fixed-in-4.17.21 and again as
+    8.1/fixed-in-4.18.0. Taking the lowest would advertise 4.17.21 as
+    sufficient and leave the 8.1 variant in place, so the conservative bound is
+    the correct one for a tool people upgrade against.
     """
     def fix_key(value: str | None):
         if not value:
@@ -28,7 +33,9 @@ def dedupe_by_cve(entries: list[dict]) -> list[dict]:
             continue
 
         if (entry.get("cvss_score") or 0) > (current.get("cvss_score") or 0):
-            # Keep the worse score, and the description that goes with it.
+            # Keep the worse score and the description that goes with it. The
+            # fixed version is reconciled separately below, so it must not be
+            # clobbered by whichever record happened to have the higher score.
             fixed = current.get("fixed_version")
             current.update(entry)
             current["fixed_version"] = fixed or entry.get("fixed_version")
@@ -36,7 +43,7 @@ def dedupe_by_cve(entries: list[dict]) -> list[dict]:
         candidate = entry.get("fixed_version")
         existing = current.get("fixed_version")
         if candidate and (
-            not existing or (fix_key(candidate) or ()) < (fix_key(existing) or ())
+            not existing or (fix_key(candidate) or ()) > (fix_key(existing) or ())
         ):
             current["fixed_version"] = candidate
 
@@ -44,3 +51,42 @@ def dedupe_by_cve(entries: list[dict]) -> list[dict]:
         current["suppressed"] = bool(current.get("suppressed")) and bool(entry.get("suppressed"))
 
     return sorted(merged.values(), key=lambda e: e.get("cvss_score") or 0, reverse=True)
+
+
+def lowest_clearing_version(
+    ecosystem: str, cves: list[dict], current_version: str | None = None
+) -> str | None:
+    """The lowest version that resolves every CVE with a known fix.
+
+    Each CVE reports the release that fixed *it*; upgrading has to satisfy all
+    of them at once, so the answer is the highest of those fixes, not the
+    lowest. Returns None when no CVE names a fix -- there is nothing to
+    upgrade to -- or when the current version already clears them all.
+    """
+    fixes = [c["fixed_version"] for c in cves if c.get("fixed_version")]
+    if not fixes:
+        return None
+
+    if ecosystem == "npm":
+        from ..core.naming import sort_semver
+
+        ordered = sort_semver(list({*fixes}))
+    else:
+        from ..core.naming import sort_pypi_versions
+
+        ordered = sort_pypi_versions(list({*fixes}))
+
+    if not ordered:
+        return None
+    target = ordered[-1]
+
+    # Never propose a downgrade or a no-op.
+    if current_version:
+        ranked = (
+            sort_semver([current_version, target])
+            if ecosystem == "npm"
+            else sort_pypi_versions([current_version, target])
+        )
+        if ranked and ranked[-1] == current_version:
+            return None
+    return target

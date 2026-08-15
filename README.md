@@ -50,8 +50,9 @@ Then [read the setup guide](docs/installation.md).
   Enforced on metadata, downloads, and publishes, without exception.
 - **Audits everything.** Every login and admin action is recorded; every
   package request is logged with user, IP, size, and cache outcome.
-- **Ships a CLI** that configures your package managers and audits a project's
-  lockfile against the same CVE data the registry blocks with.
+- **Ships a CLI** that configures your package managers, audits a project's
+  lockfile against the same CVE data the registry blocks with, and can rewrite
+  your dependency declarations to versions that clear the findings.
 
 ---
 

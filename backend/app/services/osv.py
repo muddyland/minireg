@@ -28,7 +28,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..models import Ecosystem, PackageVersion, PackageVulnerability, Vulnerability
+from ..models import Ecosystem, Package, PackageVersion, PackageVulnerability, Vulnerability
 from ..upstreams.base import get_http_client
 
 log = logging.getLogger(__name__)
@@ -416,6 +416,11 @@ class OsvScanner:
                 "severity": v.severity_label,
                 "summary": v.summary,
                 "fixed_version": None,
+                # The full record has to come along: apply_to_version reads the
+                # affected ranges out of it to work out which release fixed the
+                # issue. Omitting it here meant every CVE we had already seen
+                # reported "no fix available", regardless of the truth.
+                "raw": v.raw,
             }
             for v in known
         }
@@ -541,10 +546,56 @@ class OsvScanner:
                 versions_updated += 1
         await self.session.flush()
 
+        # Fixed versions are derived from the same stored records, and were
+        # historically left NULL whenever the CVE was already cached. Recompute
+        # them here so a rescore repairs that too.
+        by_id = {v.id: v for v in rows}
+        links = (await self.session.execute(select(PackageVulnerability))).scalars().all()
+        packages = {
+            p.id: p
+            for p in (
+                await self.session.execute(
+                    select(Package).where(
+                        Package.id.in_(
+                            select(PackageVersion.package_id).where(
+                                PackageVersion.id.in_([link.version_id for link in links] or [0])
+                            )
+                        )
+                    )
+                )
+            ).scalars().all()
+        }
+        versions = {
+            v.id: v
+            for v in (
+                await self.session.execute(
+                    select(PackageVersion).where(
+                        PackageVersion.id.in_([link.version_id for link in links] or [0])
+                    )
+                )
+            ).scalars().all()
+        }
+
+        fixes_updated = 0
+        for link in links:
+            vuln = by_id.get(link.vulnerability_id)
+            version_row = versions.get(link.version_id)
+            if vuln is None or version_row is None or not isinstance(vuln.raw, dict):
+                continue
+            package = packages.get(version_row.package_id)
+            if package is None:
+                continue
+            fixed = fixed_version_for(vuln.raw, package.name, package.ecosystem.value)
+            if fixed != link.fixed_version:
+                link.fixed_version = fixed
+                fixes_updated += 1
+        await self.session.flush()
+
         return {
             "vulnerabilities_examined": len(rows),
             "vulnerabilities_rescored": changed,
             "versions_updated": versions_updated,
+            "fixed_versions_updated": fixes_updated,
         }
 
     # -- persistence -------------------------------------------------------- #

@@ -164,9 +164,17 @@ Two things distinguish this from `npm audit` / `pip-audit`:
 Every lockfile found in the directory is audited, so a project with both npm
 and Python dependencies is covered in one run.
 
-Only pinned versions can be audited. A range like `django>=4.0` has no single
-version to check, so it is skipped and counted in the unscanned total. This is
-why lockfiles give better results than `requirements.txt`.
+Only exactly-pinned versions can be audited. A range like `django>=4.0` has no
+single version to look up, so it is reported as unpinned and excluded — the
+count is always stated, never silently dropped:
+
+```
+scanning requirements.txt (1 packages, pypi, 3 unpinned)
+```
+
+If nothing in the file is pinned, the file is named and the reason given rather
+than skipped in silence. This is why lockfiles give better results than a
+hand-written `requirements.txt`.
 
 ### Failing a build
 
@@ -187,15 +195,76 @@ is set, because they will not install.
 Distinguish `1` from `2` in CI — `1` is a broken pipeline, `2` is a real
 finding.
 
+### Fixing what it finds
+
+```bash
+minireg audit --fix              # propose upgrades, ask before writing
+minireg audit --fix --dry-run    # show them and stop
+minireg audit --fix --yes        # write without asking
+```
+
+```
+  Remediation
+
+    ./package.json
+      lodash  ^4.17.20 -> ^4.18.0
+      minimist  ~1.2.5 -> ~1.2.6
+
+  Write these changes? [y/N]
+```
+
+What it edits:
+
+| Audited | Edited | Why |
+|---|---|---|
+| `package-lock.json` | `package.json` | The lock is generated output; raising the declared floor is what stops the next `npm install` regenerating a vulnerable lock |
+| `requirements.txt` | `requirements.txt` | The pins are the declaration |
+
+Then regenerate the lockfile — `npm install`, or `pip install -r requirements.txt` — so the change takes effect.
+
+**The target version clears every CVE, not just one.** Each advisory reports
+the release that fixed *it*, and an upgrade has to satisfy all of them at once,
+so the chosen version is the highest of those fixes. Where OSV files the same
+CVE twice with different fixes — lodash CVE-2021-23337 is recorded both as
+7.2/fixed-in-4.17.21 and 8.1/fixed-in-4.18.0 — the higher bound wins. Choosing
+the lower one would leave the more severe variant in place.
+
+**It checks its own suggestion.** Before writing, the proposed versions are
+audited too, and anything still affected is reported:
+
+```
+    after upgrading, these would still have findings:
+      some-package@2.1.0 CVSS 7.5
+```
+
+A CVE's "fixed in" only speaks for that CVE; the release it points at can carry
+others of its own.
+
+What it will not touch:
+
+- Declarations that are not version ranges — `workspace:*`, `git+https://…`,
+  `file:…` — reported as skipped.
+- A `requirements.txt` containing `--hash=` pins. Changing a version
+  invalidates every recorded hash and they cannot be recomputed without
+  downloading the artifacts; regenerate with pip-compile instead.
+- Packages with no published fix, listed as `no fix` so they are visible rather
+  than quietly absent.
+
+Comments, environment markers, spacing, key order and indentation are all
+preserved — the edit changes version tokens and nothing else.
+
 ### Other flags
 
 ```bash
 minireg audit --json       # machine readable
 minireg audit --offline    # do not scan packages the registry has not seen
+minireg audit --refresh    # re-query OSV even for versions already scanned
 ```
 
 `--offline` is instant but blind to anything this registry has never served.
-Without it, unknown packages are scanned against OSV on demand.
+Without it, anything the registry lacks CVE data for is looked up on demand —
+including packages it has mirrored but not yet scanned, which is the normal
+state of a new registry.
 
 ---
 
@@ -243,6 +312,7 @@ for a person and a pipeline with no branching.
 | `whoami` | Show the current identity and scopes |
 | `configure [npm\|pip\|all]` | Point package managers at the registry |
 | `audit [path]` | Check dependencies for CVEs |
+| `audit --fix` | Rewrite declarations to versions that clear them |
 | `search <query>` | Search the index |
 | `info <package>` | Show a package |
 

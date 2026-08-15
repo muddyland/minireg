@@ -441,21 +441,50 @@ def parse_package_lock(path: Path) -> list[dict]:
     return [{"name": n, "version": v} for n, v in found]
 
 
+#: Requirement lines that named a package but no exact version. Reported rather
+#: than dropped -- a requirements.txt full of ranges used to audit as "1 package
+#: found", which reads exactly like the file was ignored.
+UNPINNED: dict[Path, list[str]] = {}
+
+# `==` and `===` (arbitrary equality). The `(?!=)` stops `===1.0` being read as
+# `==` followed by a version of "=1.0".
+_PIN_RE = re.compile(
+    r"^(?P<name>[A-Za-z0-9._-]+)\s*(?:\[[^\]]*\])?\s*===?(?!=)\s*(?P<version>[^\s;#]+)"
+)
+_NAMED_RE = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)\s*(?:\[[^\]]*\])?\s*(?P<rest>.*)$")
+
+
 def parse_requirements(path: Path) -> list[dict]:
-    """requirements.txt, pinned entries only -- a range has no single version
-    to audit."""
+    """requirements.txt.
+
+    Only exactly-pinned entries can be audited: a range like ``>=2.0`` has no
+    single version to look up. Anything named but unpinned is recorded in
+    UNPINNED so the caller can say so out loud.
+    """
     out = []
+    unpinned = []
     try:
         lines = path.read_text().splitlines()
     except OSError:
         return out
-    for line in lines:
-        line = line.split("#", 1)[0].strip()
-        if not line or line.startswith("-"):
+
+    for raw in lines:
+        line = raw.split("#", 1)[0].strip().rstrip("\\").strip()
+        # Options (-r, -e, --hash continuation lines) and URL requirements are
+        # not version pins.
+        if not line or line.startswith("-") or "://" in line:
             continue
-        match = re.match(r"^([A-Za-z0-9._-]+)\s*(?:\[[^\]]*\])?\s*==\s*([^\s;]+)", line)
-        if match:
-            out.append({"name": match.group(1), "version": match.group(2)})
+
+        pin = _PIN_RE.match(line)
+        if pin:
+            out.append({"name": pin.group("name"), "version": pin.group("version")})
+            continue
+
+        named = _NAMED_RE.match(line)
+        if named and named.group("rest").lstrip()[:1] in ("", "<", ">", "~", "!", "="):
+            unpinned.append(line)
+
+    UNPINNED[path] = unpinned
     return out
 
 
@@ -505,13 +534,17 @@ SEVERITY_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
 def discover(root: Path) -> list[tuple[Path, str, list[dict]]]:
+    """Every dependency file we recognise, including ones that yielded nothing.
+
+    A file that parsed to zero packages is still reported: dropping it silently
+    is indistinguishable from not supporting the format, and the caller needs to
+    explain *why* it found nothing.
+    """
     found = []
     for filename, ecosystem, parser in LOCKFILES:
         path = root / filename
         if path.is_file():
-            packages = parser(path)
-            if packages:
-                found.append((path, ecosystem, packages))
+            found.append((path, ecosystem, parser(path)))
     return found
 
 
@@ -531,17 +564,47 @@ def cmd_audit(args):
 
     if not sources:
         die(
-            f"no lockfile found in {root}\n"
+            f"no dependency file found in {root}\n"
             f"  looked for: {', '.join(name for name, _, _ in LOCKFILES)}"
         )
 
     total_findings = []
     worst = 0.0
     exit_blocked = False
+    per_source: list[tuple[Path, str, list[dict]]] = []
 
     for path, ecosystem, packages in sources:
         rel = path.name
-        info(f"{dim('scanning')} {bold(rel)} {dim(f'({len(packages)} packages, {ecosystem})')}")
+        unpinned = UNPINNED.get(path, [])
+
+        if not packages:
+            # Recognised the file, got nothing auditable out of it. Say so --
+            # staying quiet here reads as "the file was ignored".
+            info(f"{dim('skipping')} {bold(rel)} {dim('— no exactly-pinned versions')}")
+            if unpinned:
+                info(
+                    dim(
+                        f"  {len(unpinned)} requirement(s) specify a range, which has no "
+                        "single version to audit."
+                    )
+                )
+                for entry in unpinned[:5]:
+                    info(dim(f"    {entry}"))
+                if len(unpinned) > 5:
+                    info(dim(f"    … and {len(unpinned) - 5} more"))
+                info(
+                    dim(
+                        "  Generate a lockfile (pip-compile, poetry, uv) or pin with '==' "
+                        "to audit these."
+                    )
+                )
+            continue
+
+        suffix = f", {len(unpinned)} unpinned" if unpinned else ""
+        info(
+            f"{dim('scanning')} {bold(rel)} "
+            f"{dim(f'({len(packages)} packages, {ecosystem}{suffix})')}"
+        )
 
         try:
             result = api(
@@ -560,6 +623,7 @@ def cmd_audit(args):
 
         findings = result.get("findings") or []
         total_findings.extend(findings)
+        per_source.append((path, ecosystem, findings))
 
         if args.json:
             continue
@@ -606,10 +670,19 @@ def cmd_audit(args):
                     + (" (offline mode)" if args.offline else "")
                 )
             )
+        if unpinned:
+            info(
+                dim(
+                    f"  {len(unpinned)} unpinned requirement(s) in {rel} were not audited"
+                )
+            )
 
     if args.json:
         print(json.dumps({"findings": total_findings}, indent=2))
         return 0
+
+    if args.fix:
+        apply_fixes(args, registry, token, root, per_source)
 
     blocked = [f for f in total_findings if f.get("blocked")]
     parts = [f"{len(total_findings)} package(s) with findings"]
@@ -631,6 +704,233 @@ def cmd_audit(args):
         if exit_blocked:
             return 2
     return 0
+
+
+
+# --------------------------------------------------------------------------- #
+# --fix: rewrite dependency declarations to versions that clear the CVEs
+# --------------------------------------------------------------------------- #
+# Which file to edit for each ecosystem. For npm we audit the lockfile but edit
+# package.json: raising the declared floor is what stops `npm install`
+# regenerating a vulnerable lock, and the lockfile itself is generated output.
+FIX_TARGETS = {"npm": "package.json", "pypi": None}
+
+_REQ_PIN_RE = re.compile(
+    r"^(?P<lead>\s*)(?P<name>[A-Za-z0-9._-]+)(?P<extras>\s*\[[^\]]*\])?"
+    r"(?P<space>\s*)(?P<op>===?)(?P<gap>\s*)(?P<version>[^\s;#]+)(?P<rest>.*)$"
+)
+# Keep the operator the declaration already used, so a project's convention
+# survives the edit.
+_NPM_RANGE_RE = re.compile(r"^(?P<op>[\^~]|>=|>)?(?P<version>\d.*)$")
+
+
+def normalize_key(ecosystem: str, name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower() if ecosystem == "pypi" else name.lower()
+
+
+def plan_requirements_fix(path: Path, fixes: dict) -> tuple[str, list[str]]:
+    """Return the rewritten requirements.txt and a description of each change."""
+    original = path.read_text()
+    changes = []
+    out = []
+
+    for line in original.splitlines(keepends=True):
+        stripped = line.split("#", 1)[0].strip()
+        match = _REQ_PIN_RE.match(stripped) if stripped else None
+        if match is None:
+            out.append(line)
+            continue
+
+        target = fixes.get(normalize_key("pypi", match.group("name")))
+        if not target or target == match.group("version"):
+            out.append(line)
+            continue
+
+        old_pin = f"{match.group('op')}{match.group('gap')}{match.group('version')}"
+        new_pin = f"{match.group('op')}{match.group('gap')}{target}"
+        # Replace only the version token, so comments, markers and spacing
+        # survive untouched.
+        out.append(line.replace(old_pin, new_pin, 1))
+        changes.append(f"{match.group('name')}  {match.group('version')} -> {target}")
+
+    return "".join(out), changes
+
+
+def plan_package_json_fix(path: Path, fixes: dict) -> tuple[str, list[str], list[str]]:
+    """Rewrite package.json dependency ranges. Returns (text, changes, skipped)."""
+    original = path.read_text()
+    try:
+        data = json.loads(original)
+    except json.JSONDecodeError:
+        return original, [], ["package.json is not valid JSON"]
+
+    changes, skipped = [], []
+    text = original
+
+    for section in (
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ):
+        for name, spec in (data.get(section) or {}).items():
+            target = fixes.get(normalize_key("npm", name))
+            if not target or not isinstance(spec, str):
+                continue
+
+            match = _NPM_RANGE_RE.match(spec.strip())
+            if match is None:
+                # A tag, git URL or file: path -- not something we can safely
+                # bump by rewriting a version number.
+                skipped.append(f"{name} ({spec})")
+                continue
+            if match.group("version") == target:
+                continue
+
+            new_spec = f"{match.group('op') or ''}{target}"
+            # Edit the raw text rather than re-serialising, so key order,
+            # indentation and any trailing newline are preserved exactly.
+            needle = f'"{name}": "{spec}"'
+            if needle not in text:
+                skipped.append(f"{name} (could not locate its declaration)")
+                continue
+            text = text.replace(needle, f'"{name}": "{new_spec}"', 1)
+            changes.append(f"{name}  {spec} -> {new_spec}")
+
+    return text, changes, skipped
+
+
+def render_diff(path: Path, before: str, after: str) -> str:
+    import difflib
+
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=str(path),
+            tofile=f"{path} (proposed)",
+            n=1,
+        )
+    )
+
+def apply_fixes(args, registry, token, root: Path, per_source) -> None:
+    """Propose (and optionally write) dependency bumps that clear the CVEs."""
+    print()
+    print(f"  {bold('Remediation')}")
+
+    planned = []
+    for path, ecosystem, findings in per_source:
+        fixable = {
+            normalize_key(ecosystem, f["name"]): f["fix_version"]
+            for f in findings
+            if f.get("fix_version")
+        }
+        unfixable = [f for f in findings if f.get("cves") and not f.get("fix_version")]
+
+        target_name = FIX_TARGETS.get(ecosystem)
+        target = (path.parent / target_name) if target_name else path
+
+        if not fixable:
+            if findings:
+                print(f"    {dim(path.name)}: nothing with a published fix")
+            continue
+        if not target.is_file():
+            info(f"    {yellow('skip')} {path.name}: {target.name} not found next to it")
+            continue
+
+        before = target.read_text()
+        if target.name == "package.json":
+            after, changes, skipped = plan_package_json_fix(target, fixable)
+        else:
+            if "--hash=" in before:
+                # Editing a version invalidates every recorded hash, and we
+                # cannot recompute them without downloading the artifacts.
+                info(
+                    f"    {yellow('skip')} {target.name}: it pins hashes; "
+                    "regenerate it with pip-compile instead"
+                )
+                continue
+            after, changes = plan_requirements_fix(target, fixable)
+            skipped = []
+
+        for entry in skipped:
+            info(dim(f"    could not rewrite {entry}"))
+        if not changes:
+            print(f"    {dim(target.name)}: already at or above the fixed versions")
+            continue
+
+        planned.append((target, before, after, changes, ecosystem, fixable))
+        for entry in unfixable:
+            print(f"    {red('no fix')} {entry['name']}@{entry['version']}")
+
+    if not planned:
+        print(f"    {dim('nothing to change')}")
+        return
+
+    for target, _before, _after, changes, _eco, _fixes in planned:
+        print(f"\n    {bold(str(target))}")
+        for entry in changes:
+            print(f"      {green(entry)}")
+
+    # Say whether the proposed versions are actually clean. A CVE's "fixed in"
+    # only speaks for that CVE; the target release can carry others.
+    residual = verify_fixes(registry, token, planned, args)
+    if residual:
+        print()
+        print(f"    {yellow('after upgrading, these would still have findings:')}")
+        for name, version, score in residual:
+            marker = f" CVSS {score:.1f}" if score else ""
+            print(f"      {name}@{version}{marker}")
+
+    if args.dry_run:
+        info(dim("\n  (dry run — nothing written)"))
+        return
+
+    if not args.yes:
+        print()
+        try:
+            answer = input("  Write these changes? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            info(dim("  Not written."))
+            return
+
+    for target, _before, after, changes, _eco, _fixes in planned:
+        target.write_text(after)
+        print(f"  {green('✓')} wrote {target} ({len(changes)} change(s))")
+
+    info(
+        dim(
+            "\n  Regenerate your lockfile so the change takes effect: "
+            "`npm install` or `pip install -r requirements.txt`."
+        )
+    )
+
+
+def verify_fixes(registry, token, planned, args):
+    """Re-audit the proposed versions and report anything still affected."""
+    residual = []
+    for _target, _before, _after, _changes, ecosystem, fixes in planned:
+        packages = [{"name": name, "version": version} for name, version in fixes.items()]
+        if not packages:
+            continue
+        try:
+            result = api(
+                registry,
+                "/api/cli/audit",
+                "POST",
+                {"ecosystem": ecosystem, "packages": packages, "scan_unknown": True},
+                token=token,
+                timeout=180,
+                insecure=args.insecure,
+            )
+        except ApiError:
+            # Verification is a courtesy; failing it should not block the fix.
+            return []
+        for finding in result.get("findings") or []:
+            residual.append((finding["name"], finding["version"], finding.get("max_cvss")))
+    return residual
 
 
 # --------------------------------------------------------------------------- #
@@ -780,6 +1080,17 @@ def build_parser() -> argparse.ArgumentParser:
     audit_cmd.add_argument("--json", action="store_true", help="machine-readable output")
     audit_cmd.add_argument(
         "--offline", action="store_true", help="do not scan packages the registry has not seen"
+    )
+    audit_cmd.add_argument(
+        "--fix",
+        action="store_true",
+        help="rewrite requirements.txt / package.json to versions that clear the CVEs",
+    )
+    audit_cmd.add_argument(
+        "--yes", action="store_true", help="apply --fix without confirming"
+    )
+    audit_cmd.add_argument(
+        "--dry-run", action="store_true", help="with --fix, show the changes without writing"
     )
     audit_cmd.set_defaults(func=cmd_audit)
 

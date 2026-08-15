@@ -46,9 +46,9 @@ from ..models import (
     Vulnerability,
 )
 from ..services import audit
-from ..services.osv import OsvScanner
+from ..services.osv import OsvScanner, fixed_version_for
 from ..services.policy import PolicyEngine
-from ..services.vulns import dedupe_by_cve
+from ..services.vulns import dedupe_by_cve, lowest_clearing_version
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/cli", tags=["cli"])
@@ -60,6 +60,10 @@ USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no I/O/0/1
 USER_CODE_LEN = 8
 DEVICE_CODE_TTL = timedelta(minutes=10)
 POLL_INTERVAL_SECONDS = 3
+
+# Cap on how many versions one audit will look up, so a monorepo lockfile
+# cannot turn into a multi-thousand-request storm against OSV.
+MAX_ON_DEMAND_SCAN = 500
 
 def _find_cli_source() -> Path | None:
     """Locate the bundled CLI.
@@ -374,9 +378,12 @@ class AuditItem(BaseModel):
 class AuditRequest(BaseModel):
     ecosystem: Ecosystem
     packages: list[AuditItem] = Field(default_factory=list, max_length=4000)
-    #: Scan anything we have not seen before. Off makes the call instant but
-    #: silently blind to packages this registry has never served.
+    #: Look up anything we lack CVE data for. Off makes the call instant but
+    #: blind to anything not already scanned.
     scan_unknown: bool = True
+    #: Re-query OSV even for versions already scanned. Slower; use when you
+    #: need today's advisories rather than the registry's last refresh.
+    refresh: bool = False
 
 
 @router.post("/audit")
@@ -415,21 +422,41 @@ async def audit_packages(
     for package, version in rows:
         known[(package.normalized_name, version.version)] = (package, version)
 
-    # Anything we have never resolved gets scanned on demand, so an audit of a
-    # project that pulls from elsewhere is still meaningful.
-    missing = [
-        (item.name, item.version)
-        for key, item in wanted.items()
-        if key not in known
-    ]
+    # Look up anything we do not already hold CVE data for -- which is *not* the
+    # same as "anything the registry has never seen". Proxying a package creates
+    # its version rows long before anything scans them, so treating "known" as
+    # "scanned" silently reported freshly mirrored packages as clean. That made
+    # an audit against a new registry return nothing at all.
+    scanner = OsvScanner(session)
+    to_scan: list[tuple[str, str]] = []
+    for key, item in wanted.items():
+        entry = known.get(key)
+        needs_lookup = (
+            entry is None or entry[1].scanned_at is None or payload.refresh
+        )
+        if needs_lookup:
+            to_scan.append((item.name, item.version))
+
     scanned_now: dict[tuple[str, str], object] = {}
-    if missing and payload.scan_unknown:
+    if to_scan and payload.scan_unknown:
         try:
-            scanned_now = await OsvScanner(session).scan_versions(
-                ecosystem, missing[:500]
-            )
+            scanned_now = await scanner.scan_versions(ecosystem, to_scan[:MAX_ON_DEMAND_SCAN])
         except Exception:
             log.warning("on-demand audit scan failed", exc_info=True)
+        else:
+            # Persist against the rows we do have, so the next audit is a
+            # database read rather than another round trip to OSV.
+            persisted = False
+            for key, entry in known.items():
+                item = wanted.get(key)
+                if item is None:
+                    continue
+                result = scanned_now.get((item.name, item.version))
+                if result is not None and getattr(result, "scanned", False):
+                    await scanner.apply_to_version(entry[1], result, entry[0].name)
+                    persisted = True
+            if persisted:
+                await session.commit()
 
     version_ids = [v.id for _p, v in known.values()]
     cve_rows = []
@@ -480,19 +507,26 @@ async def audit_packages(
             if result is not None and getattr(result, "scanned", False):
                 scanned = True
                 max_cvss = result.max_score
-                cves = [
-                    {
-                        "cve_id": c.get("cve_id"),
-                        "osv_id": c.get("id"),
-                        "cvss_score": c.get("cvss_score"),
-                        "severity": c.get("severity"),
-                        "summary": c.get("summary"),
-                        "fixed_version": None,
-                        "suppressed": False,
-                        "url": f"https://osv.dev/vulnerability/{c.get('id')}",
-                    }
-                    for c in result.cves
-                ]
+                cves = dedupe_by_cve(
+                    [
+                        {
+                            "cve_id": c.get("cve_id"),
+                            "osv_id": c.get("id"),
+                            "cvss_score": c.get("cvss_score"),
+                            "severity": c.get("severity"),
+                            "summary": c.get("summary"),
+                            # "fixed in X" is the most actionable part of a
+                            # finding, so dig it out of the raw OSV record
+                            # rather than reporting None.
+                            "fixed_version": fixed_version_for(
+                                c.get("raw") or {}, item.name, ecosystem.value
+                            ),
+                            "suppressed": False,
+                            "url": f"https://osv.dev/vulnerability/{c.get('id')}",
+                        }
+                        for c in result.cves
+                    ]
+                )
 
         if not scanned:
             unscanned.append({"name": item.name, "version": item.version})
@@ -502,17 +536,21 @@ async def audit_packages(
         )
 
         if cves or verdict.blocked:
+            ordered_cves = sorted(cves, key=lambda c: c.get("cvss_score") or 0, reverse=True)
+            fix_version = lowest_clearing_version(ecosystem.value, ordered_cves, item.version)
             findings.append(
                 {
                     "name": item.name,
                     "version": item.version,
                     "max_cvss": max_cvss,
-                    "cves": sorted(
-                        cves, key=lambda c: c.get("cvss_score") or 0, reverse=True
-                    ),
+                    "cves": ordered_cves,
                     "blocked": verdict.blocked,
                     "block_reason": verdict.reason,
                     "known_to_registry": entry is not None,
+                    # The lowest release that clears every CVE with a known
+                    # fix, or None when nothing upstream fixes them yet.
+                    "fix_version": fix_version,
+                    "fixable": fix_version is not None,
                 }
             )
 
