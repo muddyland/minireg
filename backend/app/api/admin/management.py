@@ -491,7 +491,7 @@ async def index_upstream(
 
     try:
         names = await provider.list_packages()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=f"indexing failed: {exc}"
         ) from exc
@@ -624,7 +624,7 @@ def _expand_spec(ecosystem: Ecosystem | None, spec: str | None) -> str | None:
         return None
     try:
         return str(parse_range(spec)) if is_valid_range(spec) else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 

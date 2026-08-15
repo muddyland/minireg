@@ -6,6 +6,8 @@ passing run means our ranges agree with npm's on the cases npm itself
 regression-tests.
 """
 
+import itertools
+
 import pytest
 
 from app.core.semver import (
@@ -58,7 +60,7 @@ class TestPrecedence:
             "1.0.0-rc.1",
             "1.0.0",
         ]
-        for lower, higher in zip(ordered, ordered[1:], strict=False):
+        for lower, higher in itertools.pairwise(ordered):
             assert compare(lower, higher) == -1, f"{lower} should sort below {higher}"
 
     def test_numeric_identifiers_compare_numerically(self):

@@ -7,6 +7,7 @@ slows the registry down but never takes it offline.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Any
 
@@ -71,26 +72,22 @@ async def cache_get_json(key: str) -> Any | None:
 async def cache_set_json(key: str, value: Any, ttl: int) -> None:
     if _redis is None:
         return
-    try:
+    with contextlib.suppress(Exception):
         await _redis.set(key, orjson.dumps(value), ex=ttl)
-    except Exception:
-        pass
 
 
 async def cache_delete(*keys: str) -> None:
     if _redis is None or not keys:
         return
-    try:
+    with contextlib.suppress(Exception):
         await _redis.delete(*keys)
-    except Exception:
-        pass
 
 
 async def cache_delete_prefix(prefix: str) -> None:
     """Drop every key under a prefix. Uses SCAN so it never blocks Redis."""
     if _redis is None:
         return
-    try:
+    with contextlib.suppress(Exception):
         cursor = 0
         while True:
             cursor, keys = await _redis.scan(cursor=cursor, match=f"{prefix}*", count=500)
@@ -98,8 +95,6 @@ async def cache_delete_prefix(prefix: str) -> None:
                 await _redis.delete(*keys)
             if cursor == 0:
                 break
-    except Exception:
-        pass
 
 
 class herd_guard:
@@ -116,7 +111,7 @@ class herd_guard:
         self._local = _local_locks.setdefault(self.key, asyncio.Lock())
         self._held_remote = False
 
-    async def __aenter__(self) -> "herd_guard":
+    async def __aenter__(self) -> herd_guard:
         await self._local.acquire()
         if _redis is not None:
             try:
@@ -131,10 +126,8 @@ class herd_guard:
 
     async def __aexit__(self, *exc) -> None:
         if self._held_remote and _redis is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await _redis.delete(self.key)
-            except Exception:
-                pass
         self._local.release()
 
 

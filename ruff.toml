@@ -1,0 +1,40 @@
+# Repo-wide lint configuration.
+#
+# This lives at the root rather than in backend/pyproject.toml because ruff
+# resolves configuration per file by searching upward: a config nested under
+# backend/ would not apply to cli/, which would then be linted with default
+# rules and silently diverge.
+
+line-length = 110
+target-version = "py312"
+
+# Where first-party packages live. Without this, `app` and `tests` resolve as
+# third-party from the repo root and import sorting fights itself depending on
+# which directory ruff was invoked from.
+src = ["backend", "."]
+
+[lint]
+select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "RUF"]
+ignore = [
+    # The line-length cap above already governs code; E501 additionally flags
+    # spec URLs and references in comments that are not worth wrapping.
+    "E501",
+]
+
+[lint.per-file-ignores]
+# Tests import app modules inside functions on purpose, so the database
+# fixture is configured before the module under test loads.
+"backend/tests/*" = ["E402"]
+
+[lint.flake8-bugbear]
+# FastAPI's dependency injection *requires* a call in the default argument --
+# `Depends(get_session)` is the documented idiom, not a mutable-default bug.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Form",
+    "fastapi.File",
+]

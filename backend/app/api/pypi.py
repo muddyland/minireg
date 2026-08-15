@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 
 import orjson
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -350,7 +350,7 @@ async def upload(
 ) -> Response:
     try:
         form = await request.form()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return upload_error("could not parse the multipart form", status.HTTP_400_BAD_REQUEST)
 
     upload_file = form.get("content")
@@ -363,7 +363,7 @@ async def upload(
 
     # Collapse the multi-dict, preserving repeated keys as lists.
     fields: dict = {}
-    for key in form.keys():
+    for key in form:
         if key == "content":
             continue
         values = form.getlist(key)
@@ -577,7 +577,7 @@ async def _forward_to_publish_targets(
             ok, message = await provider.publish(payload, "pypi")
             if not ok:
                 log.warning("mirror upload to %s failed: %s", upstream.name, message)
-        except Exception:  # noqa: BLE001 - mirroring must not fail the upload
+        except Exception:
             log.exception("mirror upload to %s raised", upstream.name)
 
 
@@ -601,7 +601,7 @@ async def _scan_new_versions(session: AsyncSession, package: Package) -> None:
         results = await scanner.scan_versions(
             ECOSYSTEM, [(package.name, v.version) for v in targets]
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.debug("inline scan batch failed for %s", package.name, exc_info=True)
         return
     for version_row in targets:

@@ -105,7 +105,7 @@ def _vector_parts(vector: str) -> dict[str, str]:
 
 def _round_up(value: float) -> float:
     """CVSS 3.1 Appendix A roundup, done in integer space to dodge float error."""
-    integer = int(round(value * 100000))
+    integer = round(value * 100000)
     if integer % 10000 == 0:
         return integer / 100000.0
     return (int(integer / 10000) + 1) / 10.0
@@ -128,7 +128,10 @@ def _cvss3_base(vector: str) -> float | None:
         return None
 
     iss = 1 - ((1 - conf) * (1 - integ) * (1 - avail))
-    if scope_changed:
+    # Kept as a branch rather than a ternary: these are the two impact
+    # sub-formulas from the CVSS 3.1 specification, and side by side they can
+    # be checked against it line for line.
+    if scope_changed:  # noqa: SIM108
         impact = 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.02) ** 15)
     else:
         impact = 6.42 * iss
@@ -621,7 +624,7 @@ async def inline_scan(
     except (TimeoutError, asyncio.CancelledError):
         log.info("inline OSV scan timed out for %s@%s", package_name, version)
         return ScanResult(None, package_name, version, scanned=False)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.warning("inline OSV scan failed for %s@%s: %s", package_name, version, exc)
         return ScanResult(None, package_name, version, scanned=False)
     return results.get(

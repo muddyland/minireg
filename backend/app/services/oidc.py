@@ -79,7 +79,7 @@ async def get_discovery() -> dict:
     client = get_http_client()
     try:
         response = await client.get(url, timeout=10.0)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise OidcError(f"could not reach the OIDC discovery endpoint: {exc}") from exc
     if response.status_code != 200:
         raise OidcError(f"OIDC discovery returned HTTP {response.status_code}")
@@ -140,7 +140,7 @@ async def exchange_code(code: str, redirect_uri: str, verifier: str) -> dict:
 
     try:
         response = await client.post(discovery["token_endpoint"], data=data, timeout=15.0)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise OidcError(f"token exchange failed: {exc}") from exc
 
     if response.status_code != 200:
@@ -191,7 +191,7 @@ async def fetch_userinfo(access_token: str) -> dict:
         if response.status_code != 200:
             return {}
         return response.json()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return {}
 
 

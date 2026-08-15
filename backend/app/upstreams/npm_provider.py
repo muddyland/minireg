@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
 from ..core.naming import npm_name_to_path
 from .base import (
@@ -49,7 +49,7 @@ class NpmProvider(UpstreamProvider):
         return f"{self.base_url}/{npm_name_to_path(name)}"
 
     #: Hosts whose web UI we can address without being told.
-    PUBLIC_WEB = {
+    PUBLIC_WEB: ClassVar[dict[str, str]] = {
         "registry.npmjs.org": "https://www.npmjs.com/package/{name}",
         "registry.yarnpkg.com": "https://www.npmjs.com/package/{name}",
     }

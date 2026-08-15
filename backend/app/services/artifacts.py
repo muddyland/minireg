@@ -22,7 +22,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from ..core.cache import herd_guard
 from ..models import Blob, PackageFile, Upstream
-from ..upstreams.base import UpstreamError
 from .resolver import build_provider
 from .storage import get_store
 
@@ -123,11 +122,13 @@ def _verify_digests(file_row: PackageFile, stored) -> None:
             except Exception:
                 return
             actual_hex = stored.sha512 if algorithm == "sha512" else stored.sha256
-            if hashlib.new(algorithm).digest_size == len(expected_bytes):
-                if expected_bytes.hex() != actual_hex:
-                    raise DigestMismatch(
-                        f"{file_row.filename}: SRI integrity mismatch ({algorithm})"
-                    )
+            if (
+                hashlib.new(algorithm).digest_size == len(expected_bytes)
+                and expected_bytes.hex() != actual_hex
+            ):
+                raise DigestMismatch(
+                    f"{file_row.filename}: SRI integrity mismatch ({algorithm})"
+                )
 
 
 async def _download(url: str, upstream: Upstream | None):

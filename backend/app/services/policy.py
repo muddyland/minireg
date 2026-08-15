@@ -85,7 +85,7 @@ class CvePolicy:
         }
 
     @classmethod
-    def from_dict(cls, data: dict | None) -> "CvePolicy":
+    def from_dict(cls, data: dict | None) -> CvePolicy:
         if not data:
             return cls()
         return cls(
@@ -148,7 +148,7 @@ def _matches_version(spec: str | None, ecosystem: str, version: str | None) -> b
             from packaging.version import Version
 
             return Version(version) in SpecifierSet(spec, prereleases=True)
-        except Exception:  # noqa: BLE001 - fall back rather than fail open
+        except Exception:
             return fnmatch.fnmatchcase(version, spec)
 
     if is_valid_range(spec):

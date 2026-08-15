@@ -29,6 +29,13 @@ async function lookup() {
   busy.value = true
   try {
     pending.value = await api.cliPending(value)
+    // Pre-select what the CLI asked for, filtered to what this person can
+    // actually grant — the server enforces the same ceiling on approval.
+    const requested = pending.value.requested_scopes || ['read']
+    scopes.value = requested.filter(
+      (s) => s === 'read' || (s === 'publish' && auth.canPublish) || (s === 'admin' && auth.isAdmin),
+    )
+    if (!scopes.value.includes('read')) scopes.value.push('read')
     if (pending.value.already_approved) {
       error.value = 'That code has already been used.'
       pending.value = null
@@ -145,6 +152,13 @@ onMounted(() => {
 
           <div class="field">
             <label>Grant this tool</label>
+            <p
+              v-if="(pending.requested_scopes || []).length > 1"
+              class="field-hint"
+              style="margin-top: -0.15rem; margin-bottom: 0.4rem"
+            >
+              It asked for <strong>{{ (pending.requested_scopes || []).join(', ') }}</strong>.
+            </p>
             <label class="check">
               <input type="checkbox" checked disabled />
               <span><strong>read</strong> <span class="faint small">— install and search</span></span>

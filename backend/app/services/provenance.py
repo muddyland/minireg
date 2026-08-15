@@ -105,7 +105,7 @@ async def package_upstreams(session: AsyncSession, package: Package) -> list[dic
             provider = build_provider(upstream)
             index_url = provider.package_index_url(package.name)
             web_url = provider.package_web_url(package.name)
-        except Exception:  # noqa: BLE001 - a bad upstream config must not 500 the page
+        except Exception:
             log.warning("could not build links for upstream %s", upstream.name, exc_info=True)
 
         entries.append(

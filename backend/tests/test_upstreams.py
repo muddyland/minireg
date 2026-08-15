@@ -395,7 +395,7 @@ class TestGitLabProviders:
             gitlab_project_id="42",
             allow_publish=True,
         )
-        ok, message = await GitLabNpmProvider(upstream).publish({"name": "my-pkg"}, "npm")
+        ok, _message = await GitLabNpmProvider(upstream).publish({"name": "my-pkg"}, "npm")
         assert ok is True
         assert route.called
 

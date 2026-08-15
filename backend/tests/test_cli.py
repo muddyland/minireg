@@ -11,7 +11,6 @@ import pathlib
 import sys
 from datetime import UTC, datetime, timedelta
 
-import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
@@ -580,3 +579,51 @@ class TestCliConfigHandling:
         cli.save_config({"token": "secret"})
         mode = cli.config_path().stat().st_mode & 0o777
         assert mode == 0o600, f"config must not be world readable, got {oct(mode)}"
+
+
+class TestRequestedScopes:
+    """`minireg login --scopes` is advisory: it pre-selects on the approval
+    screen, and the server still caps what can actually be granted."""
+
+    async def test_requested_scopes_reach_the_approval_screen(self, client):
+        start = (
+            await client.post(
+                "/api/cli/auth/start",
+                json={"hostname": "laptop", "scopes": ["read", "publish"]},
+            )
+        ).json()
+        await login_session(client)
+
+        pending = await client.get(f"/api/cli/auth/pending/{start['user_code']}")
+        assert pending.json()["requested_scopes"] == ["publish", "read"]
+
+    async def test_defaults_to_read_when_unspecified(self, client):
+        start = (await client.post("/api/cli/auth/start", json={})).json()
+        await login_session(client)
+        pending = await client.get(f"/api/cli/auth/pending/{start['user_code']}")
+        assert pending.json()["requested_scopes"] == ["read"]
+
+    async def test_unknown_scopes_are_discarded(self, client):
+        start = (
+            await client.post(
+                "/api/cli/auth/start", json={"scopes": ["read", "root", "sudo"]}
+            )
+        ).json()
+        await login_session(client)
+        pending = await client.get(f"/api/cli/auth/pending/{start['user_code']}")
+        assert pending.json()["requested_scopes"] == ["read"]
+
+    async def test_requesting_more_does_not_grant_more(self, client):
+        # A read-only user approving a request that asked for admin still gets
+        # a read token: the request is advisory, the approver's authority is not.
+        start = (
+            await client.post(
+                "/api/cli/auth/start", json={"scopes": ["read", "publish", "admin"]}
+            )
+        ).json()
+        await login_session(client, "reader", "reader-password-1234")
+        approved = await client.post(
+            "/api/cli/auth/approve",
+            json={"user_code": start["user_code"], "scopes": ["read", "publish", "admin"]},
+        )
+        assert approved.json()["scopes"] == ["read"]

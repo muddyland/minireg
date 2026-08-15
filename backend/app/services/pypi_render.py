@@ -65,9 +65,7 @@ def select_content_type(accept: str | None, format_param: str | None = None) -> 
             continue
         if media in (JSON_CONTENT_TYPE, "application/vnd.pypi.simple.latest+json"):
             best_type, best_q = JSON_CONTENT_TYPE, quality
-        elif media in (HTML_CONTENT_TYPE, "application/vnd.pypi.simple.latest+html"):
-            best_type, best_q = HTML_CONTENT_TYPE, quality
-        elif media in (LEGACY_HTML_CONTENT_TYPE, "*/*"):
+        elif media in (HTML_CONTENT_TYPE, "application/vnd.pypi.simple.latest+html") or media in (LEGACY_HTML_CONTENT_TYPE, "*/*"):
             best_type, best_q = HTML_CONTENT_TYPE, quality
     return best_type
 

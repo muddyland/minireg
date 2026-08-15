@@ -235,6 +235,8 @@ backend/app/
   models.py       SQLAlchemy models
 cli/minireg.py   the CLI, served from /api/cli/download
 frontend/src/     Vue 3 SPA
+ruff.toml        repo-wide lint config
+.gitlab-ci.yml   lint, test, build
 ```
 
 ---
@@ -244,6 +246,39 @@ frontend/src/     Vue 3 SPA
 ```bash
 cd backend && .venv/bin/python -m pytest
 ```
+
+Lint:
+
+```bash
+ruff check backend/app backend/tests cli
+```
+
+The ruff config lives in `ruff.toml` at the repo root, not under `backend/`.
+Ruff resolves configuration per file by searching upward, so a config nested in
+`backend/` would not apply to `cli/` — which would then be linted with default
+rules and silently diverge. `src` is declared for the same reason: without it,
+`app` resolves as third-party from the root and import sorting flips depending
+on which directory ruff was invoked from.
+
+### CI
+
+`.gitlab-ci.yml` runs three stages:
+
+| Stage | Job | Does |
+|---|---|---|
+| lint | `lint:backend` | `ruff check` over the server, tests, and the CLI |
+| test | `test:backend` | Import smoke test, then the full suite with a JUnit report |
+| test | `build:frontend` | Builds the SPA and asserts it actually emitted `index.html` |
+| build | `build:image` | Builds and pushes the container image |
+
+Base images are pulled through GitLab's dependency proxy via
+`CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX`, and the `build:image` job passes the
+same prefix into the build as `BASE_REGISTRY` so the `FROM` lines in the
+Dockerfile use the cache too. `build:image` runs on `main`, on tags, and tags a
+release build as `:latest` as well.
+
+There is no frontend lint job: the SPA is plain JavaScript with no linter or
+type checker configured, so `build:frontend` is the real compile-time check.
 
 | File | Covers |
 |---|---|

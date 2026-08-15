@@ -30,7 +30,7 @@ from ..core.naming import (
 )
 from ..models import DistTag, Ecosystem, Package, PackageFile, PackageVersion, Upstream
 from ..upstreams.base import RemotePackage
-from .resolver import ResolveResult, Resolver
+from .resolver import Resolver, ResolveResult
 
 log = logging.getLogger(__name__)
 

@@ -15,8 +15,8 @@ from ..models import Ecosystem, Package, PackageVersion, PackageVulnerability, V
 from ..services import packages
 from ..services.policy import PolicyEngine
 from ..services.provenance import package_upstreams
-from ..services.vulns import dedupe_by_cve
 from ..services.resolver import Resolver
+from ..services.vulns import dedupe_by_cve
 
 router = APIRouter(prefix="/api", tags=["search"])
 

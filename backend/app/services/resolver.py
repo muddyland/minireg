@@ -193,7 +193,7 @@ class Resolver:
         except UpstreamError as exc:
             await self._mark_failure(upstream, str(exc))
             return None
-        except Exception as exc:  # noqa: BLE001 - never let one upstream break routing
+        except Exception as exc:
             log.exception("upstream %s raised unexpectedly", upstream.name)
             await self._mark_failure(upstream, repr(exc))
             return None
@@ -323,7 +323,7 @@ class Resolver:
             # A slow or search-less upstream must never hold up the response.
             try:
                 return await asyncio.wait_for(p.search(query, size=size), timeout=8.0)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 return []
 
         batches = await asyncio.gather(*(run(p) for p in providers))

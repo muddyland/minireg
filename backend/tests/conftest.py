@@ -11,8 +11,8 @@ os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:1/0")
 os.environ.setdefault("OSV_ENABLED", "false")
 os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
 
-from app.models import DistTag, Ecosystem, Package, PackageFile, PackageVersion  # noqa: E402
-from app.services.storage import BlobStore, set_store  # noqa: E402
+from app.models import DistTag, Ecosystem, Package, PackageFile, PackageVersion
+from app.services.storage import BlobStore, set_store
 
 
 @pytest.fixture

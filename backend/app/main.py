@@ -136,7 +136,7 @@ async def housekeeping_loop() -> None:
                         log.info("background CVE refresh scanned %d versions", len(rows))
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("housekeeping iteration failed")
 
         await asyncio.sleep(3600)
@@ -212,7 +212,7 @@ async def health_detailed() -> JSONResponse:
         async with get_engine().connect() as conn:
             await conn.execute(select(1))
         checks["database"] = {"ok": True}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         checks["database"] = {"ok": False, "error": str(exc)}
 
     client = redis_client()
@@ -222,13 +222,13 @@ async def health_detailed() -> JSONResponse:
         try:
             await client.ping()
             checks["redis"] = {"ok": True}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             checks["redis"] = {"ok": False, "error": str(exc)}
 
     try:
         usage = await get_store().disk_usage()
         checks["storage"] = {"ok": True, **usage}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         checks["storage"] = {"ok": False, "error": str(exc)}
 
     # Redis being down degrades performance but not correctness.

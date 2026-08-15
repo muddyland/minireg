@@ -25,7 +25,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Union
 
 # --------------------------------------------------------------------------- #
 # Grammar fragments
@@ -78,7 +77,7 @@ class SemVer:
     build: str | None = None
 
     @staticmethod
-    def parse(value: str) -> "SemVer | None":
+    def parse(value: str) -> SemVer | None:
         if not isinstance(value, str):
             return None
         match = FULL_VERSION_RE.match(value.strip())
@@ -113,19 +112,19 @@ class SemVer:
     def _key(self) -> tuple:
         return (self.major, self.minor, self.patch, _prerelease_key(self.prerelease))
 
-    def __lt__(self, other: "SemVer") -> bool:
+    def __lt__(self, other: SemVer) -> bool:
         return self._key() < other._key()
 
-    def __le__(self, other: "SemVer") -> bool:
+    def __le__(self, other: SemVer) -> bool:
         return self._key() <= other._key()
 
-    def __gt__(self, other: "SemVer") -> bool:
+    def __gt__(self, other: SemVer) -> bool:
         return self._key() > other._key()
 
-    def __ge__(self, other: "SemVer") -> bool:
+    def __ge__(self, other: SemVer) -> bool:
         return self._key() >= other._key()
 
-    def equivalent(self, other: "SemVer") -> bool:
+    def equivalent(self, other: SemVer) -> bool:
         """Precedence equality, ignoring build metadata."""
         return self._key() == other._key()
 
@@ -183,7 +182,7 @@ ANY = _Any()
 @dataclass(frozen=True, slots=True)
 class Comparator:
     operator: str  # '' | '=' | '<' | '<=' | '>' | '>='
-    semver: Union[SemVer, _Any]
+    semver: SemVer | _Any
 
     def test(self, version: SemVer) -> bool:
         if isinstance(self.semver, _Any):
@@ -239,7 +238,7 @@ class ComparatorSet:
 class Range:
     """A full range: comparator sets ORed together with ``||``."""
 
-    __slots__ = ("raw", "sets", "include_prerelease")
+    __slots__ = ("include_prerelease", "raw", "sets")
 
     def __init__(self, raw: str, sets: list[ComparatorSet], include_prerelease: bool = False):
         self.raw = raw
@@ -267,7 +266,7 @@ def _desugar_hyphen(match: re.Match, include_prerelease: bool) -> str:
     """``1.2.3 - 2.3.4`` -> ``>=1.2.3 <=2.3.4``, honouring partial bounds."""
     groups = match.groups()
     # 0 = whole left partial, 1..5 = its parts; 6 = whole right, 7..11 its parts.
-    from_raw, f_major, f_minor, f_patch, f_pre, _f_build = groups[0:6]
+    from_raw, f_major, f_minor, f_patch, _f_pre, _f_build = groups[0:6]
     to_raw, t_major, t_minor, t_patch, t_pre, _t_build = groups[6:12]
     lower_pre = "-0" if include_prerelease else ""
 

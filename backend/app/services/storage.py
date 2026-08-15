@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import logging
 import os
@@ -50,7 +51,7 @@ class StoredBlob:
 class Digests:
     """Computes every digest both ecosystems need in a single pass."""
 
-    __slots__ = ("sha256", "sha1", "md5", "blake2b", "sha512", "size")
+    __slots__ = ("blake2b", "md5", "sha1", "sha256", "sha512", "size")
 
     def __init__(self) -> None:
         self.sha256 = hashlib.sha256()
@@ -161,10 +162,8 @@ class BlobStore:
         path = self.path_for(sha256)
         if not path.is_file():
             return False
-        try:
+        with contextlib.suppress(OSError):
             os.chmod(path, 0o644)
-        except OSError:
-            pass
         path.unlink(missing_ok=True)
         # Prune now-empty fan-out directories.
         for parent in (path.parent, path.parent.parent):

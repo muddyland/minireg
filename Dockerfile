@@ -1,5 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
+# Prefix for the base images. CI sets this to GitLab's dependency proxy so
+# node/python are pulled through the cache rather than Docker Hub, which
+# both speeds up builds and avoids anonymous pull limits. Empty locally.
+ARG BASE_REGISTRY=
+
 # ---------------------------------------------------------------------------
 # Stage 1: build the Vue admin UI.
 #
@@ -8,7 +13,7 @@
 # outDir is overridden here because the checked-in vite config writes straight
 # into the backend tree, which does not exist in this stage.
 # ---------------------------------------------------------------------------
-FROM node:22-alpine AS frontend
+FROM ${BASE_REGISTRY}node:22-alpine AS frontend
 
 WORKDIR /build
 
@@ -24,7 +29,7 @@ RUN npx vite build --outDir /build/dist --emptyOutDir
 # Stage 2: Python dependencies into a venv, isolated from the app source so
 # editing code does not reinstall the dependency tree.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS deps
+FROM ${BASE_REGISTRY}python:3.12-slim AS deps
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -42,7 +47,7 @@ RUN python -m venv /opt/venv \
 # ---------------------------------------------------------------------------
 # Stage 3: runtime.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM ${BASE_REGISTRY}python:3.12-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

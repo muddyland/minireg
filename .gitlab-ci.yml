@@ -1,0 +1,97 @@
+stages:
+  - lint
+  - test
+  - build
+
+# ── Shared bases ──────────────────────────────────────────────────────────
+
+.python_base:
+  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/python:3.12-slim
+  tags: [saas-linux-small-amd64]
+  before_script:
+    - pip install --quiet -r backend/requirements.txt
+
+.node_base:
+  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/node:22-alpine
+  tags: [saas-linux-small-amd64]
+  before_script:
+    - cd frontend && npm ci
+
+# ── Lint ──────────────────────────────────────────────────────────────────
+
+lint:backend:
+  extends: .python_base
+  stage: lint
+  before_script:
+    - pip install --quiet ruff
+  script:
+    # The CLI is shipped to users verbatim from /api/cli/download, so it is
+    # linted alongside the server rather than treated as a loose script.
+    - ruff check backend/app backend/tests cli
+
+# No frontend lint job: the project is plain JavaScript with no linter or type
+# checker configured, so `build:frontend` below is the real compile-time check.
+
+# ── Test ──────────────────────────────────────────────────────────────────
+
+test:backend:
+  extends: .python_base
+  stage: test
+  before_script:
+    - cd backend && pip install --quiet -e ".[dev]"
+  script:
+    # Import smoke test first — fails in seconds on broken wiring, rather than
+    # after the whole suite has collected.
+    - python -c "import app.main; print('app import OK')"
+    - pytest -q --tb=short --junitxml=report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: backend/report.xml
+    expire_in: 14 days
+
+build:frontend:
+  extends: .node_base
+  stage: test
+  script:
+    - npm run build
+    # vite writes into backend/app/static, which the image copies in. If the
+    # build silently produced nothing, the image would ship an empty SPA.
+    - test -f ../backend/app/static/index.html
+  artifacts:
+    paths: [backend/app/static]
+    expire_in: 14 days
+
+# ── Build ─────────────────────────────────────────────────────────────────
+
+build:image:
+  stage: build
+  tags: [saas-linux-small-amd64]
+  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/docker:24.0.5
+  services:
+    # Explicit alias: GitLab derives a service's hostname from its image name, so
+    # the dependency-proxy prefix would otherwise change it away from "docker" and
+    # `docker info` would wait forever for a host that never comes up.
+    - name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/docker:24.0.5-dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - until docker info; do sleep 1; done
+    # Log the dind daemon in to the dependency proxy so the Dockerfile's FROM
+    # base images (node, python) also pull through the cache, not Docker Hub.
+    - docker login -u $CI_DEPENDENCY_PROXY_USER -p $CI_DEPENDENCY_PROXY_PASSWORD $CI_DEPENDENCY_PROXY_SERVER
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build --build-arg BASE_REGISTRY=${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/ --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME
+    # A tagged build is also the release, so publish it as :latest too.
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME $CI_REGISTRY_IMAGE:latest
+        docker push $CI_REGISTRY_IMAGE:latest
+      fi
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "main"'
+    - if: '$CI_COMMIT_TAG'
+    - exists: [Dockerfile]

@@ -243,7 +243,7 @@ def extract_wheel_metadata(content: bytes, filename: str) -> dict[str, Any] | No
 
     message = Parser().parsestr(raw)
     metadata: dict[str, Any] = {"_raw": raw}
-    for key in message.keys():
+    for key in message:
         values = message.get_all(key) or []
         normalized = key.lower().replace("-", "_")
         metadata[normalized] = values if len(values) > 1 else values[0]

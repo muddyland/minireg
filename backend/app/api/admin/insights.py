@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
-from sqlalchemy import String, and_, cast, desc, func, select
+from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -28,10 +28,10 @@ from ...models import (
     Vulnerability,
 )
 from ...services import artifacts, audit, packages
-from ...services.provenance import package_upstreams
-from ...services.vulns import dedupe_by_cve
 from ...services.osv import OsvScanner
+from ...services.provenance import package_upstreams
 from ...services.storage import get_store
+from ...services.vulns import dedupe_by_cve
 
 log = logging.getLogger(__name__)
 router = APIRouter(dependencies=[Depends(require_admin)])

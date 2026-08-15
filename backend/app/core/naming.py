@@ -19,8 +19,13 @@ from __future__ import annotations
 import re
 from urllib.parse import quote
 
-from packaging.utils import InvalidWheelFilename, canonicalize_name, canonicalize_version
-from packaging.utils import parse_sdist_filename, parse_wheel_filename
+from packaging.utils import (
+    InvalidWheelFilename,
+    canonicalize_name,
+    canonicalize_version,
+    parse_sdist_filename,
+    parse_wheel_filename,
+)
 from packaging.version import InvalidVersion, Version
 
 from .semver import SemVer, _prerelease_key

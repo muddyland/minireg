@@ -9,7 +9,6 @@ locally-published integration tests both miss.
 import hashlib
 
 import httpx
-import pytest
 import pytest_asyncio
 import respx
 from httpx import ASGITransport, AsyncClient

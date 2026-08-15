@@ -172,7 +172,7 @@ class DownloadRecorder:
                 await self._drain_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.exception("download log flush failed")
 
     async def _drain_once(self) -> None:
@@ -191,7 +191,7 @@ class DownloadRecorder:
         try:
             async with session_scope() as session:
                 await session.execute(insert(DownloadLog), rows)
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("failed to persist %d download events", len(rows))
 
 

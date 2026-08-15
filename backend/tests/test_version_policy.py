@@ -185,7 +185,7 @@ async def add_rule(pattern, version_spec, ecosystem=Ecosystem.npm):
 class TestVersionScopedBlockingEndToEnd:
     async def test_only_the_matching_versions_are_hidden(self, client):
         for version in ("4.17.19", "4.17.20", "4.17.21", "5.0.0"):
-            await client.put(f"/npm/lodash", json=publish_body("lodash", version))
+            await client.put("/npm/lodash", json=publish_body("lodash", version))
 
         await add_rule("lodash", "<4.17.21")
 

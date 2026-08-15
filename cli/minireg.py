@@ -17,6 +17,7 @@ they can point npm at their own mirror would defeat the purpose.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import platform
@@ -209,7 +210,11 @@ def cmd_login(args):
             registry,
             "/api/cli/auth/start",
             "POST",
-            {"hostname": socket.gethostname(), "platform": platform.platform()},
+            {
+                "hostname": socket.gethostname(),
+                "platform": platform.platform(),
+                "scopes": scopes,
+            },
             insecure=args.insecure,
         )
     except ApiError as exc:
@@ -227,11 +232,12 @@ def cmd_login(args):
     print(flush=True)
     info(dim("  Waiting for approval… (Ctrl-C to cancel)"))
 
+    if len(scopes) > 1 or scopes != ["read"]:
+        info(dim(f"  Requesting: {', '.join(scopes)}"))
+
     if not args.no_browser:
-        try:
+        with contextlib.suppress(Exception):
             webbrowser.open(verify_url)
-        except Exception:
-            pass
 
     interval = max(1, int(start.get("interval", 3)))
     deadline = time.time() + int(start.get("expires_in", 600))

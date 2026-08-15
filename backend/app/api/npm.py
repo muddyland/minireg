@@ -725,7 +725,7 @@ async def _forward_to_publish_targets(
             log.info("mirror publish %s -> %s: %s", parsed.name, upstream.name, message)
             if not ok:
                 log.warning("mirror publish to %s failed: %s", upstream.name, message)
-        except Exception:  # noqa: BLE001 - a mirror failure must not fail the publish
+        except Exception:
             log.exception("mirror publish to %s raised", upstream.name)
 
 
@@ -1028,7 +1028,7 @@ async def _scan_new_versions(session: AsyncSession, package: Package) -> None:
         results = await scanner.scan_versions(
             ECOSYSTEM, [(package.name, v.version) for v in targets]
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.debug("inline scan batch failed for %s", package.name, exc_info=True)
         return
     for version_row in targets:

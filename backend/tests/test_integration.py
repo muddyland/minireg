@@ -6,7 +6,6 @@ the parts unit tests of pure functions cannot cover.
 
 import base64
 
-import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 

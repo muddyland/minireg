@@ -31,16 +31,13 @@ dev = [
     "pytest-cov>=5.0.0",
     "aiosqlite>=0.20.0",
     "respx>=0.21.1",
+    "ruff>=0.6",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
-
-[tool.ruff]
-line-length = 110
-target-version = "py312"
 
 [build-system]
 requires = ["setuptools>=68"]

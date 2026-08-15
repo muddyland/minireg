@@ -16,6 +16,7 @@ import enum
 from datetime import UTC, datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -25,7 +26,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -79,24 +79,24 @@ def _updated_col(**kw) -> Mapped[datetime]:
 # --------------------------------------------------------------------------- #
 # Enums
 # --------------------------------------------------------------------------- #
-class Ecosystem(str, enum.Enum):
+class Ecosystem(enum.StrEnum):
     npm = "npm"
     pypi = "pypi"
 
 
-class UpstreamKind(str, enum.Enum):
+class UpstreamKind(enum.StrEnum):
     npm = "npm"
     pypi = "pypi"
     gitlab_npm = "gitlab_npm"
     gitlab_pypi = "gitlab_pypi"
 
 
-class RuleAction(str, enum.Enum):
+class RuleAction(enum.StrEnum):
     block = "block"
     allow = "allow"
 
 
-class AuthProvider(str, enum.Enum):
+class AuthProvider(enum.StrEnum):
     local = "local"
     oidc = "oidc"
 
@@ -125,7 +125,7 @@ class User(Base):
     created_at: Mapped[datetime] = _now_col()
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    tokens: Mapped[list["ApiToken"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    tokens: Mapped[list[ApiToken]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
     __table_args__ = (UniqueConstraint("oidc_issuer", "oidc_subject", name="uq_user_oidc"),)
 
@@ -179,6 +179,10 @@ class DeviceAuthorization(Base):
 
     # What the CLI told us about itself, shown on the approval screen so the
     # person can tell whether this is really their terminal.
+    # What the CLI asked to be granted. Advisory: the approval screen shows
+    # these pre-selected and the person decides what is actually issued.
+    requested_scopes: Mapped[list] = mapped_column(JSONType, default=list)
+
     client_hostname: Mapped[str | None] = mapped_column(String(255))
     client_platform: Mapped[str | None] = mapped_column(String(255))
     client_ip: Mapped[str | None] = mapped_column(String(64))
@@ -318,10 +322,10 @@ class Package(Base):
     blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     block_reason: Mapped[str | None] = mapped_column(Text)
 
-    versions: Mapped[list["PackageVersion"]] = relationship(
+    versions: Mapped[list[PackageVersion]] = relationship(
         back_populates="package", cascade="all, delete-orphan"
     )
-    dist_tags: Mapped[list["DistTag"]] = relationship(
+    dist_tags: Mapped[list[DistTag]] = relationship(
         back_populates="package", cascade="all, delete-orphan"
     )
 
@@ -363,7 +367,7 @@ class PackageVersion(Base):
     scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     package: Mapped[Package] = relationship(back_populates="versions")
-    files: Mapped[list["PackageFile"]] = relationship(
+    files: Mapped[list[PackageFile]] = relationship(
         back_populates="version", cascade="all, delete-orphan"
     )
 

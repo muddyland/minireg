@@ -10,6 +10,7 @@ import logging
 import re
 from datetime import datetime
 from html.parser import HTMLParser
+from typing import ClassVar
 from urllib.parse import unquote, urljoin
 
 from ..core.naming import normalize_pypi_name, parse_dist_filename
@@ -52,9 +53,7 @@ class _SimpleHTMLParser(HTMLParser):
             "requires_python": attributes.get("data-requires-python"),
             # PEP 592: presence of the attribute means yanked; its value is the
             # reason, and an empty value still means yanked.
-            "yanked": (
-                attributes["data-yanked"] if "data-yanked" in attributes else None
-            ),
+            "yanked": attributes.get("data-yanked"),
             "yanked_present": "data-yanked" in attributes,
             # PEP 714: data-core-metadata is the current spelling;
             # data-dist-info-metadata is the deprecated alias we still accept.
@@ -119,7 +118,7 @@ class PyPIProvider(UpstreamProvider):
         # PEP 503 requires the normalized name and a trailing slash.
         return f"{self.base_url}/{normalize_pypi_name(name)}/"
 
-    PUBLIC_WEB = {
+    PUBLIC_WEB: ClassVar[dict[str, str]] = {
         "pypi.org": "https://pypi.org/project/{normalized_name}/",
         "test.pypi.org": "https://test.pypi.org/project/{normalized_name}/",
     }

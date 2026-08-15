@@ -8,7 +8,6 @@ import base64
 
 import pytest
 
-from app.models import Ecosystem
 from app.services.npm_publish import (
     PublishError,
     match_attachment,

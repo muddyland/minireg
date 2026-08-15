@@ -36,8 +36,15 @@ from ..core.deps import Identity, client_ip, require_user
 from ..core.naming import normalize_name_for
 from ..core.security import generate_token
 from ..db import get_session
-from ..models import ApiToken, DeviceAuthorization, Ecosystem, Package, PackageVersion
-from ..models import PackageVulnerability, Vulnerability
+from ..models import (
+    ApiToken,
+    DeviceAuthorization,
+    Ecosystem,
+    Package,
+    PackageVersion,
+    PackageVulnerability,
+    Vulnerability,
+)
 from ..services import audit
 from ..services.osv import OsvScanner
 from ..services.policy import PolicyEngine
@@ -102,6 +109,9 @@ def _aware(value: datetime | None) -> datetime | None:
 class DeviceStartRequest(BaseModel):
     hostname: str | None = Field(default=None, max_length=255)
     platform: str | None = Field(default=None, max_length=255)
+    #: Scopes the CLI would like. Advisory only -- the approval screen shows
+    #: them pre-selected and the person decides what is actually granted.
+    scopes: list[str] = Field(default_factory=lambda: ["read"])
 
 
 @router.post("/auth/start", status_code=status.HTTP_201_CREATED)
@@ -142,6 +152,9 @@ async def device_start(
         client_hostname=(payload.hostname or "")[:255] or None,
         client_platform=(payload.platform or "")[:255] or None,
         client_ip=ip,
+        requested_scopes=sorted(
+            {s for s in payload.scopes if s in ("read", "publish", "admin")} or {"read"}
+        ),
     )
     session.add(record)
     await session.commit()
@@ -249,6 +262,7 @@ async def device_pending(
         "hostname": record.client_hostname,
         "platform": record.client_platform,
         "ip": record.client_ip,
+        "requested_scopes": record.requested_scopes or ["read"],
         "requested_at": record.created_at,
         "expires_at": record.expires_at,
         "already_approved": record.approved_at is not None,
@@ -414,7 +428,7 @@ async def audit_packages(
             scanned_now = await OsvScanner(session).scan_versions(
                 ecosystem, missing[:500]
             )
-        except Exception:  # noqa: BLE001 - a scan failure degrades, never fails
+        except Exception:
             log.warning("on-demand audit scan failed", exc_info=True)
 
     version_ids = [v.id for _p, v in known.values()]
