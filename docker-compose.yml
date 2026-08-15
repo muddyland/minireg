@@ -1,0 +1,147 @@
+####################################################################
+# minireg -- caching npm + PyPI registry
+#
+#   cp .env.example .env    # then edit PUBLIC_URL and the secrets
+#   docker compose up -d --build
+#
+# The application image is built from ./Dockerfile by this file; there is
+# nothing to pull from a registry.
+####################################################################
+
+name: minireg
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-minireg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-minireg}
+      POSTGRES_DB: ${POSTGRES_DB:-minireg}
+      # C collation makes the b-tree index scans on package names materially
+      # faster than a locale-aware collation, and package names are ASCII.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-minireg} -d ${POSTGRES_DB:-minireg}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    command:
+      - postgres
+      # Tuned for a metadata-heavy read workload on a modest host. Raise
+      # shared_buffers to ~25% of RAM on a dedicated database machine.
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - jit=off
+    networks: [minireg]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-512mb}
+      # The cache is disposable: evict rather than error when it fills.
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [minireg]
+
+  minireg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: minireg:1.0.0
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # -- identity --------------------------------------------------------
+      # MUST match the URL clients actually use: tarball and file URLs are
+      # rendered against it. Getting this wrong breaks npm install.
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8000}
+      ENVIRONMENT: ${ENVIRONMENT:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # -- secrets ---------------------------------------------------------
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      CREDENTIAL_KEY: ${CREDENTIAL_KEY:-}
+
+      # -- backing services -------------------------------------------------
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-minireg}:${POSTGRES_PASSWORD:-minireg}@postgres:5432/${POSTGRES_DB:-minireg}
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /data/packages
+
+      # -- access ------------------------------------------------------------
+      ALLOW_ANONYMOUS_READ: ${ALLOW_ANONYMOUS_READ:-true}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@localhost}
+
+      # -- OIDC / Authentik ---------------------------------------------------
+      OIDC_ENABLED: ${OIDC_ENABLED:-false}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_ADMIN_GROUP: ${OIDC_ADMIN_GROUP:-minireg-admins}
+      OIDC_USER_GROUP: ${OIDC_USER_GROUP:-}
+      OIDC_AUTO_CREATE_USERS: ${OIDC_AUTO_CREATE_USERS:-true}
+
+      # -- caching / performance ----------------------------------------------
+      META_CACHE_TTL: ${META_CACHE_TTL:-60}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+      UPSTREAM_TIER_PARALLEL: ${UPSTREAM_TIER_PARALLEL:-true}
+
+      # -- OSV / CVE ----------------------------------------------------------
+      OSV_ENABLED: ${OSV_ENABLED:-true}
+      OSV_INLINE_SCAN: ${OSV_INLINE_SCAN:-true}
+      OSV_INLINE_TIMEOUT_SECONDS: ${OSV_INLINE_TIMEOUT_SECONDS:-4}
+      OSV_FAIL_CLOSED: ${OSV_FAIL_CLOSED:-false}
+    volumes:
+      - package-storage:/data
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+    networks: [minireg]
+
+volumes:
+  postgres-data:
+  redis-data:
+  package-storage:
+
+networks:
+  minireg:
+    driver: bridge
