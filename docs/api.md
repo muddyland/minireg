@@ -107,6 +107,7 @@ Advertised API version is **1.1** (PEP 700). Implements PEP 503, 592, 629, 658,
 | `GET` | `/api/cli/auth/pending/{code}` | session | Details for the approval screen |
 | `POST` | `/api/cli/auth/approve` | session | Approve or deny |
 | `POST` | `/api/cli/audit` | token | Audit a dependency set |
+| `GET` | `/api/cli/version` | none | Shipped CLI version and its SHA-256 |
 | `GET` | `/api/cli/download` | none | The CLI script |
 | `GET` | `/api/cli/install.sh` | none | Installer with the URL baked in |
 
@@ -199,6 +200,10 @@ npm endpoints return npm's shape, because the CLI prints the field verbatim:
 ```
 
 PyPI upload returns plain text, because twine prints the body verbatim.
+
+Every `/api/*` response carries `x-minireg-cli-version`, the CLI version this
+registry ships. The CLI reads it from responses it was already making, so it
+can tell you it is out of date without spending a request to ask.
 
 Everything else returns FastAPI's shape:
 

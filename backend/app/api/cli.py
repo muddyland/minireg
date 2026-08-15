@@ -20,8 +20,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import secrets
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -567,6 +569,25 @@ async def audit_packages(
 # --------------------------------------------------------------------------- #
 # Distribution
 # --------------------------------------------------------------------------- #
+#: Response header carrying the CLI version the registry ships. Every API
+#: response includes it, so the CLI learns it has fallen behind without ever
+#: making a request purely to ask.
+CLI_VERSION_HEADER = "x-minireg-cli-version"
+
+_VERSION_RE = re.compile(r'^__version__\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+@lru_cache(maxsize=1)
+def cli_version() -> str | None:
+    """Version declared by the bundled CLI. Cached: the file cannot change
+    without a restart, and this is read on every API response."""
+    path = _find_cli_source()
+    if path is None:
+        return None
+    match = _VERSION_RE.search(path.read_text(encoding="utf-8"))
+    return match.group(1) if match else None
+
+
 def _cli_source() -> str:
     path = _find_cli_source()
     if path is None:
@@ -575,6 +596,22 @@ def _cli_source() -> str:
             detail="the CLI is not bundled with this deployment",
         )
     return path.read_text(encoding="utf-8")
+
+
+@router.get("/version")
+async def cli_version_info() -> dict:
+    """What the registry ships, so the CLI can tell whether it is current.
+
+    Unauthenticated on purpose: a CLI that cannot log in should still be able to
+    discover that it is the reason why.
+    """
+    source = _cli_source()
+    return {
+        "version": cli_version(),
+        "sha256": hashlib.sha256(source.encode()).hexdigest(),
+        "size": len(source.encode()),
+        "download_url": f"{settings.public_url}/api/cli/download",
+    }
 
 
 @router.get("/download", include_in_schema=False)

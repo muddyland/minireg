@@ -315,6 +315,7 @@ for a person and a pipeline with no branching.
 | `audit --fix` | Rewrite declarations to versions that clear them |
 | `search <query>` | Search the index |
 | `info <package>` | Show a package |
+| `update` | Update this CLI from the registry |
 
 ### Global flags
 
@@ -350,5 +351,37 @@ server-side. Revoke it in **API tokens** if a machine is lost.
 
 **Approval codes expire in 10 minutes** and are single-use.
 
-**The CLI is served from the registry**, so it is always the version that
-matches your deployment. Re-run the installer after upgrading the registry.
+**The CLI updates itself.**
+
+```bash
+minireg update           # install the version this registry ships
+minireg update --check   # report only; exits 1 if an update exists
+```
+
+You will not usually need to run it unprompted. The registry stamps every API
+response with the CLI version it ships, so the CLI compares against its own as
+a side effect of traffic it was making anyway and says one line when it has
+fallen behind:
+
+```
+  note: this registry ships CLI 1.1.0, you have 1.0.0 — run 'minireg update'
+```
+
+That costs no extra request, and it goes to stderr — piping `--json` output
+stays clean.
+
+Before overwriting itself the update checks three things: the download matches
+the SHA-256 the registry advertised, it compiles as Python, and it actually
+looks like this program. Any failure aborts without touching the installed
+file, because a half-written script would leave nothing to recover with. The
+replacement is an atomic rename within the same directory, and the executable
+bit is preserved.
+
+If the CLI lives somewhere you cannot write, it says so and suggests
+`sudo minireg update` or re-running the installer.
+
+`--check` is useful in CI to fail a pipeline that is pinned to a stale client:
+
+```bash
+minireg update --check || echo "CLI is out of date"
+```

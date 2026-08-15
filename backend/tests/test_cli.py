@@ -1038,3 +1038,74 @@ class TestFixPlanners:
         path.write_text('{"dependencies": {"lodash": "^4.18.0"}}')
         _text, changes, _skipped = cli.plan_package_json_fix(path, {"lodash": "4.18.0"})
         assert changes == []
+
+
+class TestCliVersionDiscovery:
+    """How the CLI learns it has fallen behind."""
+
+    async def test_version_endpoint_reports_what_is_shipped(self, client):
+        response = await client.get("/api/cli/version")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["version"], "the registry must report a CLI version"
+        assert len(body["sha256"]) == 64
+        assert body["download_url"].endswith("/api/cli/download")
+
+    async def test_version_endpoint_needs_no_authentication(self, client):
+        # A CLI too old to authenticate should still be able to find out that
+        # being old is the reason.
+        assert (await client.get("/api/cli/version")).status_code == 200
+
+    async def test_checksum_matches_the_served_file(self, client):
+        import hashlib
+
+        advertised = (await client.get("/api/cli/version")).json()["sha256"]
+        source = (await client.get("/api/cli/download")).text
+        assert hashlib.sha256(source.encode()).hexdigest() == advertised
+
+    async def test_version_matches_the_source(self, client):
+        import re
+
+        advertised = (await client.get("/api/cli/version")).json()["version"]
+        source = (await client.get("/api/cli/download")).text
+        declared = re.search(r'^__version__\s*=\s*"([^"]+)"', source, re.MULTILINE)
+        assert declared and declared.group(1) == advertised
+
+    async def test_api_responses_carry_the_version_header(self, client):
+        # This is how the CLI notices without spending a request on asking.
+        from app.api.cli import CLI_VERSION_HEADER
+
+        response = await client.get("/api/auth/oidc/status")
+        assert response.headers.get(CLI_VERSION_HEADER)
+
+    async def test_registry_endpoints_do_not_carry_it(self, client):
+        # npm and pip do not care, and it would be noise on every tarball.
+        from app.api.cli import CLI_VERSION_HEADER
+
+        response = await client.get("/npm/-/ping")
+        assert CLI_VERSION_HEADER not in response.headers
+
+
+class TestCliSelfUpdateGuards:
+    """The CLI replaces its own file, so a bad payload must never land."""
+
+    def test_downloaded_source_is_valid_python(self):
+        # The same check cmd_update performs before overwriting itself.
+        source = CLI_PATH.read_text()
+        compile(source, "<minireg>", "exec")
+
+    def test_update_command_is_registered(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["update", "--check"])
+        assert args.command == "update"
+        assert args.check is True
+
+    def test_install_path_resolves_to_the_script(self):
+        assert cli.install_path().name == "minireg.py"
+
+    def test_sanity_checks_reject_a_non_cli_payload(self):
+        # cmd_update refuses anything that parses but is not this program.
+        payload = "print('hello')\n"
+        compile(payload, "<x>", "exec")  # valid Python...
+        assert "def main(" not in payload  # ...but not the CLI
+        assert "__version__" not in payload

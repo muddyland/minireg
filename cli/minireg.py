@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import platform
@@ -25,6 +26,7 @@ import re
 import socket
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -32,10 +34,16 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 DEFAULT_TIMEOUT = 30
 USER_AGENT = f"minireg-cli/{__version__}"
+
+#: The registry stamps every API response with the CLI version it ships. We
+#: record it as a side effect of ordinary traffic, so noticing that we are out
+#: of date costs nothing extra.
+CLI_VERSION_HEADER = "x-minireg-cli-version"
+_server_cli_version: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -178,11 +186,16 @@ def api(
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
+    global _server_cli_version
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+            _server_cli_version = (
+                response.headers.get(CLI_VERSION_HEADER) or _server_cli_version
+            )
             payload = response.read()
             return json.loads(payload) if payload else None
     except urllib.error.HTTPError as exc:
+        _server_cli_version = exc.headers.get(CLI_VERSION_HEADER) or _server_cli_version
         raw = exc.read()
         detail = None
         try:
@@ -1030,6 +1043,111 @@ def cmd_info(args):
 
 
 # --------------------------------------------------------------------------- #
+# update
+# --------------------------------------------------------------------------- #
+def fetch_text(registry: str, path: str, insecure: bool = False, timeout: int = 60) -> str:
+    """Fetch a non-JSON body. Used for the CLI source itself."""
+    request = urllib.request.Request(
+        f"{registry.rstrip('/')}{path}",
+        headers={"user-agent": USER_AGENT, "accept": "*/*"},
+    )
+    context = None
+    if insecure:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+            return response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise ApiError(exc.code, f"HTTP {exc.code} fetching {path}") from exc
+    except urllib.error.URLError as exc:
+        raise ApiError(0, f"could not reach {registry}: {exc.reason}") from exc
+
+
+def install_path() -> Path:
+    """Where this script lives, following symlinks."""
+    return Path(__file__).resolve()
+
+
+def cmd_update(args):
+    registry = require_registry(args)
+
+    try:
+        remote = api(registry, "/api/cli/version", insecure=args.insecure)
+    except ApiError as exc:
+        die(f"could not check for updates: {exc.detail}")
+
+    latest = remote.get("version")
+    if not latest:
+        die("the registry did not report a CLI version")
+
+    print(f"  installed : {__version__}")
+    print(f"  registry  : {latest}")
+
+    if latest == __version__ and not args.force:
+        print(f"  {green('✓')} already up to date")
+        return 0
+    if args.check:
+        print(f"  {yellow('an update is available')} — run: minireg update")
+        return 1
+
+    source = fetch_text(registry, "/api/cli/download", insecure=args.insecure)
+
+    # Three checks before anything is overwritten. A truncated or mangled
+    # download that replaced this file would leave no working CLI to recover
+    # with, and the whole point is that it is the only tool installed.
+    expected = remote.get("sha256")
+    actual = hashlib.sha256(source.encode()).hexdigest()
+    if expected and expected != actual:
+        die(f"checksum mismatch: expected {expected[:16]}…, got {actual[:16]}…")
+    try:
+        compile(source, "<downloaded minireg>", "exec")
+    except SyntaxError as exc:
+        die(f"the downloaded CLI is not valid Python ({exc}); refusing to install it")
+    if "def main(" not in source or "__version__" not in source:
+        die("the downloaded file does not look like the minireg CLI; refusing to install it")
+
+    target = install_path()
+    try:
+        # Stage beside the target so the rename is atomic and cannot leave a
+        # half-written script behind.
+        fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".minireg-")
+        with os.fdopen(fd, "w") as handle:
+            handle.write(source)
+        os.chmod(tmp_name, target.stat().st_mode & 0o777 or 0o755)
+        os.replace(tmp_name, target)
+    except PermissionError:
+        die(
+            f"no permission to write {target}\n"
+            f"  try:  sudo minireg update\n"
+            f"  or reinstall: curl -fsSL {registry}/api/cli/install.sh | sh"
+        )
+    except OSError as exc:
+        die(f"could not replace {target}: {exc}")
+
+    print(f"  {green('✓')} updated to {latest}")
+    return 0
+
+
+def warn_if_outdated():
+    """One line, after the command has done its work.
+
+    Uses the version learned from responses already made, so it never adds a
+    request of its own and never fires for a command that did not talk to the
+    registry.
+    """
+    if not _server_cli_version or _server_cli_version == __version__:
+        return
+    info(
+        dim(
+            f"  note: this registry ships CLI {_server_cli_version}, you have "
+            f"{__version__} — run 'minireg update'"
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -1061,6 +1179,13 @@ def build_parser() -> argparse.ArgumentParser:
     login.set_defaults(func=cmd_login)
 
     sub.add_parser("logout", help="forget the stored token").set_defaults(func=cmd_logout)
+
+    update = sub.add_parser("update", help="update this CLI from the registry")
+    update.add_argument(
+        "--check", action="store_true", help="report whether an update exists, exit 1 if so"
+    )
+    update.add_argument("--force", action="store_true", help="reinstall even if versions match")
+    update.set_defaults(func=cmd_update)
     sub.add_parser("whoami", help="show the current identity").set_defaults(func=cmd_whoami)
 
     configure = sub.add_parser("configure", help="point npm / pip at the registry")
@@ -1112,13 +1237,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        return args.func(args) or 0
+        code = args.func(args) or 0
     except KeyboardInterrupt:
         info("\nCancelled.")
         return 130
     except ApiError as exc:
         die(exc.detail or f"HTTP {exc.status}")
-    return 0
+        return 1
+    if args.command != "update":
+        warn_if_outdated()
+    return code
 
 
 if __name__ == "__main__":

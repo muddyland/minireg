@@ -188,6 +188,17 @@ if settings.environment == "dev":
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
+
+    # Advertise the CLI version on API responses. The CLI compares it against
+    # its own and nudges when it has fallen behind, which costs no extra
+    # request -- it learns from traffic it was making anyway.
+    if request.url.path.startswith("/api/"):
+        from .api.cli import CLI_VERSION_HEADER, cli_version
+
+        shipped = cli_version()
+        if shipped:
+            response.headers.setdefault(CLI_VERSION_HEADER, shipped)
+
     response.headers.setdefault("x-content-type-options", "nosniff")
     response.headers.setdefault("referrer-policy", "same-origin")
     # The registry endpoints are consumed by CLIs, not browsers, so a frame
