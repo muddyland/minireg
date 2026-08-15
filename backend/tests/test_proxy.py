@@ -355,3 +355,114 @@ class TestTieredFallback:
     async def test_all_tiers_failing_is_404(self, proxy_client):
         respx.get("https://upstream.test/nothing").mock(return_value=httpx.Response(404))
         assert (await proxy_client.get("/npm/nothing")).status_code == 404
+
+
+class TestUpstreamMetadataShapes:
+    """Registry metadata is not schema-enforced and its shapes drift.
+
+    A field the column cannot hold raises a driver-level DataError, which
+    surfaces as a 500 on the packument *and* every tarball beneath it -- one
+    badly shaped field takes the whole package offline. This is what
+    config-chain did: its license is the legacy {"type", "url"} object.
+    """
+
+    @respx.mock
+    async def test_object_license_does_not_break_the_package(self, proxy_client):
+        packument = {
+            **UPSTREAM_PACKUMENT,
+            "name": "config-chain",
+            "license": {
+                "type": "MIT",
+                "url": "https://raw.githubusercontent.com/x/y/master/LICENCE",
+            },
+        }
+        respx.get("https://upstream.test/config-chain").mock(
+            return_value=httpx.Response(200, json=packument)
+        )
+        respx.get("https://upstream.test/leftpad/-/leftpad-1.1.0.tgz").mock(
+            return_value=httpx.Response(200, content=TARBALL)
+        )
+
+        response = await proxy_client.get("/npm/config-chain")
+        assert response.status_code == 200, "an object license must not 500 the packument"
+
+    @respx.mock
+    async def test_array_of_licenses_is_flattened(self, proxy_client):
+        packument = {
+            **UPSTREAM_PACKUMENT,
+            "name": "config-chain",
+            "license": [{"type": "MIT"}, {"type": "Apache-2.0"}],
+        }
+        respx.get("https://upstream.test/config-chain").mock(
+            return_value=httpx.Response(200, json=packument)
+        )
+        assert (await proxy_client.get("/npm/config-chain")).status_code == 200
+
+    @respx.mock
+    async def test_object_author_does_not_break_the_package(self, proxy_client):
+        packument = {
+            **UPSTREAM_PACKUMENT,
+            "name": "config-chain",
+            "author": {"name": "Someone", "email": "a@b.c", "url": "https://x"},
+        }
+        respx.get("https://upstream.test/config-chain").mock(
+            return_value=httpx.Response(200, json=packument)
+        )
+        assert (await proxy_client.get("/npm/config-chain")).status_code == 200
+
+    @respx.mock
+    async def test_absurdly_long_values_are_truncated_not_rejected(self, proxy_client):
+        # Some projects paste an entire licence into the field.
+        packument = {
+            **UPSTREAM_PACKUMENT,
+            "name": "config-chain",
+            "license": "MIT " * 5000,
+            "homepage": "https://example.com/" + ("x" * 4000),
+        }
+        respx.get("https://upstream.test/config-chain").mock(
+            return_value=httpx.Response(200, json=packument)
+        )
+        assert (await proxy_client.get("/npm/config-chain")).status_code == 200
+
+    @respx.mock
+    async def test_string_keywords_are_accepted(self, proxy_client):
+        packument = {**UPSTREAM_PACKUMENT, "name": "config-chain", "keywords": "config, chain"}
+        respx.get("https://upstream.test/config-chain").mock(
+            return_value=httpx.Response(200, json=packument)
+        )
+        assert (await proxy_client.get("/npm/config-chain")).status_code == 200
+
+    @respx.mock
+    async def test_the_tarball_is_still_servable(self, proxy_client):
+        # The original symptom was a 500 on the *tarball*, because the packument
+        # had to be persisted first and that is where it failed.
+        packument = {
+            **UPSTREAM_PACKUMENT,
+            "name": "leftpad",
+            "license": {"type": "MIT", "url": "https://x/LICENCE"},
+        }
+        respx.get("https://upstream.test/leftpad").mock(
+            return_value=httpx.Response(200, json=packument)
+        )
+        respx.get("https://upstream.test/leftpad/-/leftpad-1.1.0.tgz").mock(
+            return_value=httpx.Response(200, content=TARBALL)
+        )
+        response = await proxy_client.get("/npm/leftpad/-/leftpad-1.1.0.tgz")
+        assert response.status_code == 200
+        assert response.content == TARBALL
+
+
+class TestCoerceText:
+    def test_shapes(self):
+        from app.services.packages import coerce_keywords, coerce_text
+
+        assert coerce_text({"type": "MIT", "url": "https://x"}) == "MIT"
+        assert coerce_text([{"type": "MIT"}, {"type": "Apache-2.0"}]) == "MIT, Apache-2.0"
+        assert coerce_text("ISC") == "ISC"
+        assert coerce_text(None) is None
+        assert coerce_text({}) is None
+        assert coerce_text(object()) is None
+        assert len(coerce_text("x" * 5000, 255)) == 255
+        assert coerce_keywords("web, api http") == ["web", "api", "http"]
+        assert coerce_keywords(["a", {"name": "b"}]) == ["a", "b"]
+        assert coerce_keywords(None) == []

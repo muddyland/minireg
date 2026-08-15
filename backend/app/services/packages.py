@@ -39,6 +39,57 @@ def cache_key(ecosystem: str, name: str, suffix: str = "") -> str:
     return f"pkg:{ecosystem}:{name}{(':' + suffix) if suffix else ''}"
 
 
+
+# Column widths for the fields upstreams populate. Values are truncated to fit
+# rather than allowed to fail the insert: a registry that 500s because some
+# package put a whole licence text in a field is worse than one that stores the
+# first 255 characters of it.
+_TEXT_LIMITS = {"license": 255, "author": 512, "homepage": 1024, "latest_version": 128}
+
+
+def coerce_text(value, limit: int | None = None) -> str | None:
+    """Flatten an upstream field into something a text column will accept.
+
+    Registry metadata is not schema-enforced and the shapes drift over time.
+    npm's ``license`` is a plain SPDX string today, but older packages carry
+    ``{"type": "MIT", "url": ...}`` or a ``licenses`` array of those, and PyPI
+    projects occasionally paste an entire licence into the field. Passing any
+    of that straight to a VARCHAR column raises a driver-level DataError, which
+    surfaces as a 500 on both the packument *and* every tarball under it --
+    one badly shaped field takes the whole package offline.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, dict):
+        # {"type": "MIT", "url": ...} and friends.
+        text = value.get("type") or value.get("name") or value.get("license") or ""
+        if not isinstance(text, str):
+            text = ""
+    elif isinstance(value, (list, tuple)):
+        parts = [coerce_text(item) for item in value]
+        text = ", ".join(part for part in parts if part)
+    elif isinstance(value, (int, float, bool)):
+        text = str(value)
+    else:
+        return None
+
+    text = text.strip()
+    if not text:
+        return None
+    return text[:limit] if limit else text
+
+
+def coerce_keywords(value) -> list[str]:
+    """Keywords are a list by convention, but a string in the wild."""
+    if isinstance(value, str):
+        return [k.strip() for k in value.replace(",", " ").split() if k.strip()]
+    if isinstance(value, (list, tuple)):
+        return [k for k in (coerce_text(item) for item in value) if k]
+    return []
+
+
 @dataclass(slots=True)
 class PackageLookup:
     package: Package | None
@@ -115,12 +166,13 @@ async def persist_remote_package(
             if package is None:
                 raise
 
-    package.description = remote.description or package.description
-    package.author = remote.author or package.author
-    package.homepage = remote.homepage or package.homepage
-    package.license = remote.license or package.license
-    if remote.keywords:
-        package.keywords = remote.keywords
+    package.description = coerce_text(remote.description) or package.description
+    package.author = coerce_text(remote.author, _TEXT_LIMITS["author"]) or package.author
+    package.homepage = coerce_text(remote.homepage, _TEXT_LIMITS["homepage"]) or package.homepage
+    package.license = coerce_text(remote.license, _TEXT_LIMITS["license"]) or package.license
+    keywords = coerce_keywords(remote.keywords)
+    if keywords:
+        package.keywords = keywords
     package.cached_document = remote.raw or package.cached_document
     package.cached_etag = remote.etag
     package.cached_at = datetime.now(UTC)
@@ -221,7 +273,10 @@ async def persist_remote_package(
                 package.dist_tags.append(row)
             elif not package.is_local:
                 row.version = version
-        package.latest_version = remote.dist_tags.get("latest") or package.latest_version
+        package.latest_version = (
+            coerce_text(remote.dist_tags.get("latest"), _TEXT_LIMITS["latest_version"])
+            or package.latest_version
+        )
 
     if package.latest_version is None and package.versions:
         package.latest_version = _derive_latest(ecosystem, package)

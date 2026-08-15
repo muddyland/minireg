@@ -506,12 +506,14 @@ async def upload(
         )
     )
 
-    package.description = parsed.summary or package.description
-    package.author = parsed.author or package.author
-    package.homepage = parsed.home_page or package.homepage
-    package.license = parsed.license or package.license
+    # A project is free to put an entire licence text in the License field, and
+    # some do; bound it rather than letting the insert fail.
+    package.description = packages.coerce_text(parsed.summary) or package.description
+    package.author = packages.coerce_text(parsed.author, 512) or package.author
+    package.homepage = packages.coerce_text(parsed.home_page, 1024) or package.homepage
+    package.license = packages.coerce_text(parsed.license, 255) or package.license
     if parsed.keyword_list:
-        package.keywords = parsed.keyword_list
+        package.keywords = packages.coerce_keywords(parsed.keyword_list)
 
     from ..core.naming import sort_pypi_versions
 
