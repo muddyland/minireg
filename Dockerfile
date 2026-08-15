@@ -18,8 +18,11 @@ FROM ${BASE_REGISTRY}node:22-alpine AS frontend
 WORKDIR /build
 
 # Manifests first: the dependency layer then caches across source edits.
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm install --no-audit --no-fund
+COPY frontend/package.json frontend/package-lock.json ./
+# `ci` not `install`: it installs exactly what the lockfile pins and fails if
+# the two have drifted, so an image build cannot quietly resolve different
+# dependencies than CI tested.
+RUN npm ci --no-audit --no-fund
 
 COPY frontend/ ./
 RUN npx vite build --outDir /build/dist --emptyOutDir
