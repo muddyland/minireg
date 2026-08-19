@@ -29,16 +29,24 @@ services:
       timeout: 5s
       retries: 20
       start_period: 10s
+    # A hard cap so a runaway query is killed inside its own cgroup. Without
+    # limits the kernel picks the victim host-wide, and it has picked dockerd --
+    # which takes redis and postgres down with it and leaves them stopped.
+    mem_limit: ${POSTGRES_MEM_LIMIT:-1g}
     command:
       - postgres
-      # Tuned for a metadata-heavy read workload on a modest host. Raise
-      # shared_buffers to ~25% of RAM on a dedicated database machine.
+      # Tuned for a metadata-heavy read workload on a modest *shared* host --
+      # the app and redis live here too. shared_buffers is a real reservation,
+      # so the "25% of RAM" rule only applies to a dedicated database machine;
+      # raising it here just takes memory away from the registry process.
       - -c
       - max_connections=200
       - -c
-      - shared_buffers=256MB
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-256MB}
       - -c
-      - effective_cache_size=768MB
+      # A planner hint about total cache (shared_buffers + OS page cache), not
+      # an allocation, so it should exceed shared_buffers rather than track it.
+      - effective_cache_size=1GB
       - -c
       - work_mem=8MB
       - -c
@@ -52,6 +60,8 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # Headroom over maxmemory for fragmentation and client buffers.
+    mem_limit: ${REDIS_MEM_LIMIT:-768m}
     command:
       - redis-server
       - --maxmemory
@@ -78,6 +88,12 @@ services:
       dockerfile: Dockerfile
     image: minireg:1.0.0
     restart: unless-stopped
+    # The registry is the component that can balloon (large packuments, big
+    # scan batches), so it is the one that must be contained. Hitting this
+    # limit kills and restarts *this* container -- visible as exit 137 and a
+    # rising RestartCount -- instead of letting the kernel shoot the docker
+    # daemon and leave the database stopped.
+    mem_limit: ${MINIREG_MEM_LIMIT:-1536m}
     depends_on:
       postgres:
         condition: service_healthy

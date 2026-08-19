@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, selectinload
 
 from ..config import settings
 from ..core.cache import cache_delete_prefix, herd_guard
@@ -384,7 +384,9 @@ async def search_local(
 
     from sqlalchemy import or_
 
-    stmt = select(Package).where(or_(*conditions))
+    # Search results render summary fields only. Leaving cached_document in
+    # means one page of hits can carry hundreds of MB of packument JSON.
+    stmt = select(Package).options(defer(Package.cached_document)).where(or_(*conditions))
     count_stmt = select(func.count(Package.id)).where(or_(*conditions))
     if ecosystem is not None:
         stmt = stmt.where(Package.ecosystem == ecosystem)

@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
+from sqlalchemy.orm import defer
 
 from .api import auth as auth_api
 from .api import cli as cli_api
@@ -108,10 +109,18 @@ async def housekeeping_loop() -> None:
             if settings.osv_enabled:
                 cutoff = datetime.now(UTC) - timedelta(seconds=settings.osv_refresh_interval_seconds)
                 async with session_scope() as session:
+                    # Select the two package columns the scan actually uses
+                    # rather than the Package entity. The entity drags
+                    # cached_document -- the whole upstream packument, 18MB for
+                    # playwright and 37MB for vite -- once per *row*, so a
+                    # 200-row batch pulled and JSON-parsed multiple GB and got
+                    # the container OOM-killed. metadata_json is deferred for
+                    # the same reason; apply_to_version never reads it.
                     rows = (
                         await session.execute(
-                            select(Package, PackageVersion)
+                            select(Package.ecosystem, Package.name, PackageVersion)
                             .join(PackageVersion, PackageVersion.package_id == Package.id)
+                            .options(defer(PackageVersion.metadata_json))
                             .where(
                                 (PackageVersion.scanned_at.is_(None))
                                 | (PackageVersion.scanned_at < cutoff)
@@ -123,16 +132,16 @@ async def housekeeping_loop() -> None:
                     if rows:
                         scanner = OsvScanner(session)
                         grouped: dict = {}
-                        for package, version in rows:
-                            grouped.setdefault(package.ecosystem, []).append((package, version))
+                        for eco, name, version in rows:
+                            grouped.setdefault(eco, []).append((name, version))
                         for ecosystem, items in grouped.items():
                             results = await scanner.scan_versions(
-                                ecosystem, [(p.name, v.version) for p, v in items]
+                                ecosystem, [(n, v.version) for n, v in items]
                             )
-                            for package, version in items:
-                                result = results.get((package.name, version.version))
+                            for name, version in items:
+                                result = results.get((name, version.version))
                                 if result is not None:
-                                    await scanner.apply_to_version(version, result, package.name)
+                                    await scanner.apply_to_version(version, result, name)
                         log.info("background CVE refresh scanned %d versions", len(rows))
         except asyncio.CancelledError:
             raise

@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, selectinload
 
 from ..config import settings
 from ..core.deps import Identity, require_user
@@ -111,7 +111,14 @@ async def package_detail(
             select(Package)
             .where(Package.ecosystem == ecosystem, Package.normalized_name == normalized)
             .options(
-                selectinload(Package.versions).selectinload(PackageVersion.files),
+                # This view renders neither the packument nor per-version
+                # metadata, and both are large enough to dominate the response
+                # cost -- vite's cached_document alone is 37MB.
+                defer(Package.cached_document),
+                selectinload(Package.versions).options(
+                    defer(PackageVersion.metadata_json),
+                    selectinload(PackageVersion.files),
+                ),
                 selectinload(Package.dist_tags),
             )
         )

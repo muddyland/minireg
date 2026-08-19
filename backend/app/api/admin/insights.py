@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, selectinload
 
 from ...core.deps import Identity, client_ip, require_admin
 from ...core.naming import order_version_rows
@@ -535,7 +535,12 @@ async def vulnerability_affected(
 
     rows = (
         await session.execute(
-            select(Package, PackageVersion, PackageVulnerability)
+            select(
+                Package.ecosystem,
+                Package.name,
+                PackageVersion.version,
+                PackageVulnerability,
+            )
             .join(PackageVersion, PackageVersion.package_id == Package.id)
             .join(
                 PackageVulnerability, PackageVulnerability.version_id == PackageVersion.id
@@ -557,15 +562,15 @@ async def vulnerability_affected(
         },
         "affected": [
             {
-                "ecosystem": pkg.ecosystem.value,
-                "package": pkg.name,
-                "version": ver.version,
+                "ecosystem": eco.value,
+                "package": name,
+                "version": version,
                 "fixed_version": link.fixed_version,
                 "suppressed": link.suppressed,
                 "suppressed_reason": link.suppressed_reason,
                 "link_id": link.id,
             }
-            for pkg, ver, link in rows
+            for eco, name, version, link in rows
         ],
     }
 
@@ -660,8 +665,9 @@ async def trigger_scan(
 
     rows = (
         await session.execute(
-            select(Package, PackageVersion)
+            select(Package.ecosystem, Package.name, PackageVersion)
             .join(PackageVersion, PackageVersion.package_id == Package.id)
+            .options(defer(PackageVersion.metadata_json))
             .where(and_(*conditions) if conditions else True)
             .order_by(PackageVersion.first_seen_at.desc())
             .limit(limit)
@@ -673,20 +679,20 @@ async def trigger_scan(
 
     scanner = OsvScanner(session)
     by_ecosystem: dict[Ecosystem, list] = {}
-    for package, version in rows:
-        by_ecosystem.setdefault(package.ecosystem, []).append((package, version))
+    for eco, name, version in rows:
+        by_ecosystem.setdefault(eco, []).append((name, version))
 
     scanned = 0
     with_cves = 0
     for eco, items in by_ecosystem.items():
         results = await scanner.scan_versions(
-            eco, [(p.name, v.version) for p, v in items]
+            eco, [(n, v.version) for n, v in items]
         )
-        for package, version in items:
-            result = results.get((package.name, version.version))
+        for name, version in items:
+            result = results.get((name, version.version))
             if result is None or not result.scanned:
                 continue
-            await scanner.apply_to_version(version, result, package.name)
+            await scanner.apply_to_version(version, result, name)
             scanned += 1
             if result.cves:
                 with_cves += 1

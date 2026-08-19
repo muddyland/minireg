@@ -31,6 +31,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from ..config import settings
 from ..core.cache import rate_limit
@@ -409,20 +410,27 @@ async def audit_packages(
         for item in payload.packages
     }
 
+    # Filter on the requested versions as well as the requested names. Without
+    # the version predicate an audit that mentions `playwright` pulled all 5,600
+    # of its stored version rows; with the Package entity attached that meant
+    # 5,600 copies of a 17MB packument. Both are fixed here: narrow rows, and
+    # only the columns this handler reads.
     rows = (
         await session.execute(
-            select(Package, PackageVersion)
+            select(Package.name, Package.normalized_name, PackageVersion)
             .join(PackageVersion, PackageVersion.package_id == Package.id)
+            .options(defer(PackageVersion.metadata_json))
             .where(
                 Package.ecosystem == ecosystem,
                 Package.normalized_name.in_({key[0] for key in wanted}),
+                PackageVersion.version.in_({key[1] for key in wanted}),
             )
         )
     ).all()
 
-    known: dict[tuple[str, str], tuple[Package, PackageVersion]] = {}
-    for package, version in rows:
-        known[(package.normalized_name, version.version)] = (package, version)
+    known: dict[tuple[str, str], tuple[str, PackageVersion]] = {}
+    for name, normalized, version in rows:
+        known[(normalized, version.version)] = (name, version)
 
     # Look up anything we do not already hold CVE data for -- which is *not* the
     # same as "anything the registry has never seen". Proxying a package creates
@@ -455,12 +463,12 @@ async def audit_packages(
                     continue
                 result = scanned_now.get((item.name, item.version))
                 if result is not None and getattr(result, "scanned", False):
-                    await scanner.apply_to_version(entry[1], result, entry[0].name)
+                    await scanner.apply_to_version(entry[1], result, entry[0])
                     persisted = True
             if persisted:
                 await session.commit()
 
-    version_ids = [v.id for _p, v in known.values()]
+    version_ids = [v.id for _name, v in known.values()]
     cve_rows = []
     if version_ids:
         cve_rows = (
@@ -500,7 +508,7 @@ async def audit_packages(
         scanned = False
 
         if entry is not None:
-            _package, version_row = entry
+            _name, version_row = entry
             cves = by_version.get(version_row.id, [])
             max_cvss = version_row.max_cvss
             scanned = version_row.scanned_at is not None
