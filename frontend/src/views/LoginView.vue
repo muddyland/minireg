@@ -42,7 +42,7 @@ onMounted(() => auth.loadOidcStatus())
       <header class="login-head">
         <BrandMark :size="52" />
         <h1>minireg</h1>
-        <p class="page-sub">npm &amp; PyPI package registry</p>
+        <p class="page-sub">npm, PyPI &amp; cargo package registry</p>
       </header>
 
       <div class="card">

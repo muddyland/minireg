@@ -29,11 +29,12 @@ const COMMANDS = [
   },
   {
     command: 'minireg configure',
-    summary: 'Point npm and pip at this registry, credentials included.',
+    summary: 'Point npm, pip and cargo at this registry, credentials included.',
   },
   {
     command: 'minireg audit',
-    summary: "Check this project's lockfile against known CVEs and this registry's policy.",
+    summary:
+      "Check this project's lockfiles — npm, Python and Cargo.lock — against known CVEs and this registry's policy.",
   },
   { command: 'minireg search <query>', summary: 'Search the package index.' },
   { command: 'minireg info <package>', summary: 'Versions, CVEs, and upstream sources.' },

@@ -39,6 +39,7 @@ onMounted(async () => {
     <div class="tabs">
       <button class="tab" :class="{ active: tab === 'npm' }" @click="tab = 'npm'">npm / yarn / pnpm</button>
       <button class="tab" :class="{ active: tab === 'pip' }" @click="tab = 'pip'">pip / uv / poetry</button>
+      <button v-if="config.cargo" class="tab" :class="{ active: tab === 'cargo' }" @click="tab = 'cargo'">cargo</button>
       <button class="tab" :class="{ active: tab === 'publish' }" @click="tab = 'publish'">Publishing</button>
     </div>
 
@@ -114,6 +115,56 @@ onMounted(async () => {
       </div>
     </template>
 
+    <template v-if="tab === 'cargo'">
+      <div class="card mb">
+        <div class="card-head">
+          <h3>Configure cargo</h3>
+          <span class="badge badge-cargo">cargo</span>
+        </div>
+        <div class="card-body">
+          <p class="dim small mb">
+            Cargo has no <code>config set</code> equivalent — the redirect has to live in a file.
+            Put this in <code>{{ config.cargo.config_path }}</code>:
+          </p>
+          <div class="copy-block mb">
+            <pre>{{ config.cargo.config_toml }}</pre>
+            <button class="btn btn-sm" @click="copy(config.cargo.config_toml, 'cargo-toml')">
+              {{ copied === 'cargo-toml' ? 'Copied' : 'Copy' }}
+            </button>
+          </div>
+
+          <p class="field-hint">
+            This is <em>source replacement</em>: it redirects every crates.io dependency without
+            editing a single <code>Cargo.toml</code>. Commit it as
+            <code>.cargo/config.toml</code> at the repository root and it applies to everyone who
+            builds the project.
+          </p>
+
+          <h4 class="small mt">Two details that are load-bearing</h4>
+          <ul class="field-hint" style="margin: 0.3rem 0 0; padding-left: 1.1rem">
+            <li>
+              <code>sparse+</code> tells cargo the index is served over HTTP. Without it cargo
+              tries to <code>git clone</code> the URL and fails like a network error.
+            </li>
+            <li>
+              The trailing slash. Without it cargo joins the shard paths against the parent
+              segment, and every crate 404s while <code>config.json</code> keeps working.
+            </li>
+          </ul>
+
+          <h4 class="small mt">No token needed</h4>
+          <p class="field-hint">
+            Reads are anonymous, and cargo only sends credentials to an index that declares
+            <code>auth-required</code>. Nothing here is a secret.
+          </p>
+        </div>
+      </div>
+
+      <div class="alert alert-info">
+        {{ config.cargo.note }}
+      </div>
+    </template>
+
     <template v-if="tab === 'publish'">
       <div class="alert alert-info">
         Publishing always requires an API token with the <strong>publish</strong> scope. Password
@@ -145,6 +196,24 @@ npm publish --registry {{ config.npm.registry }}</pre>
               {{ copied === 'pypirc' ? 'Copied' : 'Copy' }}
             </button>
           </div>
+        </div>
+      </div>
+
+      <div v-if="config.cargo" class="card mt">
+        <div class="card-head">
+          <h3>Publish a crate</h3>
+          <span class="badge badge-cargo">cargo</span>
+        </div>
+        <div class="card-body">
+          <p class="field-hint" style="margin: 0">
+            Not supported, and not an oversight. Cargo mirrors a registry through source
+            replacement, and it requires the replacement to serve exactly what crates.io serves —
+            every crate is checked against the checksum in <code>Cargo.lock</code>. A crate that is
+            not on crates.io can never resolve through a replaced source, so anything published
+            here would be unreachable from the clients configured above. Hosting private crates
+            needs a separate registry entry and a <code>registry = "…"</code> key on each
+            dependency, which is a different thing from mirroring.
+          </p>
         </div>
       </div>
     </template>

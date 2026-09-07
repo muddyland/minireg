@@ -35,7 +35,7 @@ onMounted(() => auth.loadOidcStatus())
         <BrandMark :size="30" />
         <div>
           <div class="brand-name">minireg</div>
-          <div class="faint" style="font-size: 0.7rem">npm + pypi registry</div>
+          <div class="faint" style="font-size: 0.7rem">npm + pypi + cargo registry</div>
         </div>
       </div>
 

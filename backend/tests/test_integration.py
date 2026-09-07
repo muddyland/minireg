@@ -826,6 +826,30 @@ class TestClientConfig:
         assert body["twine"]["repository_url"] == "http://registry.test/pypi/legacy/"
         assert "registry.test/npm/:_authToken" in body["npm"]["npmrc"]
 
+    async def test_cargo_stanza_is_client_ready(self, app_client):
+        """The Client setup page renders these keys directly, so the contract
+        matters as much as the values. Both the `sparse+` prefix and the
+        trailing slash are load-bearing: without the prefix cargo tries to git
+        clone the index, and without the slash it joins the shard paths against
+        the parent segment and every crate 404s."""
+        body = (
+            await app_client.get("/api/client-config", headers=auth(app_client))
+        ).json()
+        cargo = body["cargo"]
+        assert cargo["registry"] == "sparse+http://registry.test/cargo/index/"
+
+        assert set(cargo) >= {"registry", "config_toml", "config_path", "commands", "note"}
+
+        # It has to be a source replacement, not a plain [registries] entry --
+        # only replacement redirects crates.io deps without editing Cargo.toml.
+        assert "[source.crates-io]" in cargo["config_toml"]
+        assert 'replace-with = "minireg"' in cargo["config_toml"]
+        assert cargo["registry"] in cargo["config_toml"]
+
+        # No token belongs in it: reads are anonymous and cargo only sends
+        # credentials to an index declaring auth-required.
+        assert "token" not in cargo["config_toml"].lower()
+
 
 class TestUserSearch:
     async def test_search_finds_published_package(self, app_client):

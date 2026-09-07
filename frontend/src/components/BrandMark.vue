@@ -3,8 +3,8 @@
  * The minireg mark: an isometric package, drawn as three faces of a box.
  *
  * A package cube reads instantly at 24px and stays ecosystem-neutral, which
- * matters here because the registry serves npm and PyPI equally -- borrowing
- * either one's iconography would misrepresent what this is.
+ * matters here because the registry serves npm, PyPI and cargo equally --
+ * borrowing any one's iconography would misrepresent what this is.
  */
 defineProps({
   size: { type: Number, default: 26 },
