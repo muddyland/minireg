@@ -1,7 +1,7 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { formatDateTime } from '@/utils/format'
+import { ecosystemBadge, formatDateTime } from '@/utils/format'
 
 const tab = ref('audit')
 
@@ -205,6 +205,7 @@ onMounted(async () => {
             <option value="">All ecosystems</option>
             <option value="npm">npm</option>
             <option value="pypi">PyPI</option>
+            <option value="cargo">cargo</option>
           </select>
           <select v-model.number="downloadFilters.days" style="width: auto" @change="loadDownloads">
             <option :value="1">Last 24 hours</option>
@@ -238,7 +239,7 @@ onMounted(async () => {
               <tr v-for="entry in downloads" :key="entry.id">
                 <td class="dim small nowrap">{{ formatDateTime(entry.ts) }}</td>
                 <td>
-                  <span class="badge" :class="entry.ecosystem === 'npm' ? 'badge-npm' : 'badge-pypi'">
+                  <span class="badge" :class="ecosystemBadge(entry.ecosystem)">
                     {{ entry.ecosystem }}
                   </span>
                   {{ entry.package_name }}

@@ -73,6 +73,37 @@ Advertised API version is **1.1** (PEP 700). Implements PEP 503, 592, 629, 658,
 
 ---
 
+## Cargo API
+
+Mounted at `/cargo`. The sparse HTTP index (RFC 2789); the git index is not
+supported.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/cargo/index/config.json` | Registry configuration. `api` is omitted — this is a read-only mirror |
+| `GET` | `/cargo/index/{prefix}/{crate}` | Index file: newline-delimited JSON, one object per version |
+| `GET` | `/cargo/api/v1/crates/{crate}/{version}/download` | Artifact (`.crate`) |
+
+The shard `{prefix}` is fixed by cargo and computed by the client, so it must
+match exactly: `1/{name}` for one-character names, `2/{name}` for two,
+`3/{first}/{name}` for three, and `{name[0:2]}/{name[2:4]}/{name}` beyond that,
+all lowercased. A request whose prefix disagrees with its final segment is a
+404 rather than a redirect.
+
+```bash
+curl .../cargo/index/config.json
+curl .../cargo/index/se/rd/serde
+curl -O .../cargo/api/v1/crates/serde/1.0.197/download
+```
+
+A version blocked by policy is rendered as `"yanked": true` — the only "do not
+select this" signal the index format has — and its download returns **403**.
+
+There is no publish, yank or owners surface. See
+[Using the registry](usage.md#why-cargo-is-read-only).
+
+---
+
 ## Web API
 
 ### Auth

@@ -120,9 +120,9 @@ or give CI a token so it uses the authenticated limit.
 | Field | Meaning |
 |---|---|
 | **Name** | Label only; appears in logs and on package pages. |
-| **Ecosystem** | npm or PyPI. Cannot be changed after creation. |
-| **Type** | Plain registry, or GitLab package registry. |
-| **URL** | Registry root. For GitLab, the instance root — `/api/v4` is appended automatically. |
+| **Ecosystem** | npm, PyPI or cargo. Cannot be changed after creation. |
+| **Type** | Plain registry, or GitLab package registry. Cargo has one type — GitLab hosts no cargo registry. |
+| **URL** | Registry root. For GitLab, the instance root — `/api/v4` is appended automatically. For cargo, the sparse index root (e.g. `https://index.crates.io`) *without* the `sparse+` prefix — that is a scheme marker for the client, not part of the URL we fetch. |
 | **Tier** | Lower is tried first. See [Tiering](#tiering). |
 | **Priority** | Order *within* a tier. |
 | **Timeout** | Per-request, overrides the global default. |
@@ -164,6 +164,17 @@ current state and the last error.
 Credentials are encrypted at rest and never returned by the API — the UI shows
 only whether one is set. Leave the field blank when editing to keep the
 existing value.
+
+### Cargo
+
+The URL is the sparse index root. The download URL is not configured: it comes
+from the index's own `config.json`, which is fetched once and cached.
+
+Cargo upstreams cannot be publish targets or search-index sources. The sparse
+index has no endpoint that enumerates every crate — crates.io publishes a
+database dump for that, which is not something to pull through a request path —
+so **Include in search** does nothing for them. Crates still appear in search
+once they have been resolved through the registry.
 
 ### GitLab
 

@@ -67,3 +67,18 @@ export function percent(value, total) {
   if (!total) return 0
   return Math.min(100, Math.round((value / total) * 100))
 }
+
+// The badge classes are named after the ecosystem values themselves, so this
+// stays correct as ecosystems are added. It replaced a
+// `eco === 'npm' ? 'badge-npm' : 'badge-pypi'` ternary repeated across eight
+// views, which silently mislabelled every ecosystem that was not npm the
+// moment a third one existed.
+const ECOSYSTEMS = ['npm', 'pypi', 'cargo']
+
+export function ecosystemBadge(ecosystem) {
+  return ECOSYSTEMS.includes(ecosystem) ? `badge-${ecosystem}` : 'badge'
+}
+
+export function ecosystemLabel(ecosystem) {
+  return ecosystem === 'pypi' ? 'PyPI' : ecosystem
+}

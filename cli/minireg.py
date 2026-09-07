@@ -34,7 +34,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 DEFAULT_TIMEOUT = 30
 USER_AGENT = f"minireg-cli/{__version__}"
@@ -366,7 +366,7 @@ def cmd_configure(args):
 
     targets = args.target
     if targets == "all":
-        targets = "npm,pip"
+        targets = "npm,pip,cargo"
     wanted = {t.strip() for t in targets.split(",") if t.strip()}
 
     host = registry.split("://", 1)[-1]
@@ -403,6 +403,33 @@ def cmd_configure(args):
             _upsert_lines(pip_conf, lines, "minireg")
             os.chmod(pip_conf, 0o600)
             changed.append(str(pip_conf))
+
+    if "cargo" in wanted:
+        cargo_conf = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo")) / "config.toml"
+        cargo = client.get("cargo")
+        if not cargo:
+            info(dim("  registry does not serve a cargo index; skipping"))
+        else:
+            # Source replacement, not a `[registries]` entry: it redirects every
+            # crates.io dependency without editing a single Cargo.toml. No token
+            # is written -- cargo only sends credentials to an index that
+            # declares `auth-required`, and a read-only mirror does not.
+            lines = [
+                "[source.crates-io]",
+                'replace-with = "minireg"',
+                "",
+                "[source.minireg]",
+                f'registry = "{cargo["registry"]}"',
+            ]
+            if args.dry_run:
+                print(f"\n{bold(str(cargo_conf))}\n" + "\n".join(lines))
+            else:
+                # The managed block goes at the end of the file on first write.
+                # That matters for TOML in a way it does not for npmrc: these
+                # are table headers, so anything following them would be read as
+                # part of `[source.minireg]`.
+                _upsert_lines(cargo_conf, lines, "minireg")
+                changed.append(str(cargo_conf))
 
     if args.dry_run:
         info(dim("\n(dry run — nothing written)"))
@@ -520,6 +547,33 @@ def parse_uv_lock(path: Path) -> list[dict]:
     return parse_poetry_lock(path)  # same [[package]] name/version shape
 
 
+def parse_cargo_lock(path: Path) -> list[dict]:
+    """Cargo.lock.
+
+    Same ``[[package]]`` shape as poetry.lock, with one difference that matters:
+    the file also lists the workspace's own crates and any git or path
+    dependencies. Those carry no ``source`` key (or a ``git+`` one) and are not
+    on crates.io, so sending them to the registry would ask about packages that
+    cannot exist there -- every local crate would come back unknown and read as
+    a gap in coverage rather than as "this is your own code".
+    """
+    out = []
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for block in text.split("[[package]]")[1:]:
+        name = re.search(r'^\s*name\s*=\s*"([^"]+)"', block, re.MULTILINE)
+        version = re.search(r'^\s*version\s*=\s*"([^"]+)"', block, re.MULTILINE)
+        source = re.search(r'^\s*source\s*=\s*"([^"]+)"', block, re.MULTILINE)
+        if not (name and version):
+            continue
+        if source is None or not source.group(1).startswith("registry+"):
+            continue
+        out.append({"name": name.group(1), "version": version.group(1)})
+    return out
+
+
 def parse_pipfile_lock(path: Path) -> list[dict]:
     out = []
     try:
@@ -540,6 +594,7 @@ LOCKFILES = [
     ("poetry.lock", "pypi", parse_poetry_lock),
     ("uv.lock", "pypi", parse_uv_lock),
     ("Pipfile.lock", "pypi", parse_pipfile_lock),
+    ("Cargo.lock", "cargo", parse_cargo_lock),
     ("requirements.txt", "pypi", parse_requirements),
 ]
 
@@ -726,7 +781,7 @@ def cmd_audit(args):
 # Which file to edit for each ecosystem. For npm we audit the lockfile but edit
 # package.json: raising the declared floor is what stops `npm install`
 # regenerating a vulnerable lock, and the lockfile itself is generated output.
-FIX_TARGETS = {"npm": "package.json", "pypi": None}
+FIX_TARGETS = {"npm": "package.json", "pypi": None, "cargo": None}
 
 _REQ_PIN_RE = re.compile(
     r"^(?P<lead>\s*)(?P<name>[A-Za-z0-9._-]+)(?P<extras>\s*\[[^\]]*\])?"
@@ -735,6 +790,23 @@ _REQ_PIN_RE = re.compile(
 # Keep the operator the declaration already used, so a project's convention
 # survives the edit.
 _NPM_RANGE_RE = re.compile(r"^(?P<op>[\^~]|>=|>)?(?P<version>\d.*)$")
+
+
+def _print_cargo_fix_advice(path: Path, findings: list[dict]) -> int:
+    """Hand back the `cargo update` lines that would clear what we found.
+
+    Returns how many were printed, so the caller can tell "we told you what to
+    run" apart from "there is nothing to do".
+    """
+    fixes = sorted({(f["name"], f["fix_version"]) for f in findings if f.get("fix_version")})
+    if not fixes:
+        if findings:
+            print(f"    {dim(path.name)}: nothing with a published fix")
+        return 0
+    print(f"    {dim(path.name)}: run these — cargo owns the lockfile")
+    for name, version in fixes:
+        print(f"      cargo update -p {name} --precise {version}")
+    return len(fixes)
 
 
 def normalize_key(ecosystem: str, name: str) -> str:
@@ -832,7 +904,20 @@ def apply_fixes(args, registry, token, root: Path, per_source) -> None:
     print(f"  {bold('Remediation')}")
 
     planned = []
+    # Sources we cannot rewrite but did give the user something actionable, so
+    # the "nothing to change" line below does not contradict advice we just
+    # printed.
+    advised = 0
     for path, ecosystem, findings in per_source:
+        if ecosystem == "cargo":
+            # Cargo.lock is generated output, and Cargo.toml declares ranges
+            # against a workspace and feature graph we would have to resolve to
+            # edit safely -- a floor raised in the wrong member is a build
+            # break, not a bump. cargo already owns this operation, so print the
+            # exact invocations instead of guessing at the file.
+            advised += _print_cargo_fix_advice(path, findings)
+            continue
+
         fixable = {
             normalize_key(ecosystem, f["name"]): f["fix_version"]
             for f in findings
@@ -877,7 +962,8 @@ def apply_fixes(args, registry, token, root: Path, per_source) -> None:
             print(f"    {red('no fix')} {entry['name']}@{entry['version']}")
 
     if not planned:
-        print(f"    {dim('nothing to change')}")
+        if not advised:
+            print(f"    {dim('nothing to change')}")
         return
 
     for target, _before, _after, changes, _eco, _fixes in planned:
@@ -970,7 +1056,9 @@ def cmd_search(args):
         return 0
 
     for item in results:
-        tag = blue("npm") if item["ecosystem"] == "npm" else yellow("pypi")
+        tag = {"npm": blue("npm"), "pypi": yellow("pypi")}.get(
+            item["ecosystem"], red("cargo")
+        )
         line = f"  {tag}  {bold(item['name'])}"
         if item.get("latest_version"):
             line += f"  {dim(item['latest_version'])}"
@@ -1188,9 +1276,11 @@ def build_parser() -> argparse.ArgumentParser:
     update.set_defaults(func=cmd_update)
     sub.add_parser("whoami", help="show the current identity").set_defaults(func=cmd_whoami)
 
-    configure = sub.add_parser("configure", help="point npm / pip at the registry")
+    configure = sub.add_parser(
+        "configure", help="point npm / pip / cargo at the registry"
+    )
     configure.add_argument(
-        "target", nargs="?", default="all", help="npm, pip, or all (default: all)"
+        "target", nargs="?", default="all", help="npm, pip, cargo, or all (default: all)"
     )
     configure.add_argument("--dry-run", action="store_true", help="print instead of writing")
     configure.set_defaults(func=cmd_configure)
@@ -1221,13 +1311,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     search = sub.add_parser("search", help="search the registry")
     search.add_argument("query")
-    search.add_argument("--ecosystem", choices=["npm", "pypi"])
+    search.add_argument("--ecosystem", choices=["npm", "pypi", "cargo"])
     search.add_argument("--limit", type=int, default=25)
     search.set_defaults(func=cmd_search)
 
     info_cmd = sub.add_parser("info", help="show a package")
     info_cmd.add_argument("package")
-    info_cmd.add_argument("--ecosystem", choices=["npm", "pypi"], default="npm")
+    info_cmd.add_argument("--ecosystem", choices=["npm", "pypi", "cargo"], default="npm")
     info_cmd.add_argument("--limit", type=int, default=20)
     info_cmd.set_defaults(func=cmd_info)
 

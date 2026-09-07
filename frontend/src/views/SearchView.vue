@@ -1,5 +1,6 @@
 <script setup>
 import { onMounted, ref } from 'vue'
+import { ecosystemBadge } from '@/utils/format'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 
@@ -40,7 +41,7 @@ onMounted(run)
   <div class="page-head">
     <div>
       <h1>Search packages</h1>
-      <p class="page-sub">Everything this registry has indexed, across npm and PyPI.</p>
+      <p class="page-sub">Everything this registry has indexed, across npm, PyPI and cargo.</p>
     </div>
   </div>
 
@@ -57,6 +58,7 @@ onMounted(run)
           <option value="">All ecosystems</option>
           <option value="npm">npm</option>
           <option value="pypi">PyPI</option>
+          <option value="cargo">cargo</option>
         </select>
         <button class="btn btn-primary" type="submit" :disabled="loading">Search</button>
       </form>
@@ -86,7 +88,7 @@ onMounted(run)
               {{ pkg.name }}
             </router-link>
             <div class="row-tight" style="margin-top: 0.3rem">
-              <span class="badge" :class="pkg.ecosystem === 'npm' ? 'badge-npm' : 'badge-pypi'">
+              <span class="badge" :class="ecosystemBadge(pkg.ecosystem)">
                 {{ pkg.ecosystem }}
               </span>
               <span v-if="pkg.latest_version" class="badge">{{ pkg.latest_version }}</span>

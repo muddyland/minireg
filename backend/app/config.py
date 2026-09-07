@@ -122,6 +122,10 @@ class Settings(BaseSettings):
     def pypi_base(self) -> str:
         return f"{self.public_url}/pypi"
 
+    @property
+    def cargo_base(self) -> str:
+        return f"{self.public_url}/cargo"
+
 
 @lru_cache
 def get_settings() -> Settings:

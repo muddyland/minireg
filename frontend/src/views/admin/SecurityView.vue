@@ -1,7 +1,7 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { formatDate, severityClass } from '@/utils/format'
+import { ecosystemBadge, formatDate, severityClass } from '@/utils/format'
 
 const vulns = ref([])
 const total = ref(0)
@@ -113,6 +113,7 @@ onMounted(load)
           <option value="">All ecosystems</option>
           <option value="npm">npm</option>
           <option value="pypi">PyPI</option>
+          <option value="cargo">cargo</option>
         </select>
         <select v-model="filters.severity" style="width: auto" @change="load">
           <option value="">Any severity</option>
@@ -170,7 +171,7 @@ onMounted(load)
                 <div class="faint small">{{ vuln.severity || '' }}</div>
               </td>
               <td>
-                <span class="badge" :class="vuln.ecosystem === 'npm' ? 'badge-npm' : 'badge-pypi'">
+                <span class="badge" :class="ecosystemBadge(vuln.ecosystem)">
                   {{ vuln.ecosystem }}
                 </span>
               </td>
@@ -215,7 +216,7 @@ onMounted(load)
             <tbody>
               <tr v-for="entry in detail.affected" :key="entry.link_id">
                 <td>
-                  <span class="badge" :class="entry.ecosystem === 'npm' ? 'badge-npm' : 'badge-pypi'">
+                  <span class="badge" :class="ecosystemBadge(entry.ecosystem)">
                     {{ entry.ecosystem }}
                   </span>
                   {{ entry.package }}

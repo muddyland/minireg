@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { relativeTime } from '@/utils/format'
+import { ecosystemBadge, relativeTime } from '@/utils/format'
 
 const upstreams = ref([])
 const loading = ref(true)
@@ -33,28 +33,46 @@ const showForm = ref(false)
 const editing = ref(null)
 const form = ref(blank())
 
-const byEcosystem = computed(() => ({
-  npm: upstreams.value.filter((u) => u.ecosystem === 'npm').sort(sortFn),
-  pypi: upstreams.value.filter((u) => u.ecosystem === 'pypi').sort(sortFn),
-}))
+const ECOSYSTEMS = ['npm', 'pypi', 'cargo']
+
+const byEcosystem = computed(() =>
+  Object.fromEntries(
+    ECOSYSTEMS.map((eco) => [eco, upstreams.value.filter((u) => u.ecosystem === eco).sort(sortFn)]),
+  ),
+)
 
 function sortFn(a, b) {
   return a.tier - b.tier || a.priority - b.priority
 }
 
-const kindOptions = computed(() =>
-  form.value.ecosystem === 'npm'
-    ? [
-        { value: 'npm', label: 'npm registry' },
-        { value: 'gitlab_npm', label: 'GitLab npm registry' },
-      ]
-    : [
-        { value: 'pypi', label: 'PyPI simple index' },
-        { value: 'gitlab_pypi', label: 'GitLab PyPI registry' },
-      ],
-)
+// GitLab hosts npm and PyPI package registries but has no cargo one, so
+// cargo has a single kind. This mirrors _KINDS_FOR_ECOSYSTEM on the server,
+// which is what actually rejects a mismatch.
+const KINDS_BY_ECOSYSTEM = {
+  npm: [
+    { value: 'npm', label: 'npm registry' },
+    { value: 'gitlab_npm', label: 'GitLab npm registry' },
+  ],
+  pypi: [
+    { value: 'pypi', label: 'PyPI simple index' },
+    { value: 'gitlab_pypi', label: 'GitLab PyPI registry' },
+  ],
+  cargo: [{ value: 'cargo', label: 'Cargo sparse index' }],
+}
+
+const kindOptions = computed(() => KINDS_BY_ECOSYSTEM[form.value.ecosystem] ?? [])
 
 const isGitlab = computed(() => form.value.kind.startsWith('gitlab_'))
+
+const URL_PLACEHOLDERS = {
+  npm: 'https://registry.npmjs.org',
+  pypi: 'https://pypi.org/simple',
+  cargo: 'https://index.crates.io',
+}
+
+const urlPlaceholder = computed(
+  () => URL_PLACEHOLDERS[form.value.kind] ?? 'https://gitlab.example.com',
+)
 
 async function load() {
   loading.value = true
@@ -89,7 +107,7 @@ function openEdit(upstream) {
 }
 
 function onEcosystemChange() {
-  form.value.kind = form.value.ecosystem === 'npm' ? 'npm' : 'pypi'
+  form.value.kind = kindOptions.value[0]?.value ?? 'npm'
 }
 
 async function save() {
@@ -181,10 +199,10 @@ onMounted(load)
   <div v-if="loading" class="empty">Loading…</div>
 
   <template v-else>
-    <div v-for="eco in ['npm', 'pypi']" :key="eco" class="card mb">
+    <div v-for="eco in ECOSYSTEMS" :key="eco" class="card mb">
       <div class="card-head">
         <h3>
-          <span class="badge" :class="eco === 'npm' ? 'badge-npm' : 'badge-pypi'">{{ eco }}</span>
+          <span class="badge" :class="ecosystemBadge(eco)">{{ eco }}</span>
           upstreams
         </h3>
         <span class="faint small">{{ byEcosystem[eco].length }} configured</span>
@@ -282,6 +300,7 @@ onMounted(load)
             <select v-model="form.ecosystem" :disabled="!!editing" @change="onEcosystemChange">
               <option value="npm">npm</option>
               <option value="pypi">PyPI</option>
+              <option value="cargo">cargo</option>
             </select>
           </div>
           <div class="field" style="flex: 1">
@@ -298,16 +317,15 @@ onMounted(load)
           <label>URL</label>
           <input
             v-model="form.url"
-            :placeholder="
-              form.kind === 'npm'
-                ? 'https://registry.npmjs.org'
-                : form.kind === 'pypi'
-                  ? 'https://pypi.org/simple'
-                  : 'https://gitlab.example.com'
-            "
+            :placeholder="urlPlaceholder"
           />
           <p class="field-hint">
             For GitLab, the instance root — the <code>/api/v4</code> path is added automatically.
+            <template v-if="form.ecosystem === 'cargo'">
+              For cargo, the sparse index root, without the <code>sparse+</code>
+              prefix — that is a scheme marker for the client, not part of the
+              URL we fetch.
+            </template>
           </p>
         </div>
 

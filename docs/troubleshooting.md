@@ -65,6 +65,41 @@ restart.
 A closer `.npmrc` wins. `npm config list` shows which file provided each
 setting. Project-level beats user-level beats global.
 
+### cargo tries to clone the index
+
+```
+error: failed to load source for dependency `serde`
+Caused by: Unable to update registry `minireg`
+```
+
+The `sparse+` prefix is missing from the registry URL. Without it cargo treats
+the URL as a **git** index and tries to clone it. The value must be
+`sparse+https://…/cargo/index/`, prefix and trailing slash both.
+
+### Every crate 404s but `config.json` works
+
+The trailing slash is missing from the index URL. Cargo joins the shard path
+against the last segment, so `…/cargo/index` + `se/rd/serde` resolves to
+`…/cargo/se/rd/serde`. Add the slash.
+
+### `checksum for X did not match what is in Cargo.lock`
+
+Source replacement requires the replacement to serve the *same bytes* as
+crates.io, which a caching mirror does. If this appears, the mirror served
+something else — check the registry logs for a digest-mismatch 502, which is
+what it emits when an upstream hands it an artifact whose hash disagrees with
+the `cksum` in the index.
+
+If it appears only for a crate that is **not** on crates.io, that crate cannot
+be resolved through a replaced source at all — see
+[why cargo is read-only](usage.md#why-cargo-is-read-only).
+
+### `registry does not support API commands`
+
+Expected. This is a read-only mirror: `cargo publish`, `cargo yank`,
+`cargo search` and `cargo login` are not implemented, and `config.json` omits
+the `api` key so cargo says so up front rather than failing deeper in.
+
 ### `ECONNREFUSED` / `ETIMEDOUT` behind a proxy
 
 Package tarballs are large. If nginx has a default `client_max_body_size`,

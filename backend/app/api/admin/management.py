@@ -316,11 +316,17 @@ def upstream_payload(upstream: Upstream) -> dict:
     }
 
 
+#: Which provider kinds can back each ecosystem. GitLab publishes npm and
+#: PyPI package registries but has no cargo registry, so cargo has one kind.
+_KINDS_FOR_ECOSYSTEM = {
+    Ecosystem.npm: {UpstreamKind.npm, UpstreamKind.gitlab_npm},
+    Ecosystem.pypi: {UpstreamKind.pypi, UpstreamKind.gitlab_pypi},
+    Ecosystem.cargo: {UpstreamKind.cargo},
+}
+
+
 def _validate_kind(ecosystem: Ecosystem, kind: UpstreamKind) -> None:
-    npm_kinds = {UpstreamKind.npm, UpstreamKind.gitlab_npm}
-    pypi_kinds = {UpstreamKind.pypi, UpstreamKind.gitlab_pypi}
-    valid = npm_kinds if ecosystem == Ecosystem.npm else pypi_kinds
-    if kind not in valid:
+    if kind not in _KINDS_FOR_ECOSYSTEM.get(ecosystem, set()):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"kind '{kind.value}' is not valid for ecosystem '{ecosystem.value}'",
@@ -567,16 +573,31 @@ def _validate_version_spec(ecosystem: Ecosystem | None, spec: str | None) -> str
         return None
     spec = spec.strip()
 
-    # An ecosystem-agnostic rule has to satisfy both grammars.
-    check_npm = ecosystem in (None, Ecosystem.npm)
+    # An ecosystem-agnostic rule has to satisfy both grammars. npm and cargo
+    # share one: both are semver 2.0.0 and both are evaluated by the same range
+    # engine. They disagree only on what a *bare* version means -- `1.2.3` is an
+    # exact pin here and a caret range in Cargo.toml -- which is why the
+    # expansion is echoed back to the admin rather than left implicit.
+    check_semver = ecosystem in (None, Ecosystem.npm, Ecosystem.cargo)
     check_pypi = ecosystem in (None, Ecosystem.pypi)
 
-    if check_npm and not is_valid_range(spec):
+    if check_semver and not is_valid_range(spec):
+        # Name the grammar after the ecosystem the admin actually chose; "npm
+        # version range" is what the docs and the UI both call it, and for a
+        # cargo rule the caret caveat is the thing most likely to bite.
+        grammar = "npm version range" if ecosystem != Ecosystem.cargo else "semver range"
+        caveat = (
+            " Note a bare '1.2.3' pins that exact version here, unlike in "
+            "Cargo.toml where it means '^1.2.3'."
+            if ecosystem == Ecosystem.cargo
+            else ""
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"'{spec}' is not a valid npm version range. Examples: "
+                f"'{spec}' is not a valid {grammar}. Examples: "
                 "'1.2.3', '<4.17.21', '^1.2.3', '>=3.0.0 <3.0.2', '1.x || 2.x'."
+                + caveat
             ),
         )
 
@@ -594,10 +615,10 @@ def _validate_version_spec(ecosystem: Ecosystem | None, spec: str | None) -> str
                         "'==1.2.3', '<2.0', '>=1.0,<2.0', '~=1.4.2'."
                     ),
                 ) from exc
-            # Ecosystem-agnostic rule: npm already accepted it, so allow it
-            # through and let PyPI evaluation fall back to a glob.
+            # Ecosystem-agnostic rule: the semver grammar already accepted it,
+            # so allow it through and let PyPI evaluation fall back to a glob.
 
-    if check_npm and is_valid_range(spec):
+    if check_semver and is_valid_range(spec):
         return str(parse_range(spec))
     return spec
 

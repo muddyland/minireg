@@ -82,11 +82,13 @@ def _updated_col(**kw) -> Mapped[datetime]:
 class Ecosystem(enum.StrEnum):
     npm = "npm"
     pypi = "pypi"
+    cargo = "cargo"
 
 
 class UpstreamKind(enum.StrEnum):
     npm = "npm"
     pypi = "pypi"
+    cargo = "cargo"
     gitlab_npm = "gitlab_npm"
     gitlab_pypi = "gitlab_pypi"
 
@@ -292,7 +294,8 @@ class Package(Base):
     )
     # Display name as the ecosystem spells it (npm: as published; pypi: as uploaded).
     name: Mapped[str] = mapped_column(String(512), nullable=False)
-    # npm: lowercased name. pypi: PEP 503 normalized. This is the lookup key.
+    # npm: lowercased name. pypi: PEP 503 normalized. cargo: lowercased,
+    # which is the form the sparse index paths use. This is the lookup key.
     normalized_name: Mapped[str] = mapped_column(String(512), nullable=False)
 
     description: Mapped[str | None] = mapped_column(Text)
@@ -344,7 +347,7 @@ class PackageVersion(Base):
         ForeignKey("packages.id", ondelete="CASCADE"), index=True, nullable=False
     )
     version: Mapped[str] = mapped_column(String(128), nullable=False)
-    # PEP 440 normalized (pypi) / semver as-is (npm)
+    # PEP 440 normalized (pypi) / semver as-is (npm, cargo)
     normalized_version: Mapped[str] = mapped_column(String(128), nullable=False)
 
     # Full per-version metadata: package.json for npm, core metadata for pypi.
@@ -378,7 +381,8 @@ class PackageVersion(Base):
 
 
 class PackageFile(Base):
-    """One distributable artifact: an npm .tgz or a PyPI wheel/sdist."""
+    """One distributable artifact: an npm .tgz, a PyPI wheel/sdist, or a
+    cargo .crate."""
 
     __tablename__ = "package_files"
 

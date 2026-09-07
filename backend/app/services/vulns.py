@@ -67,26 +67,20 @@ def lowest_clearing_version(
     if not fixes:
         return None
 
-    if ecosystem == "npm":
-        from ..core.naming import sort_semver
+    # Order by the ecosystem's own precedence rules. Reaching for PEP 440 as
+    # the default would be wrong for cargo: it is semver, and a prerelease like
+    # `1.0.0-beta.1` does not parse as PEP 440 at all, so it would sort into
+    # the unparseable bucket and could be handed back as the recommended fix.
+    from ..core.naming import sort_versions_for
 
-        ordered = sort_semver(list({*fixes}))
-    else:
-        from ..core.naming import sort_pypi_versions
-
-        ordered = sort_pypi_versions(list({*fixes}))
-
+    ordered = sort_versions_for(ecosystem, list({*fixes}))
     if not ordered:
         return None
     target = ordered[-1]
 
     # Never propose a downgrade or a no-op.
     if current_version:
-        ranked = (
-            sort_semver([current_version, target])
-            if ecosystem == "npm"
-            else sort_pypi_versions([current_version, target])
-        )
+        ranked = sort_versions_for(ecosystem, [current_version, target])
         if ranked and ranked[-1] == current_version:
             return None
     return target

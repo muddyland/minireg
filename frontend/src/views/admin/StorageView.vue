@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { formatBytes, formatNumber, percent } from '@/utils/format'
+import { ecosystemBadge, formatBytes, formatNumber, percent } from '@/utils/format'
 
 const stats = ref(null)
 const loading = ref(true)
@@ -125,7 +125,7 @@ onMounted(load)
           <div v-else class="bars">
             <div v-for="row in stats.by_ecosystem" :key="row.ecosystem" class="bar-row">
               <span class="small">
-                <span class="badge" :class="row.ecosystem === 'npm' ? 'badge-npm' : 'badge-pypi'">
+                <span class="badge" :class="ecosystemBadge(row.ecosystem)">
                   {{ row.ecosystem }}
                 </span>
                 {{ formatNumber(row.files) }} files
@@ -160,6 +160,7 @@ onMounted(load)
               <option value="">Both</option>
               <option value="npm">npm only</option>
               <option value="pypi">PyPI only</option>
+              <option value="cargo">cargo only</option>
             </select>
           </div>
           <div class="field">

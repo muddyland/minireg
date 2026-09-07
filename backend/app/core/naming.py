@@ -8,6 +8,12 @@ poisoning at worst, so every rule here traces to a spec:
 * PEP 440  -- PyPI version normalization
 * PEP 427 / PyPA binary distribution format -- wheel filename grammar
 * npm ``validate-npm-package-name`` -- npm name rules
+* RFC 2789 / the cargo book -- crates.io sparse-index path layout
+
+Cargo versions are plain semver 2.0.0, so the npm ordering helpers below apply
+to them unchanged; only the *range* dialect differs (a bare ``1.2.3`` means
+``^1.2.3`` to cargo and an exact pin to npm), and ranges are the policy
+engine's concern rather than this module's.
 
 npm *version* semantics (precedence and ranges) live in
 :mod:`app.core.semver`; this module re-exports the ordering helpers so callers
@@ -232,6 +238,76 @@ def max_semver(versions: list[str]) -> str | None:
     return sorted(pool, key=semver_key)[-1]
 
 
+# --------------------------------------------------------------------------- #
+# cargo / crates.io
+# --------------------------------------------------------------------------- #
+# crates.io accepts ASCII alphanumerics plus `-` and `_`, and requires the
+# first character to be a letter. 64 characters is the published maximum.
+_CARGO_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+def normalize_cargo_name(name: str) -> str:
+    """Lowercase, which is the form the sparse index paths are built from.
+
+    Note this is deliberately *not* the rule crates.io uses to decide whether
+    two names collide -- there, ``-`` and ``_`` are also folded together, so
+    ``foo-bar`` and ``foo_bar`` cannot both be registered. Folding them here
+    too would be wrong for a mirror: the index is keyed on the name as spelled,
+    so ``foo_bar`` must resolve to ``foo_bar`` and not to whichever of the pair
+    we happened to cache first.
+    """
+    return name.strip().lower()
+
+
+def is_valid_cargo_name(name: str) -> bool:
+    return bool(_CARGO_NAME_RE.match(name.strip()))
+
+
+def cargo_index_prefix(name: str) -> str:
+    """The directory prefix a crate's index file lives under.
+
+    The registry index shards names so no single directory holds the whole of
+    crates.io. The layout is fixed by the cargo book and clients compute it
+    themselves, so it has to match exactly:
+
+        1 char    ``1/{name}``
+        2 chars   ``2/{name}``
+        3 chars   ``3/{first}/{name}``
+        4+        ``{name[0:2]}/{name[2:4]}/{name}``
+
+    Everything is lowercased.
+    """
+    lowered = normalize_cargo_name(name)
+    length = len(lowered)
+    if length == 0:
+        raise ValueError("crate name cannot be empty")
+    if length == 1:
+        return "1"
+    if length == 2:
+        return "2"
+    if length == 3:
+        return f"3/{lowered[0]}"
+    return f"{lowered[:2]}/{lowered[2:4]}"
+
+
+def cargo_index_path(name: str) -> str:
+    """``serde`` -> ``se/rd/serde``. The path clients request from the index."""
+    return f"{cargo_index_prefix(name)}/{normalize_cargo_name(name)}"
+
+
+def cargo_crate_filename(name: str, version: str) -> str:
+    """cargo's own convention for a downloaded artifact.
+
+    There is deliberately no inverse of this, unlike
+    :func:`parse_dist_filename` for PyPI. The Simple API is file-oriented, so
+    a wheel's version has to be recovered from its filename; the sparse index
+    is version-oriented and states the version outright. Recovering it from
+    the filename would also be ambiguous -- both crate names and semver
+    prereleases contain ``-``, so ``serde-1.0.0-beta.1`` has no unique split.
+    """
+    return f"{name}-{version}.crate"
+
+
 def normalize_version_for(ecosystem: str, version: str) -> str:
     if ecosystem == "pypi":
         return normalize_pypi_version(version)
@@ -239,7 +315,11 @@ def normalize_version_for(ecosystem: str, version: str) -> str:
 
 
 def normalize_name_for(ecosystem: str, name: str) -> str:
-    return normalize_pypi_name(name) if ecosystem == "pypi" else normalize_npm_name(name)
+    if ecosystem == "pypi":
+        return normalize_pypi_name(name)
+    if ecosystem == "cargo":
+        return normalize_cargo_name(name)
+    return normalize_npm_name(name)
 
 
 def sort_versions_for(ecosystem: str, versions: list[str], reverse: bool = False) -> list[str]:
@@ -249,7 +329,9 @@ def sort_versions_for(ecosystem: str, versions: list[str], reverse: bool = False
     sorts above "4.18.1" because "9" > "1" as text, so a package's newest
     release ends up buried in the middle of the list.
     """
-    ordered = sort_semver(versions) if ecosystem == "npm" else sort_pypi_versions(versions)
+    # cargo is semver 2.0.0, the same precedence rules the npm engine
+    # implements, so pypi is the exception here rather than npm being the rule.
+    ordered = sort_pypi_versions(versions) if ecosystem == "pypi" else sort_semver(versions)
     return list(reversed(ordered)) if reverse else ordered
 
 

@@ -1,7 +1,7 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { formatBytes, formatDate, formatNumber, severityClass } from '@/utils/format'
+import { ecosystemBadge, formatBytes, formatDate, formatNumber, severityClass } from '@/utils/format'
 
 const packages = ref([])
 const total = ref(0)
@@ -72,6 +72,7 @@ onMounted(load)
           <option value="">All ecosystems</option>
           <option value="npm">npm</option>
           <option value="pypi">PyPI</option>
+          <option value="cargo">cargo</option>
         </select>
         <input v-model="filters.search" type="search" placeholder="Name contains…" style="flex: 1" @keyup.enter="((page = 0), load())" />
         <label class="check">
@@ -102,7 +103,7 @@ onMounted(load)
           <tbody>
             <tr v-for="pkg in packages" :key="pkg.id">
               <td>
-                <span class="badge" :class="pkg.ecosystem === 'npm' ? 'badge-npm' : 'badge-pypi'">
+                <span class="badge" :class="ecosystemBadge(pkg.ecosystem)">
                   {{ pkg.ecosystem }}
                 </span>
                 <strong>{{ pkg.name }}</strong>
@@ -150,7 +151,7 @@ onMounted(load)
         <div>
           <h3 style="margin: 0">{{ detail.package.name }}</h3>
           <div class="row-tight" style="margin-top: 0.25rem">
-            <span class="badge" :class="detail.package.ecosystem === 'npm' ? 'badge-npm' : 'badge-pypi'">
+            <span class="badge" :class="ecosystemBadge(detail.package.ecosystem)">
               {{ detail.package.ecosystem }}
             </span>
             <span v-if="detail.package.is_local" class="badge badge-accent">published here</span>
