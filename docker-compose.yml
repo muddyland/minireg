@@ -1,5 +1,5 @@
 ####################################################################
-# minireg -- caching npm + PyPI registry
+# minireg -- caching npm + PyPI + cargo registry
 #
 #   cp .env.example .env    # then edit PUBLIC_URL and the secrets
 #   docker compose up -d --build

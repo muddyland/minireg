@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import api from '@/api/client'
-import { formatDate } from '@/utils/format'
+import { ecosystemBadge, formatDate } from '@/utils/format'
 
 const rules = ref([])
 const settings = ref(null)
@@ -248,6 +248,7 @@ onMounted(load)
             <select v-model="tester.ecosystem" style="width: auto">
               <option value="npm">npm</option>
               <option value="pypi">PyPI</option>
+              <option value="cargo">cargo</option>
             </select>
             <input v-model="tester.name" placeholder="package name" style="flex: 1" />
             <input v-model="tester.version" placeholder="version" style="width: 110px" />
@@ -280,7 +281,7 @@ onMounted(load)
               <tr v-for="rule in blockRules" :key="rule.id" :style="rule.enabled ? '' : 'opacity:.5'">
                 <td class="mono">{{ rule.pattern }}</td>
                 <td>
-                  <span class="badge" :class="rule.ecosystem === 'npm' ? 'badge-npm' : rule.ecosystem === 'pypi' ? 'badge-pypi' : ''">
+                  <span class="badge" :class="rule.ecosystem ? ecosystemBadge(rule.ecosystem) : ''">
                     {{ rule.ecosystem || 'all' }}
                   </span>
                 </td>
@@ -365,6 +366,7 @@ onMounted(load)
             <option value="">Both</option>
             <option value="npm">npm only</option>
             <option value="pypi">PyPI only</option>
+            <option value="cargo">cargo only</option>
           </select>
         </div>
         <div class="field">
@@ -384,9 +386,15 @@ onMounted(load)
               <code>&gt;=1.0,&lt;2.0</code>, <code>~=1.4.2</code>.
             </template>
             <template v-else>
-              Full npm semver range — <code>&lt;4.17.21</code>, <code>^1.2.3</code>,
+              Full semver range — <code>&lt;4.17.21</code>, <code>^1.2.3</code>,
               <code>~1.2</code>, <code>1.x</code>, <code>&gt;=3.0.0 &lt;3.0.2</code>,
               <code>1.x || 2.x</code>.
+              <template v-if="ruleForm.ecosystem === 'cargo'">
+                Note a bare <code>1.2.3</code> pins that exact version here,
+                unlike in <code>Cargo.toml</code> where it means
+                <code>^1.2.3</code> — the expansion below shows what it resolves
+                to.
+              </template>
             </template>
           </p>
 

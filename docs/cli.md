@@ -95,13 +95,15 @@ device — the code is what binds the session, not the browser.
 ## Configuring package managers
 
 ```bash
-minireg configure           # npm and pip
+minireg configure           # npm, pip and cargo
 minireg configure npm
 minireg configure pip
+minireg configure cargo
 minireg configure --dry-run # print what would be written
 ```
 
-Writes a marked block into `~/.npmrc` and `~/.config/pip/pip.conf`:
+Writes a marked block into `~/.npmrc`, `~/.config/pip/pip.conf` and
+`~/.cargo/config.toml`:
 
 ```ini
 # >>> minireg >>>
@@ -110,9 +112,25 @@ registry=https://registry.example.com/npm/
 # <<< minireg <<<
 ```
 
+```toml
+# >>> minireg >>>
+[source.crates-io]
+replace-with = "minireg"
+
+[source.minireg]
+registry = "sparse+https://registry.example.com/cargo/index/"
+# <<< minireg <<<
+```
+
 Anything else in those files is left alone, and re-running replaces the block
-rather than appending a second copy. Both files are written mode `600` because
-they contain a token.
+rather than appending a second copy. `~/.npmrc` and `pip.conf` are written mode
+`600` because they contain a token; the cargo block carries none, because
+reads are anonymous and cargo only sends credentials to an index that declares
+`auth-required`.
+
+The cargo block goes at the *end* of the file on first write. That matters for
+TOML in a way it does not for the other two: `[source.…]` are table headers, so
+anything placed after them would be read as part of `[source.minireg]`.
 
 ---
 
@@ -160,9 +178,15 @@ Two things distinguish this from `npm audit` / `pip-audit`:
 | `uv.lock` | PyPI |
 | `Pipfile.lock` | PyPI |
 | `requirements.txt` | PyPI (pinned `==` entries only) |
+| `Cargo.lock` | cargo (crates.io entries only) |
 
-Every lockfile found in the directory is audited, so a project with both npm
-and Python dependencies is covered in one run.
+Every lockfile found in the directory is audited, so a project with npm, Python
+and Rust dependencies is covered in one run.
+
+`Cargo.lock` also lists the workspace's own crates and any `git` or `path`
+dependencies. Those are not on crates.io, so they are skipped — asking the
+registry about them would return unknown for every one, which reads as a gap in
+coverage rather than as "this is your own code".
 
 Only exactly-pinned versions can be audited. A range like `django>=4.0` has no
 single version to look up, so it is reported as unpinned and excluded — the
@@ -219,8 +243,20 @@ What it edits:
 |---|---|---|
 | `package-lock.json` | `package.json` | The lock is generated output; raising the declared floor is what stops the next `npm install` regenerating a vulnerable lock |
 | `requirements.txt` | `requirements.txt` | The pins are the declaration |
+| `Cargo.lock` | *nothing* | See below |
 
 Then regenerate the lockfile — `npm install`, or `pip install -r requirements.txt` — so the change takes effect.
+
+**Cargo is not rewritten.** `Cargo.lock` is generated output, and `Cargo.toml`
+declares ranges against a workspace and feature graph that would have to be
+resolved to edit safely — a floor raised in the wrong member is a build break,
+not a bump. Cargo already owns this operation, so the audit prints the exact
+invocations instead:
+
+```
+    Cargo.lock: run these — cargo owns the lockfile
+      cargo update -p smallvec --precise 1.13.2
+```
 
 **The target version clears every CVE, not just one.** Each advisory reports
 the release that fixed *it*, and an upgrade has to satisfy all of them at once,
@@ -272,7 +308,7 @@ state of a new registry.
 
 ```bash
 minireg search express
-minireg search requests --ecosystem pypi --limit 10
+minireg search requests --ecosystem pypi --limit 10   # or: npm, cargo
 
 minireg info lodash
 minireg info requests --ecosystem pypi
@@ -310,7 +346,7 @@ for a person and a pipeline with no branching.
 | `login` | Authenticate via the browser |
 | `logout` | Forget the stored token (does not revoke it) |
 | `whoami` | Show the current identity and scopes |
-| `configure [npm\|pip\|all]` | Point package managers at the registry |
+| `configure [npm\|pip\|cargo\|all]` | Point package managers at the registry |
 | `audit [path]` | Check dependencies for CVEs |
 | `audit --fix` | Rewrite declarations to versions that clear them |
 | `search <query>` | Search the index |
@@ -333,6 +369,7 @@ for a person and a pipeline with no branching.
 | `MINIREG_TOKEN` | API token; overrides the config file |
 | `NO_COLOR` | Disable colour |
 | `XDG_CONFIG_HOME` | Config location (default `~/.config`) |
+| `CARGO_HOME` | Cargo config location (default `~/.cargo`) |
 
 ### Files
 
@@ -341,6 +378,7 @@ for a person and a pipeline with no branching.
 | `~/.config/minireg/config.json` | Registry URL, token, username. Mode `600` |
 | `~/.npmrc` | Written by `configure`, in a marked block |
 | `~/.config/pip/pip.conf` | Written by `configure`, in a marked block |
+| `~/.cargo/config.toml` | Written by `configure`, in a marked block. Honours `CARGO_HOME` |
 
 ---
 
@@ -364,7 +402,7 @@ a side effect of traffic it was making anyway and says one line when it has
 fallen behind:
 
 ```
-  note: this registry ships CLI 1.1.0, you have 1.0.0 — run 'minireg update'
+  note: this registry ships CLI 1.2.0, you have 1.1.0 — run 'minireg update'
 ```
 
 That costs no extra request, and it goes to stderr — piping `--json` output

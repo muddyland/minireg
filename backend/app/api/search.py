@@ -95,6 +95,14 @@ async def search(
     return {"total": total, "results": results[:limit], "query": q}
 
 
+def _install_command(ecosystem: Ecosystem, name: str) -> str:
+    if ecosystem == Ecosystem.npm:
+        return f"npm install {name}"
+    if ecosystem == Ecosystem.cargo:
+        return f"cargo add {name}"
+    return f"pip install {name}"
+
+
 @router.get("/packages/{ecosystem}/{name:path}")
 async def package_detail(
     ecosystem: Ecosystem,
@@ -168,11 +176,7 @@ async def package_detail(
         "blocked": verdict.blocked,
         "block_reason": verdict.reason if verdict.blocked else None,
         "dist_tags": {t.tag: t.version for t in package.dist_tags},
-        "install_command": (
-            f"npm install {package.name}"
-            if ecosystem == Ecosystem.npm
-            else f"pip install {package.name}"
-        ),
+        "install_command": _install_command(ecosystem, package.name),
         "versions": [
             {
                 "version": v.version,
@@ -262,5 +266,34 @@ async def client_config(identity: Identity = Depends(require_user)) -> dict:
                 f"poetry source add --priority=primary minireg {base}/pypi/simple/",
                 "poetry config http-basic.minireg __token__ <your-token>",
             ]
+        },
+        "cargo": {
+            # The `sparse+` prefix and the trailing slash are both load-bearing:
+            # without the prefix cargo tries to clone the URL as a git index,
+            # and without the slash it joins paths against the parent segment.
+            "registry": f"sparse+{base}/cargo/index/",
+            # Source replacement is how cargo mirrors a registry. It applies to
+            # every crates.io dependency without touching a single Cargo.toml,
+            # which is what makes it the right shape for a caching proxy -- and
+            # also why it cannot host crates that are not on crates.io.
+            "config_toml": "\n".join(
+                [
+                    "[source.crates-io]",
+                    'replace-with = "minireg"',
+                    "",
+                    "[source.minireg]",
+                    f'registry = "sparse+{base}/cargo/index/"',
+                ]
+            ),
+            "config_path": "~/.cargo/config.toml (or .cargo/config.toml in the project)",
+            "commands": [
+                "minireg configure   # writes the stanza above",
+                f"cargo build         # crates.io deps now resolve through {host}",
+            ],
+            "note": (
+                "This mirror is read-only. Source replacement requires the "
+                "replacement to serve the same crates as crates.io, so private "
+                "crates cannot be published or resolved through it."
+            ),
         },
     }

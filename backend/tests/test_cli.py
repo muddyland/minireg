@@ -534,14 +534,67 @@ class TestCliLockfileParsers:
         found = {(p["name"], p["version"]) for p in cli.parse_pipfile_lock(path)}
         assert found == {("requests", "2.31.0"), ("pytest", "8.0.0")}
 
+    def test_cargo_lock(self, tmp_path):
+        path = tmp_path / "Cargo.lock"
+        path.write_text(
+            """version = 3
+
+[[package]]
+name = "serde"
+version = "1.0.197"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fb1c873e1b9b056a4dc4c0c198b24c3ffa059243875552b2bd0933b1aee4ce2"
+
+[[package]]
+name = "libc"
+version = "0.2.153"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c198f91728a82281a64e1f4f9eeb25d82cb32a5de251c6bd1b5154d63a8e7bd"
+"""
+        )
+        found = {(p["name"], p["version"]) for p in cli.parse_cargo_lock(path)}
+        assert found == {("serde", "1.0.197"), ("libc", "0.2.153")}
+
+    def test_cargo_lock_skips_what_is_not_on_crates_io(self, tmp_path):
+        """The workspace's own crates carry no `source`, and git dependencies
+        carry a `git+` one. Sending either to the registry asks about packages
+        that cannot exist there, and every answer comes back unknown -- which
+        reads as a gap in coverage rather than as 'this is your own code'."""
+        path = tmp_path / "Cargo.lock"
+        path.write_text(
+            """version = 3
+
+[[package]]
+name = "my-workspace-crate"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "patched-dep"
+version = "0.3.0"
+source = "git+https://github.com/example/patched-dep?rev=abc123#abc123"
+
+[[package]]
+name = "serde"
+version = "1.0.197"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"""
+        )
+        found = {p["name"] for p in cli.parse_cargo_lock(path)}
+        assert found == {"serde"}
+
     def test_discover_finds_multiple_ecosystems(self, tmp_path):
         (tmp_path / "package-lock.json").write_text(
             json.dumps({"packages": {"node_modules/lodash": {"version": "4.17.21"}}})
         )
         (tmp_path / "requirements.txt").write_text("requests==2.31.0\n")
+        (tmp_path / "Cargo.lock").write_text(
+            '[[package]]\nname = "serde"\nversion = "1.0.197"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        )
         found = cli.discover(tmp_path)
         ecosystems = {ecosystem for _path, ecosystem, _pkgs in found}
-        assert ecosystems == {"npm", "pypi"}
+        assert ecosystems == {"npm", "pypi", "cargo"}
 
     def test_malformed_lockfile_yields_nothing_rather_than_raising(self, tmp_path):
         path = tmp_path / "package-lock.json"
@@ -948,6 +1001,45 @@ class TestFixVersionSelection:
         finding = response.json()["findings"][0]
         assert finding["fixable"] is True
         assert finding["fix_version"] == "4.18.0"
+
+
+class TestCargoFixAdvice:
+    """`--fix` cannot rewrite a Rust project, so it hands back the commands
+    that do the job instead."""
+
+    def test_prints_a_cargo_update_line_per_fix(self, tmp_path, capsys):
+        printed = cli._print_cargo_fix_advice(
+            tmp_path / "Cargo.lock",
+            [
+                {"name": "time", "version": "0.3.31", "fix_version": "0.3.47", "cves": [{}]},
+                {"name": "smallvec", "version": "1.6.0", "fix_version": "1.6.1", "cves": [{}]},
+            ],
+        )
+        out = capsys.readouterr().out
+        assert printed == 2
+        assert "cargo update -p time --precise 0.3.47" in out
+        assert "cargo update -p smallvec --precise 1.6.1" in out
+        # It must not claim to have edited anything.
+        assert "Cargo.toml" not in out
+
+    def test_deduplicates_repeated_fixes(self, tmp_path, capsys):
+        printed = cli._print_cargo_fix_advice(
+            tmp_path / "Cargo.lock",
+            [
+                {"name": "time", "version": "0.3.31", "fix_version": "0.3.47", "cves": [{}]},
+                {"name": "time", "version": "0.3.31", "fix_version": "0.3.47", "cves": [{}]},
+            ],
+        )
+        assert printed == 1
+        assert capsys.readouterr().out.count("cargo update") == 1
+
+    def test_says_so_when_nothing_has_a_fix(self, tmp_path, capsys):
+        printed = cli._print_cargo_fix_advice(
+            tmp_path / "Cargo.lock",
+            [{"name": "time", "version": "0.3.31", "fix_version": None, "cves": [{}]}],
+        )
+        assert printed == 0
+        assert "nothing with a published fix" in capsys.readouterr().out
 
 
 class TestFixPlanners:

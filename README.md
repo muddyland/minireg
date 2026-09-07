@@ -1,11 +1,13 @@
 # minireg
 
-A caching **npm** and **PyPI** package registry with tiered upstreams, OIDC
-single sign-on, CVE-based blocking, an admin UI, and a CLI.
+A caching **npm**, **PyPI** and **cargo** package registry with tiered
+upstreams, OIDC single sign-on, CVE-based blocking, an admin UI, and a CLI.
 
-Both registry APIs are implemented to spec, including publishing, so the real
-clients work unmodified: `npm install`, `npm publish`, `pip install`,
-`twine upload`, `uv`, and `poetry`.
+The npm and PyPI APIs are implemented to spec, including publishing, so the
+real clients work unmodified: `npm install`, `npm publish`, `pip install`,
+`twine upload`, `uv`, and `poetry`. Cargo is supported as a **read-only
+mirror** — see [Spec compliance](#spec-compliance) for why publishing is not
+part of it.
 
 ```bash
 cp .env.example .env     # set SECRET_KEY and PUBLIC_URL
@@ -41,7 +43,8 @@ Then [read the setup guide](docs/installation.md).
   exhausted before tier 2; within a tier the upstreams are raced and the first
   success wins. A failing upstream is quarantined and recovers on its own.
 - **Publishes.** `npm publish` and `twine upload` work against it, gated on an
-  API token, and can be mirrored to a GitLab package registry.
+  API token, and can be mirrored to a GitLab package registry. Cargo is
+  read-only.
 - **Indexes GitLab.** A GitLab npm or PyPI registry can be an upstream for
   reads, a publish target, or both.
 - **Scans for CVEs** against [OSV.dev](https://osv.dev) — CVE records only. New
@@ -76,6 +79,15 @@ npm config set //registry.example.com/npm/:_authToken "<token>"
 pip config set global.index-url https://registry.example.com/pypi/simple/
 ```
 
+```toml
+# cargo, by hand — ~/.cargo/config.toml
+[source.crates-io]
+replace-with = "minireg"
+
+[source.minireg]
+registry = "sparse+https://registry.example.com/cargo/index/"
+```
+
 > **`PUBLIC_URL` must match the address clients actually use.** Every tarball
 > and file URL is rendered against it, so if it is wrong the metadata looks
 > perfect while installs fail.
@@ -104,10 +116,28 @@ strict field whitelist. Scoped names work encoded or not.
 
 Advertised API version **1.1**.
 
+**Cargo** — the sparse HTTP index (RFC 2789): `config.json`, the sharded
+per-crate index files, and artifact downloads. Read-only, and deliberately so.
+
+Cargo mirrors a registry through *source replacement*, and source replacement
+requires the replacement to serve content identical to crates.io — cargo
+verifies each crate against the checksum in `Cargo.lock`. A crate that is not
+on crates.io therefore cannot be resolved through a replaced source no matter
+what the registry serves, so a publish surface here would be a surface nobody
+could use. `config.json` omits the `api` key for the same reason: without it
+cargo says "registry does not support API commands" instead of failing deeper
+in `cargo publish`.
+
+The older **git** index is not supported. Cloning and maintaining a repository
+the size of the crates.io index is a different operational shape than an HTTP
+cache, and every registry worth mirroring now serves sparse.
+
 Verified against the real thing: `pip install requests` resolves and installs
 its whole dependency tree through the registry, including PEP 658 metadata
 sidecars; `twine upload` publishes and `pip install` retrieves the result;
-proxied npm tarballs match npmjs' published `shasum` byte for byte.
+proxied npm tarballs match npmjs' published `shasum` byte for byte; the cargo
+provider reads `index.crates.io` and the artifact it resolves hashes to the
+`cksum` the index published.
 
 ---
 

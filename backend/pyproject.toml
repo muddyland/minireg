@@ -1,7 +1,7 @@
 [project]
 name = "minireg"
 version = "1.0.0"
-description = "Caching npm + PyPI package registry with tiered upstreams, OIDC, and CVE policy"
+description = "Caching npm + PyPI + cargo package registry with tiered upstreams, OIDC, and CVE policy"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",

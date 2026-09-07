@@ -43,6 +43,7 @@ from ..upstreams.base import (
     UpstreamNotFound,
     UpstreamProvider,
 )
+from ..upstreams.cargo_provider import CargoProvider
 from ..upstreams.gitlab_provider import GitLabNpmProvider, GitLabPyPIProvider
 from ..upstreams.npm_provider import NpmProvider
 from ..upstreams.pypi_provider import PyPIProvider
@@ -52,6 +53,7 @@ log = logging.getLogger(__name__)
 PROVIDERS: dict[UpstreamKind, type[UpstreamProvider]] = {
     UpstreamKind.npm: NpmProvider,
     UpstreamKind.pypi: PyPIProvider,
+    UpstreamKind.cargo: CargoProvider,
     UpstreamKind.gitlab_npm: GitLabNpmProvider,
     UpstreamKind.gitlab_pypi: GitLabPyPIProvider,
 }
@@ -119,8 +121,10 @@ class Resolver:
         if not upstreams:
             return None
         # PyPI merges by default because the Simple API is file-oriented and a
-        # project's files can legitimately be split across indexes. npm does
-        # not: a packument is a single authoritative document.
+        # project's files can legitimately be split across indexes. npm and
+        # cargo do not: a packument and a sparse-index file are each a single
+        # authoritative document, and stitching two of them together would
+        # produce a version list no upstream ever published.
         if merge_tier is None:
             merge_tier = ecosystem == Ecosystem.pypi
 

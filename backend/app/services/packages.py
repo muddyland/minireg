@@ -24,8 +24,6 @@ from ..config import settings
 from ..core.cache import cache_delete_prefix, herd_guard
 from ..core.naming import (
     normalize_name_for,
-    normalize_npm_name,
-    normalize_pypi_name,
     normalize_pypi_version,
 )
 from ..models import DistTag, Ecosystem, Package, PackageFile, PackageVersion, Upstream
@@ -293,10 +291,14 @@ def _derive_latest(ecosystem: Ecosystem, package: Package) -> str | None:
         versions = [v.version for v in package.versions]
     if not versions:
         return None
-    if ecosystem == Ecosystem.npm:
-        return max_semver(versions)
-    ordered = sort_pypi_versions(versions)
-    return ordered[-1] if ordered else None
+    if ecosystem == Ecosystem.pypi:
+        ordered = sort_pypi_versions(versions)
+        return ordered[-1] if ordered else None
+    # npm and cargo are both semver 2.0.0, and both want the highest *stable*
+    # release rather than the highest version outright -- a crate sitting on a
+    # long run of `-alpha` publishes should still present its last release as
+    # latest.
+    return max_semver(versions)
 
 
 async def fetch_package(
@@ -402,6 +404,4 @@ async def search_local(
 
 
 def normalized_for(ecosystem: Ecosystem, name: str) -> str:
-    return (
-        normalize_pypi_name(name) if ecosystem == Ecosystem.pypi else normalize_npm_name(name)
-    )
+    return normalize_name_for(ecosystem.value, name)

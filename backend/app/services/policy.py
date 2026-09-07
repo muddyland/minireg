@@ -124,10 +124,14 @@ def _matches_version(spec: str | None, ecosystem: str, version: str | None) -> b
     against does not match (the rule is version-scoped, we are asking about the
     package as a whole).
 
-    npm specs are full node-semver ranges -- ``^1.2.3``, ``<4.17.21``,
-    ``>=3.0.0 <3.0.2``, ``1.x || 2.x``. PyPI specs are PEP 440 specifier sets.
-    Either way, a spec that does not parse falls back to a glob so a rule
-    written before this understood ranges keeps working.
+    npm and cargo specs are full node-semver ranges -- ``^1.2.3``,
+    ``<4.17.21``, ``>=3.0.0 <3.0.2``, ``1.x || 2.x``. Both ecosystems are
+    semver 2.0.0 so one engine serves both; they differ only in that a bare
+    ``1.2.3`` is an exact pin to npm and a caret range to cargo, and a *rule*
+    is read here with npm's meaning -- the stricter of the two, which is the
+    safe direction for something that decides what to block. PyPI specs are
+    PEP 440 specifier sets. Either way, a spec that does not parse falls back
+    to a glob so a rule written before this understood ranges keeps working.
 
     Prereleases are matched *inclusively* on both sides. This deliberately
     departs from npm's install-time default, where ``>=1.0.0 <2.0.0`` skips

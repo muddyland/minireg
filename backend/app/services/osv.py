@@ -11,7 +11,8 @@ Policy decisions baked in here:
   timeout, so a slow OSV never becomes a slow ``npm install``. On timeout we
   fail open by default (configurable) and queue a background scan.
 
-OSV ecosystem identifiers: ``npm`` and ``PyPI`` (note the capitalisation).
+OSV ecosystem identifiers: ``npm``, ``PyPI`` and ``crates.io`` (note the
+capitalisation -- OSV rejects a query whose ecosystem name is not exact).
 """
 
 from __future__ import annotations
@@ -33,7 +34,11 @@ from ..upstreams.base import get_http_client
 
 log = logging.getLogger(__name__)
 
-OSV_ECOSYSTEM = {Ecosystem.npm: "npm", Ecosystem.pypi: "PyPI"}
+OSV_ECOSYSTEM = {
+    Ecosystem.npm: "npm",
+    Ecosystem.pypi: "PyPI",
+    Ecosystem.cargo: "crates.io",
+}
 CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 
 # CVSS v3/v4 qualitative rating scale (FIRST.org).

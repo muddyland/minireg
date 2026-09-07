@@ -179,6 +179,87 @@ Rules that are enforced:
 
 ---
 
+## Rust / cargo
+
+Cargo is supported as a **read-only mirror of crates.io**. It caches artifacts,
+scans them for CVEs, and enforces the same block rules as the other two
+ecosystems — but nothing can be published to it. See
+[why](#why-cargo-is-read-only) below.
+
+### Point everything at the registry
+
+Cargo mirrors a registry through *source replacement*, which redirects every
+crates.io dependency without touching a single `Cargo.toml`:
+
+```toml
+# ~/.cargo/config.toml
+[source.crates-io]
+replace-with = "minireg"
+
+[source.minireg]
+registry = "sparse+https://registry.example.com/cargo/index/"
+```
+
+Then `cargo build` as usual. `minireg configure` writes exactly this block.
+
+Two details are load-bearing:
+
+- **`sparse+`** is a scheme marker telling cargo the index is served over HTTP.
+  Without it, cargo tries to `git clone` the URL and fails in a way that reads
+  like a network problem.
+- **The trailing slash** on the index URL. Without it cargo joins the shard
+  paths against the parent segment and every crate 404s.
+
+### Commit it to the project
+
+Put the same block in `.cargo/config.toml` at the repository root and it
+applies to everyone who builds it, with no per-developer setup.
+
+### Verifying it is being used
+
+```bash
+cargo build -v 2>&1 | grep -i registry.example.com
+```
+
+Or check the **Packages** page in the UI — crates appear there as soon as they
+are resolved through the registry.
+
+### Auditing
+
+`minireg audit` reads `Cargo.lock`, so a Rust project is audited the same way
+as any other:
+
+```bash
+minireg audit --fail-on high
+```
+
+Workspace members and `git` dependencies are skipped and reported as such:
+they are not on crates.io, so there is nothing to look them up against.
+
+`--fix` does **not** rewrite `Cargo.toml`. A version floor raised in the wrong
+workspace member is a build break rather than a bump, and cargo already owns
+the operation — so the audit prints the exact `cargo update -p <crate>
+--precise <version>` invocations instead.
+
+### Why cargo is read-only
+
+Source replacement requires the replacement source to serve content *identical*
+to crates.io — cargo verifies every crate against the checksum recorded in
+`Cargo.lock`. A crate that is not on crates.io can therefore never be resolved
+through a replaced source, whatever the registry serves. Publishing to this
+mirror would produce packages that no configured client could install.
+
+Hosting genuinely private crates needs a *separate* registry entry
+(`[registries.foo]` plus `registry = "foo"` on each dependency), which is a
+different feature from mirroring rather than an extension of it.
+
+For the same reason, `config.json` omits the `api` key. That key is what tells
+cargo that `publish`, `yank`, `search` and `login` work against a registry;
+leaving it out gets a clear "registry does not support API commands" instead of
+a failure from somewhere deeper in the command.
+
+---
+
 ## CI
 
 Give CI a dedicated token — do not reuse a personal one. It shows up separately
@@ -195,7 +276,16 @@ in the audit log and can be revoked without disrupting anyone.
     npm config set //registry.example.com/npm/:_authToken "$MINIREG_TOKEN"
     pip config set global.index-url \
       "https://__token__:$MINIREG_TOKEN@registry.example.com/pypi/simple/"
+    mkdir -p ~/.cargo && cat >> ~/.cargo/config.toml <<'EOF'
+    [source.crates-io]
+    replace-with = "minireg"
+    [source.minireg]
+    registry = "sparse+https://registry.example.com/cargo/index/"
+    EOF
 ```
+
+Cargo needs no token here: reads are anonymous, and cargo only sends
+credentials to an index that declares `auth-required`.
 
 ### GitLab CI
 

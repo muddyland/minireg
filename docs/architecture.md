@@ -5,6 +5,7 @@
    npm ──────────────▶│  FastAPI                     │
    pip / uv / poetry  │    /npm/*    registry API    │
    twine              │    /pypi/*   simple + upload │
+   cargo              │    /cargo/*  sparse index    │
    minireg CLI       │    /api/*    web + admin     │
    browser            │    /         Vue SPA         │
                      └───┬──────────────┬───────────┘
@@ -19,7 +20,7 @@
               ┌──────────▼────────────┐        ┌──────────────┐
               │ content-addressed     │        │  upstreams   │
               │ blob store (/data)    │◀───────│ npm, PyPI,   │
-              └───────────────────────┘  fetch │ GitLab       │
+              └───────────────────────┘  fetch │ cargo, GitLab│
                                                 └──────────────┘
 ```
 
@@ -103,7 +104,9 @@ tier 2 upstreams (raced)
 - **PyPI merges within the winning tier** — the Simple API is file-oriented and
   a project's files can legitimately be split across indexes. Earlier tiers win
   filename collisions.
-- **npm does not merge** — a packument is a single authoritative document.
+- **npm and cargo do not merge** — a packument and a sparse-index file are
+  each a single authoritative document, and stitching two together would
+  produce a version list no upstream ever published.
 - Locally published versions are never overwritten by upstream data, so a
   private package shadowing a public name keeps its own content.
 
@@ -210,12 +213,13 @@ backend/app/
   api/            HTTP layer
     npm.py        npm registry endpoints
     pypi.py       PyPI endpoints
+    cargo.py      cargo sparse index (read-only mirror)
     auth.py       login, tokens, OIDC
     cli.py        device auth, audit, CLI distribution
     search.py     user-facing search
     admin/        admin API
   core/
-    naming.py     PEP 503/440, npm names, filename grammar
+    naming.py     PEP 503/440, npm and crate names, filename grammar
     semver.py     node-semver versions and ranges
     security.py   hashing, tokens, JWTs, credential encryption
     deps.py       identity resolution, RBAC, rate limiting
@@ -230,6 +234,7 @@ backend/app/
     provenance.py which upstreams have a package
     npm_render.py, npm_publish.py
     pypi_render.py, pypi_publish.py
+    cargo_render.py
     oidc.py, audit.py
   upstreams/      provider implementations
   models.py       SQLAlchemy models
@@ -285,6 +290,7 @@ type checker configured, so `build:frontend` is the real compile-time check.
 | `test_naming.py` | PEP 503/440, wheel and sdist filenames, npm names |
 | `test_semver_ranges.py` | node-semver, run against npm's own fixtures |
 | `test_npm_spec.py` | Packument formats, publish document grammar |
+| `test_cargo_spec.py` | Index shard layout, sparse-index parsing and rendering |
 | `test_pypi_spec.py` | PEP 503/592/691/700/714, upload validation |
 | `test_osv.py` | CVSS scoring against published reference vectors |
 | `test_upstreams.py` | Provider parsing, GitLab addressing, tier grouping |

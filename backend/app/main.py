@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import defer
 
 from .api import auth as auth_api
+from .api import cargo as cargo_api
 from .api import cli as cli_api
 from .api import npm as npm_api
 from .api import pypi as pypi_api
@@ -176,7 +177,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="minireg",
-    description="Caching npm + PyPI registry with tiered upstreams, OIDC, and CVE policy",
+    description="Caching npm + PyPI + cargo registry with tiered upstreams, OIDC, and CVE policy",
     version="1.0.0",
     lifespan=lifespan,
     docs_url="/api/docs",
@@ -266,6 +267,7 @@ app.include_router(search_api.router)
 app.include_router(admin_router)
 app.include_router(npm_api.router, prefix="/npm")
 app.include_router(pypi_api.router, prefix="/pypi")
+app.include_router(cargo_api.router, prefix="/cargo")
 
 
 if STATIC_DIR.is_dir():

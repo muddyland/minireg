@@ -18,7 +18,7 @@ Evaluation order:
 | Field | Meaning |
 |---|---|
 | **Action** | `block` (never serve) or `allow` (permit under allowlist mode) |
-| **Ecosystem** | npm, PyPI, or both |
+| **Ecosystem** | npm, PyPI, cargo, or all |
 | **Name pattern** | Glob against the normalized name |
 | **Version range** | Optional. Blank covers every version |
 | **Reason** | Shown to whoever gets blocked — write it for them |
@@ -41,7 +41,7 @@ normalized so `Foo.Bar`, `foo-bar`, and `foo_bar` are one name).
 
 ### Version ranges
 
-npm rules take **full node-semver ranges**; PyPI rules take **PEP 440
+npm and cargo rules take **full node-semver ranges**; PyPI rules take **PEP 440
 specifier sets**.
 
 | Ecosystem | Example | Blocks |
@@ -58,6 +58,13 @@ specifier sets**.
 | PyPI | `>=1.0,<2.0` | the 1.x line |
 | PyPI | `~=1.4.2` | `>=1.4.2, ==1.4.*` |
 | PyPI | `==1.2.3` | that exact version |
+
+Cargo rules use the same grammar as npm — both ecosystems are semver 2.0.0 and
+one engine serves both. They disagree on exactly one thing: a **bare `1.2.3`
+pins that exact version here**, whereas in `Cargo.toml` it means `^1.2.3`. A
+rule is read with npm's meaning, which is the stricter of the two and the safe
+direction for something that decides what to block. Write `^1.2.3` explicitly
+if you meant the range.
 
 The editor previews what a range expands to as you type and lets you test a
 specific version against it. Both come from the same engine that enforces the
