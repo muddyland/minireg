@@ -73,6 +73,10 @@ COPY --chown=minireg:minireg backend/app /app/app
 COPY --chown=minireg:minireg backend/pyproject.toml /app/
 # The CLI is served to users from /api/cli/download, so it ships in the image.
 COPY --chown=minireg:minireg cli /app/cli
+# The documentation is served from /api/help and rendered in the UI. This
+# registry is often deployed with no route to the internet and no access to
+# the repository it was built from, so the docs travel with it.
+COPY --chown=minireg:minireg docs /app/app/docs
 COPY --from=frontend --chown=minireg:minireg /build/dist /app/app/static
 
 RUN mkdir -p /data/packages && chown -R minireg:minireg /data

@@ -23,6 +23,7 @@ from sqlalchemy.orm import defer
 from .api import auth as auth_api
 from .api import cargo as cargo_api
 from .api import cli as cli_api
+from .api import help as help_api
 from .api import npm as npm_api
 from .api import pypi as pypi_api
 from .api import search as search_api
@@ -548,6 +549,7 @@ async def health_detailed(
 # API routers first, then the registry mounts, then the SPA catch-all.
 app.include_router(auth_api.router)
 app.include_router(cli_api.router)
+app.include_router(help_api.router)
 app.include_router(search_api.router)
 app.include_router(admin_router)
 app.include_router(npm_api.router, prefix="/npm")

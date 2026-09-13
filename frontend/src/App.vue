@@ -99,6 +99,14 @@ onMounted(() => auth.loadOidcStatus())
           <span>Signed in as <strong>{{ auth.user?.username }}</strong></span>
         </div>
         <div class="row">
+          <router-link
+            class="btn btn-sm btn-ghost topbar-icon"
+            :to="{ name: 'help' }"
+            title="Documentation"
+            aria-label="Documentation"
+          >
+            <NavIcon name="help" :size="16" />
+          </router-link>
           <button class="btn btn-sm btn-ghost" :title="`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`" @click="toggleTheme">
             {{ theme === 'dark' ? '☀' : '☾' }}
           </button>

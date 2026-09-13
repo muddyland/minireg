@@ -24,6 +24,10 @@ Then [read the setup guide](docs/installation.md).
 
 ## Documentation
 
+All of this is also served inside the running registry — the **?** in the top
+bar — so a deployment with no route to the internet still has its
+documentation, matching the version actually running.
+
 | | |
 |---|---|
 | **[Installation](docs/installation.md)** | Requirements, first run, reverse proxies, upgrading |

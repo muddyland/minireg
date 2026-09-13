@@ -1,5 +1,7 @@
 # Troubleshooting
 
+Symptoms and their causes, ordered roughly by how often they come up.
+
 ## Start here
 
 ```bash

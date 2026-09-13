@@ -1,6 +1,7 @@
 # Configuration
 
-Two places, and the split is deliberate:
+Every environment variable and admin setting. Configuration lives in two
+places, and the split is deliberate:
 
 * **`.env`** — infrastructure. Requires a restart. Database URLs, secrets, the
   public URL, timeouts, feature switches.

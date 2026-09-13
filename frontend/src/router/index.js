@@ -16,6 +16,8 @@ const routes = [
   { path: '/cli-login', name: 'cli-login', component: () => import('@/views/CliLoginView.vue') },
   { path: '/tokens', name: 'tokens', component: () => import('@/views/TokensView.vue') },
   { path: '/account', name: 'account', component: () => import('@/views/AccountView.vue') },
+  { path: '/help', name: 'help', component: () => import('@/views/HelpView.vue') },
+  { path: '/help/:slug', name: 'help-page', component: () => import('@/views/HelpView.vue') },
 
   { path: '/admin', name: 'dashboard', component: () => import('@/views/admin/DashboardView.vue'), meta: { admin: true } },
   { path: '/admin/users', name: 'users', component: () => import('@/views/admin/UsersView.vue'), meta: { admin: true } },
@@ -29,7 +31,14 @@ const routes = [
   { path: '/:pathMatch(.*)*', redirect: '/search' },
 ]
 
-const router = createRouter({ history: createWebHistory(), routes })
+const router = createRouter({
+  history: createWebHistory(),
+  routes,
+  // Documentation cross-references carry anchors. The target renders after
+  // the page is fetched, so the element does not exist yet at navigation
+  // time; the docs view scrolls to it once it has content.
+  scrollBehavior: (to, from) => (to.hash ? false : { top: 0 }),
+})
 
 router.beforeEach(async (to) => {
   const auth = useAuthStore()

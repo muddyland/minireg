@@ -141,6 +141,10 @@ export const api = {
   garbageCollect: () => request('/api/admin/cache/gc', { method: 'POST' }),
 
   health: () => request('/api/health/detailed'),
+
+  // -- documentation shipped with this build --------------------------------
+  helpPages: () => request('/api/help/pages'),
+  helpPage: (slug) => request(`/api/help/pages/${encodeURIComponent(slug)}`),
 }
 
 export default api

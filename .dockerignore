@@ -17,3 +17,6 @@ frontend/dist
 .env
 *.md
 !README.md
+# The docs are served from /api/help and rendered in the UI, so they have to
+# be in the build context despite the blanket markdown exclusion above.
+!docs/*.md

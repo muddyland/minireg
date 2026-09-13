@@ -1,5 +1,8 @@
 # Operations
 
+Running the registry day to day: what to watch, what to back up, and what to
+tune when it is slow.
+
 ## Health
 
 | Endpoint | Purpose |

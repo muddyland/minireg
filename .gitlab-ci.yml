@@ -46,10 +46,20 @@ test:backend:
     - cd backend
     - pip install --quiet --no-deps -e "."
     - pip install --quiet -r requirements-dev.txt
+  variables:
+    # The app refuses to start in production with a placeholder SECRET_KEY, so
+    # anything that imports app.main needs a real one. pytest gets these from
+    # conftest; the bare import below does not, and used to fail here.
+    ENVIRONMENT: "dev"
+    SECRET_KEY: "ci-only-not-a-deployment-secret-0123456789abcdef"
+    DATABASE_URL: "sqlite+aiosqlite:///:memory:"
   script:
     # Import smoke test first — fails in seconds on broken wiring, rather than
     # after the whole suite has collected.
     - python -c "import app.main; print('app import OK')"
+    # ...and again as prod, which is the configuration that actually ships:
+    # the startup guards only run in that mode.
+    - ENVIRONMENT=prod python -c "import app.main; print('app import OK (prod)')"
     - pytest -q --tb=short --junitxml=report.xml
   artifacts:
     when: always

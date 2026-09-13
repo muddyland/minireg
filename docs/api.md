@@ -1,7 +1,9 @@
 # API reference
 
-Interactive docs: `https://registry.example.com/api/docs`
-OpenAPI schema: `/api/openapi.json`
+Every endpoint this registry serves. The interactive Swagger UI at
+`/api/docs` and the schema at `/api/openapi.json` are available only when
+`ENVIRONMENT=dev`, because in production they enumerate the whole admin
+surface for anyone who asks.
 
 ## Authentication
 
@@ -121,6 +123,16 @@ There is no publish, yank or owners surface. See
 | `GET` | `/api/auth/oidc/login` | Start the SSO flow |
 | `GET` | `/api/auth/oidc/callback` | SSO callback |
 
+### Documentation
+
+Serves these pages to the **?** in the UI, so a registry with no route to the
+internet still has its own documentation. Requires a signed-in user.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/help/pages` | Index: slug, title and summary per page |
+| `GET` | `/api/help/pages/{slug}` | One page, as markdown |
+
 ### Search
 
 | Method | Path | Purpose |
@@ -219,6 +231,10 @@ All require an admin identity and, for token auth, the `admin` scope.
 **Packages** — `GET /api/admin/packages`, `/api/admin/packages/{id}`,
 `DELETE /api/admin/packages/{id}`, `POST /api/admin/cache/purge`,
 `POST /api/admin/cache/gc`
+
+**Metrics** — `GET /api/metrics`. Request counts by status class, and counters
+for the failures that are otherwise silent: CVE scans that timed out and were
+served unscanned, and OSV batches that failed.
 
 ---
 
