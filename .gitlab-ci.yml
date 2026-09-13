@@ -128,17 +128,27 @@ build:frontend:
 audit:dependencies:
   extends: .python_base
   stage: test
-  before_script:
-    - *pip_preflight
-    - pip install --quiet --require-hashes -r backend/requirements.lock
-    - curl -fsSL "${MINIREG_URL}/api/cli/install.sh" | sh
-    - export PATH="$HOME/.local/bin:$PATH"
+  # The CLI is a single stdlib-only script and it is right here in the repo,
+  # so run that rather than downloading the deployed build. No curl (the slim
+  # image has none), no network install, and -- more to the point -- the job
+  # exercises the CLI from the commit under test instead of whatever is
+  # currently deployed.
+  #
+  # MINIREG_TOKEN is read from the environment by the CLI; make it a masked
+  # CI variable with a read-scoped token.
   script:
-    - minireg --url "$MINIREG_URL" audit backend --fail-on high
-    - minireg --url "$MINIREG_URL" audit frontend --fail-on high
+    - python cli/minireg.py --url "$MINIREG_URL" audit backend --fail-on high
+    - python cli/minireg.py --url "$MINIREG_URL" audit frontend --fail-on high
   rules:
-    # Needs the registry reachable; skipped where MINIREG_URL is unset.
-    - if: '$MINIREG_URL'
+    # Needs both the registry and a credential; the audit endpoint requires a
+    # signed-in user. Skipped where either is unset, rather than failing.
+    - if: '$MINIREG_URL && $MINIREG_TOKEN'
+  # `--fail-on high` also fails on dependencies that could not be checked at
+  # all, which is the point of the gate but does make the job depend on OSV
+  # being up. Retry rides out a blip; a real finding still fails all three.
+  retry:
+    max: 2
+    when: script_failure
   allow_failure: false
 
 # ── Build ─────────────────────────────────────────────────────────────────

@@ -615,6 +615,11 @@ def parse_pipfile_lock(path: Path) -> list[dict]:
     return out
 
 
+#: Dependency files recognised in a project directory, in the order they are
+#: reported. `requirements.lock` and `requirements-lock.txt` are the usual
+#: names for pip-compile output kept alongside a ranged `requirements.txt`;
+#: without them the audit would find only the ranged file, report that it
+#: cannot audit ranges, and exit clean -- having checked nothing.
 LOCKFILES = [
     ("package-lock.json", "npm", parse_package_lock),
     ("npm-shrinkwrap.json", "npm", parse_package_lock),
@@ -622,6 +627,8 @@ LOCKFILES = [
     ("uv.lock", "pypi", parse_uv_lock),
     ("Pipfile.lock", "pypi", parse_pipfile_lock),
     ("Cargo.lock", "cargo", parse_cargo_lock),
+    ("requirements.lock", "pypi", parse_requirements),
+    ("requirements-lock.txt", "pypi", parse_requirements),
     ("requirements.txt", "pypi", parse_requirements),
 ]
 
