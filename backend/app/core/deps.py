@@ -243,7 +243,10 @@ async def resolve_identity(
         payload = decode_session_token(cookie)
         if payload:
             user = await session.get(User, int(payload["sub"]))
-            if user and user.is_active:
+            # The version in the cookie must still match the user row: a
+            # password change or a sign-out-everywhere bumps it, which is what
+            # makes a stateless session revocable.
+            if user and user.is_active and payload.get("sv", 0) == user.session_version:
                 return Identity(user=user, method="session")
 
     return Identity()

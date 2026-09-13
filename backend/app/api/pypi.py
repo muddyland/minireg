@@ -77,19 +77,26 @@ async def simple_index(
     Only locally known projects are listed: enumerating an upstream's entire
     index on demand would be enormous and is not something pip needs.
     """
+    # `Package.blocked` is vestigial and never written, so it was filtering
+    # nothing; the real verdict is computed below.
     rows = (
         await session.execute(
             select(Package.name)
-            .where(Package.ecosystem == ECOSYSTEM, Package.blocked.is_(False))
+            .where(Package.ecosystem == ECOSYSTEM)
             .order_by(Package.normalized_name)
         )
     ).scalars().all()
 
+    # One engine, reused: rules and settings are memoised on the instance, so
+    # this is one cache read rather than three per project. A mirror that has
+    # indexed public PyPI holds hundreds of thousands of names here, and the
+    # previous shape made that millions of sequential round trips.
     policy = PolicyEngine(session)
-    names = []
-    for name in rows:
-        if (await policy.evaluate(ECOSYSTEM, normalize_pypi_name(name))).allowed:
-            names.append(name)
+    names = [
+        name
+        for name in rows
+        if (await policy.evaluate(ECOSYSTEM, normalize_pypi_name(name), _name_level=True)).allowed
+    ]
 
     if pypi_render.wants_json(accept, format):
         return json_response(

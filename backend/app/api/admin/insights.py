@@ -29,6 +29,7 @@ from ...models import (
 )
 from ...services import artifacts, audit, packages
 from ...services.osv import OsvScanner
+from ...services.packages import _escape_like
 from ...services.provenance import package_upstreams
 from ...services.storage import get_store
 from ...services.vulns import dedupe_by_cve
@@ -343,7 +344,7 @@ async def list_audit(
 ) -> dict:
     conditions = [AuditLog.ts >= _since(days)]
     if action:
-        conditions.append(AuditLog.action.like(f"{action}%"))
+        conditions.append(AuditLog.action.like(f"{_escape_like(action)}%", escape="\\"))
     if username:
         conditions.append(AuditLog.actor_username == username)
     if success is not None:
@@ -475,9 +476,10 @@ async def list_vulnerabilities(
     if severity:
         conditions.append(Vulnerability.severity_label == severity.lower())
     if search:
-        pattern = f"%{search.lower()}%"
+        pattern = f"%{_escape_like(search.lower())}%"
         conditions.append(
-            Vulnerability.cve_id.ilike(pattern) | Vulnerability.summary.ilike(pattern)
+            Vulnerability.cve_id.ilike(pattern, escape="\\")
+            | Vulnerability.summary.ilike(pattern, escape="\\")
         )
 
     where = and_(*conditions) if conditions else True
@@ -731,7 +733,9 @@ async def list_packages(
     if ecosystem is not None:
         conditions.append(Package.ecosystem == ecosystem)
     if search:
-        conditions.append(Package.normalized_name.ilike(f"%{search.lower()}%"))
+        conditions.append(
+            Package.normalized_name.ilike(f"%{_escape_like(search.lower())}%", escape="\\")
+        )
     if local_only:
         conditions.append(Package.is_local.is_(True))
 

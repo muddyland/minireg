@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import secrets
@@ -26,8 +27,18 @@ def hash_password(password: str) -> str:
     return _hasher.hash(password)
 
 
+#: Hash of a value nobody knows, verified against when the account does not
+#: exist. Without it an unknown username returned in microseconds while a
+#: known one paid a full argon2 verify, which is a usable oracle for
+#: enumerating accounts.
+_DUMMY_HASH = _hasher.hash(secrets.token_urlsafe(32))
+
+
 def verify_password(password: str, password_hash: str | None) -> bool:
     if not password_hash:
+        # Same work, same duration, same answer.
+        with contextlib.suppress(Exception):
+            _hasher.verify(_DUMMY_HASH, password)
         return False
     try:
         return _hasher.verify(password_hash, password)
@@ -116,12 +127,22 @@ def extract_bearer(header: str | None) -> str | None:
 JWT_ALG = "HS256"
 
 
-def create_session_token(user_id: int, username: str, is_admin: bool, ttl: int | None = None) -> str:
+def create_session_token(
+    user_id: int,
+    username: str,
+    is_admin: bool,
+    ttl: int | None = None,
+    session_version: int = 0,
+) -> str:
     now = datetime.now(UTC)
     payload = {
         "sub": str(user_id),
         "username": username,
         "admin": is_admin,
+        # Compared against the user row on every request, so a password change
+        # or an explicit sign-out-everywhere invalidates existing cookies
+        # instead of leaving them valid for the rest of their 12 hours.
+        "sv": session_version,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=ttl or settings.session_ttl_seconds)).timestamp()),
         "typ": "session",

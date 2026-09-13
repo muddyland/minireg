@@ -115,6 +115,11 @@ class User(Base):
     full_name: Mapped[str | None] = mapped_column(String(255))
     password_hash: Mapped[str | None] = mapped_column(String(255))
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Bumped whenever every existing session for this user must stop working:
+    # a password change, or an explicit "sign out everywhere". Sessions are
+    # stateless JWTs, so without a version to compare against, logging out or
+    # changing a password left a stolen cookie valid for its full 12 hours.
+    session_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     can_publish: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
@@ -338,8 +343,10 @@ class Package(Base):
     first_seen_at: Mapped[datetime] = _now_col()
     updated_at: Mapped[datetime] = _updated_col()
 
-    # Denormalized policy verdict, refreshed whenever rules or scans change.
-    # NULL = not evaluated yet.
+    # Vestigial. Policy is evaluated at request time against the rule list and
+    # the version's score, so nothing writes these; they are kept only because
+    # dropping a column needs a real migration. Do not read them: a package
+    # can be blocked while `blocked` is False.
     blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     block_reason: Mapped[str | None] = mapped_column(Text)
 
@@ -351,8 +358,10 @@ class Package(Base):
     )
 
     __table_args__ = (
+        # The unique constraint already builds a btree on (ecosystem,
+        # normalized_name); a second identical index only cost write
+        # throughput on the hottest insert path.
         UniqueConstraint("ecosystem", "normalized_name", name="uq_package_eco_name"),
-        Index("ix_package_lookup", "ecosystem", "normalized_name"),
         Index("ix_package_downloads", "ecosystem", "download_count"),
     )
 
@@ -381,7 +390,8 @@ class PackageVersion(Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     first_seen_at: Mapped[datetime] = _now_col()
 
-    # CVE policy verdict for this exact version.
+    # Vestigial, as on Package: the verdict is computed per request. See the
+    # note there.
     blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     block_reason: Mapped[str | None] = mapped_column(Text)
     max_cvss: Mapped[float | None] = mapped_column(Float)

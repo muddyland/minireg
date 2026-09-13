@@ -121,7 +121,10 @@ async def ensure_cached(
                 raise
 
         # Record the blob, or bump its refcount if another file shares it.
-        blob = await session.get(Blob, stored.sha256)
+        # Locked for update: without it a concurrent purge_file can decrement
+        # and delete the same row between this read and the write, leaving a
+        # committed blob_sha256 pointing at a file that is gone.
+        blob = await session.get(Blob, stored.sha256, with_for_update=True)
         if blob is None:
             session.add(
                 Blob(
@@ -306,11 +309,14 @@ async def purge_file(session: AsyncSession, file_row: PackageFile) -> bool:
     file_row.blob_sha256 = None
     file_row.cached_at = None
 
-    blob = await session.get(Blob, sha)
+    # Same lock as ensure_cached takes, so the two cannot interleave into a
+    # deleted blob with a live reference.
+    blob = await session.get(Blob, sha, with_for_update=True)
     if blob is not None:
         blob.refcount -= 1
         if blob.refcount <= 0:
             await session.delete(blob)
+            await session.flush()
             get_store().delete(sha)
     await session.flush()
     return True

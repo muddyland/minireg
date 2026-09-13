@@ -33,6 +33,11 @@ from .resolver import Resolver, ResolveResult, TierUnavailable
 log = logging.getLogger(__name__)
 
 
+def _escape_like(value: str) -> str:
+    """Neutralise LIKE/ILIKE metacharacters in user input."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def cache_key(ecosystem: str, name: str, suffix: str = "") -> str:
     return f"pkg:{ecosystem}:{name}{(':' + suffix) if suffix else ''}"
 
@@ -490,10 +495,12 @@ async def search_local(
 ) -> tuple[list[Package], int]:
     """Substring search over the local index, ranked by exact match then
     downloads. Backed by the pg_trgm GIN index."""
-    pattern = f"%{query.lower()}%"
-    conditions = [Package.normalized_name.ilike(pattern)]
+    # Escape the wildcards, or `%a%b%c%d%e%f%` from any logged-in user turns
+    # an indexed prefix search into a scan of every description in the table.
+    pattern = f"%{_escape_like(query.lower())}%"
+    conditions = [Package.normalized_name.ilike(pattern, escape="\\")]
     if query:
-        conditions.append(Package.description.ilike(pattern))
+        conditions.append(Package.description.ilike(pattern, escape="\\"))
 
     from sqlalchemy import or_
 

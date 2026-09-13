@@ -84,6 +84,8 @@ class Settings(BaseSettings):
     session_cookie: str = "minireg_session"
     session_ttl_seconds: int = 60 * 60 * 12
     token_prefix: str = "mrg"
+    # Lifetime of a token minted by the CLI device flow. 0 means no expiry.
+    cli_token_ttl_days: int = 90
     # Allow anonymous reads of the registry endpoints (typical for a mirror).
     allow_anonymous_read: bool = True
     # Bootstrap admin, created on first start if no users exist.

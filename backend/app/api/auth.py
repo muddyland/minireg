@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +34,8 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 VALID_SCOPES = {"read", "publish", "admin"}
+#: Short-lived cookie tying an OIDC flow to the browser that began it.
+OIDC_BIND_COOKIE = "minireg_oidc_bind"
 
 
 def _safe_next(target: str | None) -> str:
@@ -164,7 +168,12 @@ async def login(
     )
     await session.commit()
 
-    _set_session_cookie(response, create_session_token(user.id, user.username, user.is_admin))
+    _set_session_cookie(
+        response,
+        create_session_token(
+            user.id, user.username, user.is_admin, session_version=user.session_version
+        ),
+    )
     return {"user": _user_payload(user)}
 
 
@@ -204,7 +213,7 @@ async def change_password(
     request: Request,
     session: AsyncSession = Depends(get_session),
     identity: Identity = Depends(require_primary_credential),
-) -> dict:
+) -> JSONResponse:
     user = identity.user
     assert user is not None
     if user.provider == AuthProvider.oidc:
@@ -217,6 +226,10 @@ async def change_password(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="current password is incorrect"
         )
 
+    # Everything signed in as this user stops working. Changing a password
+    # after a suspected compromise has to actually eject the intruder.
+    user.session_version = (user.session_version or 0) + 1
+
     user.password_hash = hash_password(payload.new_password)
     await audit.record_audit(
         session,
@@ -226,7 +239,17 @@ async def change_password(
         ip=client_ip(request),
     )
     await session.commit()
-    return {"ok": True}
+
+    # Re-issue this browser's cookie at the new version, so the person doing
+    # the change stays signed in while every other session is ejected.
+    response = JSONResponse({"ok": True})
+    _set_session_cookie(
+        response,
+        create_session_token(
+            user.id, user.username, user.is_admin, session_version=user.session_version
+        ),
+    )
+    return response
 
 
 # --------------------------------------------------------------------------- #
@@ -381,15 +404,37 @@ async def oidc_login(next: str = "/") -> RedirectResponse:
 
     verifier, challenge = oidc.make_pkce()
     nonce = secrets.token_urlsafe(24)
-    # All login state travels in the signed `state` parameter.
+    # Login state travels in the signed `state`, but state alone is
+    # self-contained: any browser presenting a valid code+state pair completes
+    # the login. An attacker who starts a flow, authenticates as themselves and
+    # then gets the victim to load the callback URL logs the victim's browser
+    # in as the attacker -- and whatever they publish or tokens they create
+    # then land in the attacker's account. Binding it to a cookie set here
+    # means only the browser that began the flow can finish it.
+    binder = secrets.token_urlsafe(24)
     state = create_state_token(
-        {"nonce": nonce, "verifier": verifier, "next": _safe_next(next)}
+        {
+            "nonce": nonce,
+            "verifier": verifier,
+            "next": _safe_next(next),
+            "bind": hashlib.sha256(binder.encode()).hexdigest(),
+        }
     )
     try:
         url = await oidc.build_authorization_url(_redirect_uri(), state, nonce, challenge)
     except oidc.OidcError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-    return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+    response = RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+    response.set_cookie(
+        OIDC_BIND_COOKIE,
+        binder,
+        max_age=600,
+        httponly=True,
+        samesite="lax",
+        secure=settings.public_url.startswith("https://"),
+        path="/",
+    )
+    return response
 
 
 @router.get("/oidc/callback")
@@ -427,6 +472,17 @@ async def oidc_callback(
     if state_payload is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="invalid or expired login state"
+        )
+
+    # Only the browser that started this flow may finish it. See oidc_login.
+    expected_bind = state_payload.get("bind")
+    presented = request.cookies.get(OIDC_BIND_COOKIE) or ""
+    if expected_bind and not hmac.compare_digest(
+        expected_bind, hashlib.sha256(presented.encode()).hexdigest()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="this login was started in a different browser; sign in again",
         )
 
     try:
@@ -552,5 +608,10 @@ async def oidc_callback(
 
     destination = _safe_next(state_payload.get("next"))
     response = RedirectResponse(destination, status_code=status.HTTP_302_FOUND)
-    _set_session_cookie(response, create_session_token(user.id, user.username, user.is_admin))
+    _set_session_cookie(
+        response,
+        create_session_token(
+            user.id, user.username, user.is_admin, session_version=user.session_version
+        ),
+    )
     return response

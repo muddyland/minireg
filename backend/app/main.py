@@ -29,7 +29,7 @@ from .api import search as search_api
 from .api.admin import router as admin_router
 from .config import settings
 from .core.cache import close_redis, init_redis
-from .core.deps import require_admin
+from .core.deps import Identity, require_admin, resolve_identity
 from .core.security import hash_password
 from .db import create_schema, dispose_engine, init_engine, session_scope
 from .models import User
@@ -116,13 +116,36 @@ async def bootstrap_admin() -> None:
 
 
 async def _prune_task() -> None:
+    from sqlalchemy import update
+
+    from .models import DeviceAuthorization
     from .services.artifacts import collect_orphan_blobs
 
     async with session_scope() as session:
         removed = await prune_old_logs(session)
         orphans = await collect_orphan_blobs(session)
-        if removed or orphans:
-            log.info("housekeeping: pruned=%s orphan_blobs=%d", removed, orphans)
+
+        # A device authorization that was approved but never polled keeps the
+        # token in plaintext until someone collects it. Expired rows never
+        # will be, so the plaintext is cleared rather than left sitting in the
+        # table. Reaping only happened on the next /auth/start before this.
+        cleared = (
+            await session.execute(
+                update(DeviceAuthorization)
+                .where(
+                    DeviceAuthorization.expires_at < datetime.now(UTC),
+                    DeviceAuthorization.token_plaintext.isnot(None),
+                )
+                .values(token_plaintext=None)
+            )
+        ).rowcount
+        if removed or orphans or cleared:
+            log.info(
+                "housekeeping: pruned=%s orphan_blobs=%d expired_device_tokens=%s",
+                removed,
+                orphans,
+                cleared,
+            )
     get_store().cleanup_tmp()
 
 
@@ -293,8 +316,10 @@ app = FastAPI(
     description="Caching npm + PyPI + cargo registry with tiered upstreams, OIDC, and CVE policy",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/api/docs",
-    openapi_url="/api/openapi.json",
+    # The interactive docs enumerate every admin route and its schema. Useful
+    # in development, free reconnaissance in production.
+    docs_url="/api/docs" if settings.environment == "dev" else None,
+    openapi_url="/api/openapi.json" if settings.environment == "dev" else None,
     redoc_url=None,
 )
 
@@ -466,9 +491,22 @@ async def metrics(identity=Depends(require_admin)) -> JSONResponse:
 
 
 @app.get("/api/health/detailed", tags=["meta"])
-async def health_detailed() -> JSONResponse:
+async def health_detailed(
+    identity: Identity = Depends(resolve_identity),
+) -> JSONResponse:
+    """Component status.
+
+    Error strings are only rendered for an admin: an asyncpg failure message
+    names the host, port and database, and disk figures describe the
+    deployment. Anonymous callers get booleans, which is all a monitor needs.
+    """
     from .core.cache import redis_client
     from .db import get_engine
+
+    detailed = bool(identity.user and identity.is_admin)
+
+    def failure(exc: Exception) -> dict:
+        return {"ok": False, **({"error": str(exc)} if detailed else {})}
 
     checks: dict[str, dict] = {}
 
@@ -477,23 +515,27 @@ async def health_detailed() -> JSONResponse:
             await conn.execute(select(1))
         checks["database"] = {"ok": True}
     except Exception as exc:
-        checks["database"] = {"ok": False, "error": str(exc)}
+        log.error("health: database check failed: %s", exc)
+        checks["database"] = failure(exc)
 
     client = redis_client()
     if client is None:
-        checks["redis"] = {"ok": False, "error": "not connected (running without cache)"}
+        checks["cache"] = {"ok": False, "detail": "not connected (running without cache)"}
     else:
         try:
             await client.ping()
-            checks["redis"] = {"ok": True}
+            checks["cache"] = {"ok": True}
         except Exception as exc:
-            checks["redis"] = {"ok": False, "error": str(exc)}
+            checks["cache"] = failure(exc)
+    # Compatibility: the key was called `redis` before the move to Valkey.
+    checks["redis"] = checks["cache"]
 
     try:
         usage = await get_store().disk_usage()
-        checks["storage"] = {"ok": True, **usage}
+        checks["storage"] = {"ok": True, **(usage if detailed else {})}
     except Exception as exc:
-        checks["storage"] = {"ok": False, "error": str(exc)}
+        log.error("health: storage check failed: %s", exc)
+        checks["storage"] = failure(exc)
 
     # Redis being down degrades performance but not correctness.
     healthy = checks["database"]["ok"] and checks["storage"]["ok"]

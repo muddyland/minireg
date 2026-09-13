@@ -92,6 +92,11 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 # so new *additive* columns are applied at startup; anything destructive (a drop,
 # a rename, a type change) would need a real migration and is deliberately not
 # handled by this mechanism.
+# Known limitation, stated plainly: this is not a migration framework. It
+# handles additive columns and nothing else -- a drop, a rename, a type change
+# or a backfill needs a real migration, applied by hand. If the schema starts
+# needing those regularly, adopt alembic and baseline it against the current
+# tables rather than extending this list.
 ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "web_url_template", "VARCHAR(512)"),
     ("device_authorizations", "requested_scopes", "JSONB"),
@@ -99,6 +104,7 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("packages", "owner_user_id", "BIGINT"),
     ("upstreams", "name_patterns", "JSONB"),
     ("upstreams", "require_digest", "BOOLEAN NOT NULL DEFAULT TRUE"),
+    ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -113,6 +119,12 @@ async def create_schema() -> None:
         if engine.dialect.name == "postgresql":
             from sqlalchemy import text
 
+            # Replicas all run this on boot. Concurrent CREATE ... IF NOT
+            # EXISTS is not actually safe in Postgres -- two sessions can both
+            # pass the existence check and one then fails on a duplicate --
+            # so take a transaction-scoped advisory lock and let the others
+            # wait. Released automatically when this transaction ends.
+            await conn.execute(text("SELECT pg_advisory_xact_lock(4127905311)"))
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await conn.run_sync(Base.metadata.create_all)
 

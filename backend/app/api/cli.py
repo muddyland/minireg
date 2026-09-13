@@ -353,6 +353,14 @@ async def device_approve(
         prefix=prefix,
         token_hash=token_hash,
         scopes=sorted(granted),
+        # CLI tokens land on developer laptops and had no expiry at all. A
+        # default lifetime bounds the damage from one that walks; `minireg
+        # login` re-runs in seconds.
+        expires_at=(
+            datetime.now(UTC) + timedelta(days=settings.cli_token_ttl_days)
+            if settings.cli_token_ttl_days
+            else None
+        ),
     )
     session.add(api_token)
     await session.flush()
