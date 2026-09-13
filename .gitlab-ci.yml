@@ -5,10 +5,50 @@ stages:
 
 # ── Shared bases ──────────────────────────────────────────────────────────
 
+# Says which index pip is about to use, and fails naming it if it cannot be
+# reached. Without this, an unreachable index reports "Could not find a
+# version that satisfies the requirement <first package in the lockfile>
+# (from versions: none)", which reads like a broken lockfile and sends you
+# looking in entirely the wrong place.
+#
+# Written in Python, not curl: the slim images do not ship curl. Credentials
+# are stripped before printing, because PIP_INDEX_URL usually carries a token
+# and a CI job log is not somewhere to put one.
+.pip_preflight: &pip_preflight |
+  python - <<'PREFLIGHT'
+  import os, sys, urllib.error, urllib.parse, urllib.request
+
+  index = os.environ.get("PIP_INDEX_URL") or "https://pypi.org/simple/"
+  parts = urllib.parse.urlsplit(index)
+
+  # Probe without the credentials: they are pip's business, and passing
+  # userinfo to urlopen trips its netloc parser. A private index answering
+  # 401 is reachable, which is all this check is asking.
+  host = parts.hostname or ""
+  netloc = f"{host}:{parts.port}" if parts.port else host
+  probe = parts._replace(netloc=netloc).geturl()
+  safe = probe if not parts.username else parts._replace(netloc=f"***@{netloc}").geturl()
+  print(f"pip index: {safe}", flush=True)
+
+  try:
+      urllib.request.urlopen(probe, timeout=20).read(1)
+  except urllib.error.HTTPError as exc:
+      print(f"note: index root returned HTTP {exc.code}; reachable, continuing")
+  except Exception as exc:
+      sys.exit(
+          f"ERROR: the Python index at {safe} is not reachable from this runner "
+          f"({exc}).\n       Set PIP_INDEX_URL, or give the runner a route to it."
+      )
+  PREFLIGHT
+
 .python_base:
   image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/python:3.12-slim
   tags: [saas-linux-small-amd64]
   before_script:
+    - *pip_preflight
+    # No automatic fallback to public PyPI when a private index is down. For a
+    # registry whose job is controlling where dependencies come from, quietly
+    # reaching past it would be the wrong failure mode.
     - pip install --quiet --require-hashes -r backend/requirements.lock
 
 .node_base:
@@ -23,6 +63,7 @@ lint:backend:
   extends: .python_base
   stage: lint
   before_script:
+    - *pip_preflight
     - pip install --quiet ruff
   script:
     # The CLI is shipped to users verbatim from /api/cli/download, so it is
@@ -38,6 +79,7 @@ test:backend:
   extends: .python_base
   stage: test
   before_script:
+    - *pip_preflight
     # The locked runtime set first, then the test extras on top. Installing
     # only `-e .[dev]` resolved from pyproject.toml, which carries no upper
     # bounds -- so CI was testing against different versions than the image
@@ -87,6 +129,7 @@ audit:dependencies:
   extends: .python_base
   stage: test
   before_script:
+    - *pip_preflight
     - pip install --quiet --require-hashes -r backend/requirements.lock
     - curl -fsSL "${MINIREG_URL}/api/cli/install.sh" | sh
     - export PATH="$HOME/.local/bin:$PATH"
