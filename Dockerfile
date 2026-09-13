@@ -41,10 +41,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY backend/requirements.txt /tmp/requirements.txt
+# The lock, not the range file. requirements.txt carries floors and caps, so
+# two builds of the same commit could resolve different dependency trees --
+# which is not a property a registry that exists to secure other people's
+# dependencies should have. --require-hashes makes every artifact verified.
+COPY backend/requirements.lock /tmp/requirements.lock
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip setuptools wheel \
-    && /opt/venv/bin/pip install -r /tmp/requirements.txt
+    && /opt/venv/bin/pip install --require-hashes -r /tmp/requirements.lock
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +86,17 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 
 # One worker per container. The download-log batcher and the housekeeping loop
 # are per-process, so scale out with replicas rather than --workers.
-CMD ["uvicorn", "app.main:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8000", \
-     "--proxy-headers", \
-     "--forwarded-allow-ips", "*", \
-     "--no-access-log"]
+# --forwarded-allow-ips is the *proxy's* address, not "*". With "*" anything
+# that can reach the port directly can forge the client address, and the app
+# keys rate limits and audit records on it. The compose file passes the bridge
+# gateway; override TRUSTED_PROXY_IPS if you front this differently.
+#
+# --timeout-graceful-shutdown lets in-flight artifact streams finish; the
+# compose stop_grace_period is set slightly higher so the runtime does not
+# SIGKILL through it.
+CMD ["sh", "-c", "exec uvicorn app.main:app \
+     --host 0.0.0.0 --port 8000 \
+     --proxy-headers \
+     --forwarded-allow-ips "${TRUSTED_PROXY_IPS:-127.0.0.1}" \
+     --timeout-graceful-shutdown 50 \
+     --no-access-log"]

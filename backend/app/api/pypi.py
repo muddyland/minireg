@@ -192,16 +192,9 @@ async def simple_project(
 async def _locate_file(
     session: AsyncSession, project: str, filename: str
 ) -> tuple[Package, PackageVersion, PackageFile] | None:
-    normalized = normalize_pypi_name(project)
-    lookup = await packages.fetch_package(session, ECOSYSTEM, normalized)
-    if lookup.package is None:
-        return None
-    package = lookup.package
-    for version_row in package.versions:
-        for file_row in version_row.files:
-            if file_row.filename == filename:
-                return package, version_row, file_row
-    return None
+    return await packages.locate_file(
+        session, ECOSYSTEM, normalize_pypi_name(project), filename=filename
+    )
 
 
 @router.get("/files/{project}/{filename}")
@@ -257,6 +250,7 @@ async def get_file(
             "artifact failed integrity verification", status_code=status.HTTP_502_BAD_GATEWAY
         )
     except artifacts.ArtifactError as exc:
+        log.warning("artifact fetch failed: %s", exc)
         return PlainTextResponse(str(exc), status_code=status.HTTP_502_BAD_GATEWAY)
 
     await packages.bump_download_counters(session, package.id, file_row.id)

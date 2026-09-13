@@ -55,6 +55,11 @@ services:
       - random_page_cost=1.1
       - -c
       - jit=off
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     networks: [minireg]
 
   # Valkey, the BSD-licensed Redis fork. Wire-compatible: the app still talks
@@ -83,6 +88,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     networks: [minireg]
 
   minireg:
@@ -153,11 +166,49 @@ services:
       OSV_ENABLED: ${OSV_ENABLED:-true}
       OSV_INLINE_SCAN: ${OSV_INLINE_SCAN:-true}
       OSV_INLINE_TIMEOUT_SECONDS: ${OSV_INLINE_TIMEOUT_SECONDS:-4}
-      OSV_FAIL_CLOSED: ${OSV_FAIL_CLOSED:-false}
+      OSV_CVE_ONLY: ${OSV_CVE_ONLY:-false}
+      OSV_HYDRATE_CONCURRENCY: ${OSV_HYDRATE_CONCURRENCY:-8}
+      OSV_HOUSEKEEPING_BUDGET_SECONDS: ${OSV_HOUSEKEEPING_BUDGET_SECONDS:-600}
+
+      # -- upstream trust -----------------------------------------------------
+      # Artifact URLs come out of upstream metadata, so fetches are restricted
+      # to the upstream's own host plus this list. Add a host here when an
+      # upstream serves its files from a separate CDN.
+      UPSTREAM_ARTIFACT_HOSTS: ${UPSTREAM_ARTIFACT_HOSTS:-registry.npmjs.org,files.pythonhosted.org,pypi.org,static.crates.io,crates.io,index.crates.io}
+      UPSTREAM_ALLOW_PRIVATE_ADDRESSES: ${UPSTREAM_ALLOW_PRIVATE_ADDRESSES:-false}
+      UPSTREAM_ALLOW_PLAINTEXT_HTTP: ${UPSTREAM_ALLOW_PLAINTEXT_HTTP:-false}
+
+      # -- limits -------------------------------------------------------------
+      MAX_PUBLISH_BYTES: ${MAX_PUBLISH_BYTES:-268435456}
+      MAX_METADATA_BYTES: ${MAX_METADATA_BYTES:-100663296}
+      MAX_ARTIFACT_BYTES: ${MAX_ARTIFACT_BYTES:-2147483648}
+      STORAGE_QUOTA_BYTES: ${STORAGE_QUOTA_BYTES:-0}
+
+      # Reverse proxies in front of this container. The client address is read
+      # this many hops from the right of X-Forwarded-For; anything further left
+      # was written by the caller.
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}
+      # Address uvicorn will accept proxy headers from.
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-172.16.0.0/12}
     volumes:
       - package-storage:/data
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8000}:8000"
+    # Long enough for an in-flight artifact stream to drain. The default of 10s
+    # SIGKILLs large downloads mid-flight on every deploy.
+    stop_grace_period: 60s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s

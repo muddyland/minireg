@@ -659,6 +659,15 @@ async def download_cli() -> Response:
 async def install_script() -> PlainTextResponse:
     """Installer, with this registry's URL already baked in."""
     base = settings.public_url
+    # PUBLIC_URL is operator-controlled, but it lands inside a shell string
+    # that every user pipes into sh, so a stray quote or $(...) would ship a
+    # broken -- or worse -- installer to all of them.
+    if any(ch in base for ch in '"\'`$\\ \n\r'):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="PUBLIC_URL contains characters that cannot be safely embedded "
+            "in the installer script; fix the deployment configuration",
+        )
     script = f"""#!/bin/sh
 # minireg CLI installer
 #
@@ -679,13 +688,40 @@ fi
 
 mkdir -p "$BIN_DIR"
 
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$REGISTRY/api/cli/download" -o "$TARGET.tmp"
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$TARGET.tmp" "$REGISTRY/api/cli/download"
-else
-  echo "error: neither curl nor wget is available" >&2
-  exit 1
+fetch() {{
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$2" "$1"
+  else
+    echo "error: neither curl nor wget is available" >&2
+    exit 1
+  fi
+}}
+
+fetch "$REGISTRY/api/cli/download" "$TARGET.tmp"
+
+# Verify the download against the checksum the registry publishes separately.
+# This is integrity, not authenticity -- both come from the same origin, so
+# TLS is still what establishes trust in that origin -- but it does catch a
+# truncated or corrupted transfer before it replaces a working CLI.
+EXPECTED=$(fetch "$REGISTRY/api/cli/version" /dev/stdout \
+  | sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\\([0-9a-f]*\\)".*/\\1/p')
+if [ -n "$EXPECTED" ]; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL=$(sha256sum "$TARGET.tmp" | cut -d' ' -f1)
+  elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL=$(shasum -a 256 "$TARGET.tmp" | cut -d' ' -f1)
+  else
+    ACTUAL=""
+  fi
+  if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
+    rm -f "$TARGET.tmp"
+    echo "error: checksum mismatch downloading the minireg CLI" >&2
+    echo "  expected $EXPECTED" >&2
+    echo "  got      $ACTUAL" >&2
+    exit 1
+  fi
 fi
 
 chmod 0755 "$TARGET.tmp"

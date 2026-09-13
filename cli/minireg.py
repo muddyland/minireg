@@ -279,7 +279,12 @@ def cmd_login(args):
             config = load_config()
             config.update(
                 {
-                    "registry": result.get("registry") or registry,
+                    # The URL the user typed, not one the response nominated.
+                    # Adopting a server-supplied registry means a compromised
+                    # or merely misconfigured deployment could redirect every
+                    # later command -- and this token -- to a host of its
+                    # choosing.
+                    "registry": registry,
                     "token": result["token"],
                     "username": result.get("username"),
                 }
@@ -349,7 +354,21 @@ def _upsert_lines(path: Path, lines: list[str], marker: str) -> None:
         updated = f"{existing}{separator}{block}\n"
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(updated)
+    # Create with 0600 from the start. Writing then chmod'ing leaves the file
+    # world-readable for the moment in between, and these files hold an API
+    # token. Written to a temp file and renamed so a crash cannot truncate an
+    # existing config.
+    tmp = path.with_name(path.name + ".minireg-tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(updated)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    os.chmod(path, 0o600)
 
 
 def cmd_configure(args):
@@ -382,7 +401,6 @@ def cmd_configure(args):
             print(f"\n{bold(str(_npmrc_path()))}\n" + "\n".join(lines))
         else:
             _upsert_lines(_npmrc_path(), lines, "minireg")
-            os.chmod(_npmrc_path(), 0o600)
             changed.append(str(_npmrc_path()))
 
     if "pip" in wanted:
@@ -394,14 +412,23 @@ def cmd_configure(args):
             # pip has no auth-token header; credentials go in the URL.
             scheme, _, rest = index_url.partition("://")
             index_url = f"{scheme}://__token__:{urllib.parse.quote(token, safe='')}@{rest}"
-        lines = ["[global]", f"index-url = {index_url}"]
+        # A second `[global]` section makes configparser raise
+        # DuplicateSectionError, which breaks pip completely -- so only emit
+        # the header when the file does not already have one outside our block.
+        existing_conf = pip_conf.read_text() if pip_conf.is_file() else ""
+        outside = re.sub(
+            r"# >>> minireg >>>.*?# <<< minireg <<<", "", existing_conf, flags=re.DOTALL
+        )
+        lines = []
+        if not re.search(r"^\s*\[global\]", outside, re.M):
+            lines.append("[global]")
+        lines.append(f"index-url = {index_url}")
         if registry.startswith("http://"):
             lines.append(f"trusted-host = {host.split(':')[0]}")
         if args.dry_run:
             print(f"\n{bold(str(pip_conf))}\n" + "\n".join(lines))
         else:
             _upsert_lines(pip_conf, lines, "minireg")
-            os.chmod(pip_conf, 0o600)
             changed.append(str(pip_conf))
 
     if "cargo" in wanted:
@@ -637,6 +664,7 @@ def cmd_audit(args):
         )
 
     total_findings = []
+    total_unscanned = 0
     worst = 0.0
     exit_blocked = False
     per_source: list[tuple[Path, str, list[dict]]] = []
@@ -731,6 +759,7 @@ def cmd_audit(args):
                 print()
 
         unscanned = result.get("unscanned_total") or 0
+        total_unscanned += unscanned
         if unscanned:
             info(
                 dim(
@@ -746,31 +775,72 @@ def cmd_audit(args):
             )
 
     if args.json:
-        print(json.dumps({"findings": total_findings}, indent=2))
-        return 0
-
-    if args.fix:
+        print(
+            json.dumps(
+                {
+                    "findings": total_findings,
+                    "unscanned_total": total_unscanned,
+                    "blocked": bool(exit_blocked),
+                },
+                indent=2,
+            )
+        )
+        # Falls through to the exit-code logic below rather than returning
+        # here. `--json --fail-on critical` used to always exit 0, so a CI job
+        # that asked for machine-readable output silently stopped gating.
+    elif args.fix:
         apply_fixes(args, registry, token, root, per_source)
 
-    blocked = [f for f in total_findings if f.get("blocked")]
-    parts = [f"{len(total_findings)} package(s) with findings"]
-    if blocked:
-        # A blocked package is not advisory: the registry will refuse to serve
-        # it, so the install fails outright.
-        parts.append(red(f"{len(blocked)} blocked — these will not install"))
-    print(f"  {bold('Summary')}: " + ", ".join(parts))
+    if not args.json:
+        blocked = [f for f in total_findings if f.get("blocked")]
+        parts = [f"{len(total_findings)} package(s) with findings"]
+        if blocked:
+            # A blocked package is not advisory: the registry will refuse to
+            # serve it, so the install fails outright.
+            parts.append(red(f"{len(blocked)} blocked — these will not install"))
+        if total_unscanned:
+            parts.append(f"{total_unscanned} unscanned")
+        print(f"  {bold('Summary')}: " + ", ".join(parts))
 
+    return audit_exit_code(args, total_findings, exit_blocked, total_unscanned)
+
+
+def audit_exit_code(args, findings, exit_blocked, unscanned) -> int:
+    """Translate an audit into a process exit code.
+
+    "We could not check" is not "we checked and it is fine". An unreachable
+    OSV, `--offline`, a package the registry has never seen, or a batch past
+    the server's scan cap all produce zero findings -- and exiting 0 on those
+    turns a CI gate into decoration. `--fail-on-unscanned` (on by default
+    whenever `--fail-on` is given) is what closes that.
+    """
     threshold = (args.fail_on or "").lower()
-    if threshold and threshold != "never":
-        limit = SEVERITY_ORDER.get(threshold)
-        if limit is None:
-            die(f"unknown --fail-on value: {threshold}")
-        for finding in total_findings:
-            for cve in finding.get("cves") or []:
-                if SEVERITY_ORDER.get((cve.get("severity") or "none"), 0) >= limit:
-                    return 2
-        if exit_blocked:
-            return 2
+    if not threshold or threshold == "never":
+        return 0
+
+    limit = SEVERITY_ORDER.get(threshold)
+    if limit is None:
+        die(f"unknown --fail-on value: {threshold}")
+
+    for finding in findings:
+        for cve in finding.get("cves") or []:
+            if SEVERITY_ORDER.get((cve.get("severity") or "none"), 0) >= limit:
+                return 2
+    if exit_blocked:
+        return 2
+
+    fail_unscanned = args.fail_on_unscanned
+    if fail_unscanned is None:
+        fail_unscanned = True
+    if unscanned and fail_unscanned:
+        info(
+            red(
+                f"  {unscanned} package(s) could not be checked. Failing because "
+                "an unchecked dependency is not a clean one "
+                "(pass --no-fail-on-unscanned to allow it)."
+            )
+        )
+        return 3
     return 0
 
 
@@ -1024,9 +1094,17 @@ def verify_fixes(registry, token, planned, args):
                 timeout=180,
                 insecure=args.insecure,
             )
-        except ApiError:
-            # Verification is a courtesy; failing it should not block the fix.
-            return []
+        except ApiError as exc:
+            # Not "clean". Returning an empty list here meant a failed
+            # re-check printed the same reassuring output as a passed one, so
+            # `--fix` could hand over versions it had never managed to verify.
+            info(
+                yellow(
+                    "  could not re-check the proposed versions "
+                    f"({exc.detail}); they are unverified"
+                )
+            )
+            return None
         for finding in result.get("findings") or []:
             residual.append((finding["name"], finding["version"], finding.get("max_cvss")))
     return residual
@@ -1161,6 +1239,22 @@ def install_path() -> Path:
 def cmd_update(args):
     registry = require_registry(args)
 
+    # Overwriting this file with whatever the network returns is remote code
+    # execution, and TLS is the only thing standing between the two. With
+    # --insecure the certificate is not checked at all, so anyone on the path
+    # can serve the replacement.
+    if args.insecure:
+        die(
+            "refusing to self-update with --insecure: the downloaded script "
+            "replaces this program, and an unverified connection means anyone "
+            "on the network path chooses what it contains"
+        )
+    if not registry.lower().startswith("https://"):
+        die(
+            "refusing to self-update over plaintext HTTP: the downloaded "
+            "script replaces this program"
+        )
+
     try:
         remote = api(registry, "/api/cli/version", insecure=args.insecure)
     except ApiError as exc:
@@ -1187,7 +1281,12 @@ def cmd_update(args):
     # with, and the whole point is that it is the only tool installed.
     expected = remote.get("sha256")
     actual = hashlib.sha256(source.encode()).hexdigest()
-    if expected and expected != actual:
+    if not expected:
+        die(
+            "the registry did not publish a checksum for the CLI; refusing to "
+            "overwrite this program with an unverified download"
+        )
+    if expected != actual:
         die(f"checksum mismatch: expected {expected[:16]}…, got {actual[:16]}…")
     try:
         compile(source, "<downloaded minireg>", "exec")
@@ -1293,6 +1392,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit 2 if a CVE at this severity or above is found: low, medium, high, critical",
     )
     audit_cmd.add_argument("--json", action="store_true", help="machine-readable output")
+    audit_cmd.add_argument(
+        "--fail-on-unscanned",
+        dest="fail_on_unscanned",
+        action="store_true",
+        default=None,
+        help=(
+            "exit 3 when a dependency could not be checked (the default "
+            "whenever --fail-on is given)"
+        ),
+    )
+    audit_cmd.add_argument(
+        "--no-fail-on-unscanned",
+        dest="fail_on_unscanned",
+        action="store_false",
+        help="treat dependencies that could not be checked as acceptable",
+    )
     audit_cmd.add_argument(
         "--offline", action="store_true", help="do not scan packages the registry has not seen"
     )

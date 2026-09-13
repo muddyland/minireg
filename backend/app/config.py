@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     db_pool_size: int = 20
     db_max_overflow: int = 20
     db_echo: bool = False
+    # Seconds a request will wait for a pooled connection before failing.
+    db_pool_timeout_seconds: float = 10.0
+    # Server-side caps, applied per connection (Postgres only).
+    db_statement_timeout_seconds: float = 30.0
+    db_idle_transaction_timeout_seconds: float = 60.0
 
     # --- Redis --------------------------------------------------------------
     redis_url: str = "redis://redis:6379/0"

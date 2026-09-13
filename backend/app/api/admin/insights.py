@@ -742,7 +742,15 @@ async def list_packages(
         await session.execute(
             select(Package)
             .where(where)
-            .options(selectinload(Package.versions))
+            .options(
+                # Up to 500 packages a page, and the entity carries the whole
+                # cached packument -- tens of megabytes each for the popular
+                # ones. Only the version count and worst score are read below.
+                defer(Package.cached_document),
+                selectinload(Package.versions).options(
+                    defer(PackageVersion.metadata_json)
+                ),
+            )
             .order_by(Package.download_count.desc(), Package.normalized_name)
             .limit(limit)
             .offset(offset)

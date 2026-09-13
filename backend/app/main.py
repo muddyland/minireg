@@ -8,11 +8,12 @@ import logging
 import os
 import secrets
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, Request, status
+from fastapi import Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +29,7 @@ from .api import search as search_api
 from .api.admin import router as admin_router
 from .config import settings
 from .core.cache import close_redis, init_redis
+from .core.deps import require_admin
 from .core.security import hash_password
 from .db import create_schema, dispose_engine, init_engine, session_scope
 from .models import User
@@ -312,6 +314,58 @@ _UPLOAD_METHODS = {"PUT", "POST"}
 _SMALL_BODY_LIMIT = 2 * 1024 * 1024
 
 
+#: Counters an operator can scrape. Deliberately tiny: the point is to make
+#: the silent failure modes visible, not to reimplement Prometheus.
+METRICS: dict[str, int] = defaultdict(int)
+
+
+def bump(name: str, amount: int = 1) -> None:
+    METRICS[name] += amount
+
+
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    """One line per request, and a counter per outcome.
+
+    Access logging was switched off at the uvicorn level and nothing replaced
+    it, so the only lines in the log were outgoing httpx calls. A 502 from a
+    failed artifact fetch, or a CVE scan that failed open, left no trace an
+    operator could find.
+    """
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        bump("requests.exception")
+        log.exception(
+            "%s %s failed after %.0fms",
+            request.method,
+            request.url.path,
+            (time.perf_counter() - started) * 1000,
+        )
+        raise
+
+    duration_ms = (time.perf_counter() - started) * 1000
+    bump("requests.total")
+    bump(f"requests.status.{response.status_code // 100}xx")
+
+    if response.status_code >= 500:
+        level = logging.ERROR
+    elif response.status_code in (401, 403, 413, 429):
+        level = logging.WARNING
+    else:
+        level = logging.DEBUG
+    log.log(
+        level,
+        '%s %s %s %.0fms',
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
+
+
 @app.middleware("http")
 async def limit_body_size(request: Request, call_next):
     """Reject oversized bodies on Content-Length, before anything reads them.
@@ -392,6 +446,23 @@ async def health() -> JSONResponse:
         payload["status"] = "degraded"
         return JSONResponse(payload, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     return JSONResponse(payload)
+
+
+@app.get("/api/metrics", tags=["meta"])
+async def metrics(identity=Depends(require_admin)) -> JSONResponse:
+    """Counters for the things that otherwise fail quietly.
+
+    Admin-only: the counts describe traffic and policy behaviour, which is not
+    something to hand out anonymously.
+    """
+    from .core.cache import redis_client
+
+    return JSONResponse(
+        {
+            "counters": dict(sorted(METRICS.items())),
+            "cache_connected": redis_client() is not None,
+        }
+    )
 
 
 @app.get("/api/health/detailed", tags=["meta"])

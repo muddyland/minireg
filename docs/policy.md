@@ -130,6 +130,19 @@ medium tail is not worth anyone's time.
 | Off (default) | An unscannable version is served. Fail open |
 | On | An unscannable version is blocked. Fail closed |
 
+"Could not be scanned" means one of two things, and neither of them is
+"scanned and clean":
+
+- OSV never answered for this version (it was down, slow, rate-limiting, or
+  the version has not reached the background queue yet).
+- OSV answered, the version has advisories, but none of them published a
+  severity anyone could score.
+
+A version that was scanned and had no advisories records a real zero and is
+never blocked by this switch. That distinction is what makes fail-closed
+usable at all: an earlier release stored both cases as "no score", so turning
+this on denied every package in the registry.
+
 Inline scanning has a 4-second budget (`OSV_INLINE_TIMEOUT_SECONDS`). Exceeding
 it does not stall the request — the version is marked unscanned and queued for
 a background scan. With fail-closed on, a slow OSV therefore blocks installs.
@@ -142,8 +155,15 @@ nobody can currently remediate, at the cost of serving known-vulnerable code.
 
 ### Where scores come from
 
-OSV.dev, restricted to records carrying a `CVE-*` alias — GHSA-only and
-MAL-only records are ignored by design, per the CVE-only requirement.
+OSV.dev. `OSV_CVE_ONLY` narrows this to records carrying a `CVE-*` alias, and
+now defaults to **off**.
+
+Malicious-package advisories (`MAL-*`, from the OpenSSF malicious packages
+project) are **always** kept, whatever that flag says, and are scored
+critical. They are the records that say "this release is malware", and npm and
+PyPI malware is almost never assigned a CVE — so filtering them out meant the
+registry scanned a compromised package and recorded it as clean, which is the
+opposite of the job.
 
 Scores are computed from the CVSS vectors OSV publishes:
 

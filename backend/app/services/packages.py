@@ -391,6 +391,69 @@ async def fetch_package(
         )
 
 
+async def locate_file(
+    session: AsyncSession,
+    ecosystem: Ecosystem,
+    normalized_name: str,
+    *,
+    filename: str | None = None,
+    version: str | None = None,
+) -> tuple[Package, PackageVersion, PackageFile] | None:
+    """Find one artifact without dragging the package's whole document graph.
+
+    The download routes used to go through :func:`fetch_package`, which eager
+    loads every version and every file and, crucially, the ``Package`` entity
+    itself -- and that carries ``cached_document``, the entire upstream
+    packument (18 MB for playwright, 37 MB for vite). Twenty concurrent CI
+    fetches of one tarball therefore deserialised hundreds of megabytes of
+    JSON to find a single row, inside a 1.5 GB container. That is the exit-137
+    signature the project has already been bitten by once, reachable from
+    ordinary installs rather than a batch job.
+
+    Only the columns the download path reads are selected. On a genuine cold
+    miss it falls back to a full resolve -- at which point the packument has
+    to be parsed anyway -- and then re-runs the narrow query.
+    """
+    found = await _locate_file_row(session, ecosystem, normalized_name, filename, version)
+    if found is not None:
+        return found
+
+    # Nothing local. Someone may be fetching an artifact URL without having
+    # asked for the metadata first, which is legitimate.
+    lookup = await fetch_package(session, ecosystem, normalized_name)
+    if lookup.package is None:
+        return None
+    return await _locate_file_row(session, ecosystem, normalized_name, filename, version)
+
+
+async def _locate_file_row(
+    session: AsyncSession,
+    ecosystem: Ecosystem,
+    normalized_name: str,
+    filename: str | None,
+    version: str | None,
+) -> tuple[Package, PackageVersion, PackageFile] | None:
+    stmt = (
+        select(Package, PackageVersion, PackageFile)
+        .join(PackageVersion, PackageVersion.package_id == Package.id)
+        .join(PackageFile, PackageFile.version_id == PackageVersion.id)
+        .where(Package.ecosystem == ecosystem, Package.normalized_name == normalized_name)
+        .options(
+            defer(Package.cached_document),
+            defer(PackageVersion.metadata_json),
+        )
+        .limit(1)
+    )
+    if filename is not None:
+        stmt = stmt.where(PackageFile.filename == filename)
+    if version is not None:
+        stmt = stmt.where(PackageVersion.version == version)
+    row = (await session.execute(stmt)).first()
+    if row is None:
+        return None
+    return row[0], row[1], row[2]
+
+
 async def invalidate_package_cache(ecosystem: str, normalized_name: str) -> None:
     # Trailing separator: without it, refreshing `react` also dropped every
     # cached document for `react-dom`, `react-router` and friends.

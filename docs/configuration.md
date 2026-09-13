@@ -84,10 +84,44 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 | `OSV_API_URL` | `https://api.osv.dev` | Point at a mirror if you have one. |
 | `OSV_INLINE_SCAN` | `true` | Scan a version the first time it is served. |
 | `OSV_INLINE_TIMEOUT_SECONDS` | `4` | Budget for that inline scan. Exceeding it does **not** block the request. |
-| `OSV_FAIL_CLOSED` | `false` | See [CVE policy](policy.md#unscanned-versions). |
 | `OSV_BATCH_SIZE` | `200` | Versions per OSV batch query. |
 | `OSV_REFRESH_INTERVAL_SECONDS` | `21600` | How often the background task re-scans. |
-| `OSV_CVE_ONLY` | `true` | Ignore OSV records with no CVE alias (GHSA-only, MAL-only). |
+| `OSV_HOUSEKEEPING_BUDGET_SECONDS` | `600` | Wall-clock the hourly pass spends draining the scan backlog. |
+| `OSV_HYDRATE_CONCURRENCY` | `8` | Concurrent advisory fetches per batch. |
+| `OSV_CVE_ONLY` | `false` | Ignore advisories with no CVE alias. Malicious-package (`MAL-*`) records are **always** kept regardless. |
+
+Fail-closed is a policy setting, not an environment variable: see
+**Block versions that could not be scanned** in [CVE policy](policy.md#unscanned-versions).
+
+### Upstream trust
+
+Artifact URLs come out of upstream metadata, so they are chosen by whoever
+controls the upstream. Fetches are restricted to the upstream's own host plus
+this allowlist, and never to a private or link-local address.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `UPSTREAM_ARTIFACT_HOSTS` | the three public registries' CDNs | Comma-separated. Add a host when an upstream serves files from its own CDN. |
+| `UPSTREAM_ALLOW_PRIVATE_ADDRESSES` | `false` | Set for a self-hosted GitLab on an internal address. |
+| `UPSTREAM_ALLOW_PLAINTEXT_HTTP` | `false` | Allows `http://` upstreams and artifact URLs. |
+
+Per upstream, **Reserved names** claims glob patterns such as `@corp/*`. When
+any upstream claims a pattern, matching names are only ever resolved from
+upstreams that claim it — a public registry can then never answer for an
+internal package, whatever the tier order and whatever the internal upstream
+is doing at the time. **Require digest** refuses to cache an artifact the
+upstream published no hash for.
+
+### Limits
+
+| Variable | Default | Notes |
+|---|---|---|
+| `MAX_PUBLISH_BYTES` | `268435456` | Rejected on `Content-Length` before the body is read. |
+| `MAX_METADATA_BYTES` | `100663296` | Largest upstream packument or index document. |
+| `MAX_ARTIFACT_BYTES` | `2147483648` | Largest artifact streamed from an upstream. |
+| `STORAGE_QUOTA_BYTES` | `0` | Stops caching new upstream artifacts above this. Publishes are exempt. `0` disables. |
+| `DB_POOL_TIMEOUT_SECONDS` | `10` | Wait for a pooled connection before failing. |
+| `DB_STATEMENT_TIMEOUT_SECONDS` | `30` | Server-side cap per query. |
 
 ### Rate limits
 
@@ -108,6 +142,16 @@ whose `Retry-After` says how many seconds are left in the window, and
 Anonymous requests are counted per client IP, authenticated ones per user. A
 CI fleet behind one NAT address therefore shares the anonymous limit. Either
 raise it in `.env`, or give CI a token so it draws on the authenticated limit.
+
+The client address is read from the **right** of `X-Forwarded-For`, counting
+back `TRUSTED_PROXY_HOPS` (default 1). Anything further left was written by
+the caller. Your reverse proxy must append rather than overwrite for this to
+be correct, which is what the nginx snippet in
+[installation](installation.md) does.
+
+Login and CLI device-flow limits fall back to an in-process counter when the
+cache is unreachable, rather than failing open — a cache outage should not
+open the door to password guessing.
 A typical `npm ci` fetches one tarball per locked package, so size the limit
 to the largest lockfile times the number of jobs that can start together.
 

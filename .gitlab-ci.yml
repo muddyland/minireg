@@ -9,7 +9,7 @@ stages:
   image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/python:3.12-slim
   tags: [saas-linux-small-amd64]
   before_script:
-    - pip install --quiet -r backend/requirements.txt
+    - pip install --quiet --require-hashes -r backend/requirements.lock
 
 .node_base:
   image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/node:22-alpine
@@ -38,7 +38,12 @@ test:backend:
   extends: .python_base
   stage: test
   before_script:
-    - cd backend && pip install --quiet -e ".[dev]"
+    # The locked runtime set first, then the test extras on top. Installing
+    # only `-e .[dev]` resolved from pyproject.toml, which carries no upper
+    # bounds -- so CI was testing against different versions than the image
+    # shipped, and the drift was invisible until something broke in prod.
+    - pip install --quiet --require-hashes -r backend/requirements.lock
+    - cd backend && pip install --quiet --no-deps -e "." && pip install --quiet pytest pytest-asyncio pytest-cov aiosqlite respx
   script:
     # Import smoke test first — fails in seconds on broken wiring, rather than
     # after the whole suite has collected.
@@ -61,6 +66,25 @@ build:frontend:
   artifacts:
     paths: [backend/app/static]
     expire_in: 14 days
+
+# The registry audits its own dependencies, through itself. A tool that tells
+# other people their lockfiles have CVEs should be held to the same standard,
+# and this is also the only end-to-end exercise of the audit endpoint against
+# real data.
+audit:dependencies:
+  extends: .python_base
+  stage: test
+  before_script:
+    - pip install --quiet --require-hashes -r backend/requirements.lock
+    - curl -fsSL "${MINIREG_URL}/api/cli/install.sh" | sh
+    - export PATH="$HOME/.local/bin:$PATH"
+  script:
+    - minireg --url "$MINIREG_URL" audit backend --fail-on high
+    - minireg --url "$MINIREG_URL" audit frontend --fail-on high
+  rules:
+    # Needs the registry reachable; skipped where MINIREG_URL is unset.
+    - if: '$MINIREG_URL'
+  allow_failure: false
 
 # ── Build ─────────────────────────────────────────────────────────────────
 

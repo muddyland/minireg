@@ -128,6 +128,45 @@ class TestNoPackumentInMultiRowQueries:
         sql.assert_no_heavy_columns("admin scan trigger")
 
 
+class TestArtifactDownloadFootprint:
+    """The hottest path in the registry, and the one the original OOM guard
+    missed: a tarball download used to load the Package entity, and with it
+    the whole cached packument, once per request."""
+
+    async def test_locate_file_defers_the_heavy_columns(self):
+        import inspect
+
+        from app.services.packages import _locate_file_row
+
+        source = inspect.getsource(_locate_file_row)
+        assert "defer(Package.cached_document)" in source, (
+            "locate_file must not select cached_document; it is the entire "
+            "upstream packument, tens of megabytes per row"
+        )
+        assert "defer(PackageVersion.metadata_json)" in source
+
+    async def test_download_paths_use_the_narrow_lookup(self):
+        import inspect
+
+        from app.api import cargo as cargo_api
+        from app.api import npm as npm_api
+        from app.api import pypi as pypi_api
+
+        for module, function in (
+            (npm_api, "get_tarball"),
+            (pypi_api, "_locate_file"),
+            (cargo_api, "_locate_file"),
+        ):
+            source = inspect.getsource(getattr(module, function))
+            assert "locate_file" in source, f"{function} bypasses the narrow lookup"
+            # A call, not a mention: the handlers explain in a comment why they
+            # avoid this function.
+            assert "packages.fetch_package(" not in source, (
+                f"{function} calls fetch_package directly, which eager-loads "
+                "the packument on every download"
+            )
+
+
 class TestCliAuditFootprint:
     """The audit endpoint was the worst offender: it filtered on package name
     only, so auditing one version of playwright loaded every version row the

@@ -148,17 +148,9 @@ async def index_file(
 async def _locate_file(
     session: AsyncSession, name: str, version: str
 ) -> tuple[Package, PackageVersion, PackageFile] | None:
-    lookup = await packages.fetch_package(session, ECOSYSTEM, normalize_cargo_name(name))
-    if lookup.package is None:
-        return None
-    package = lookup.package
-    for version_row in package.versions:
-        if version_row.version != version:
-            continue
-        if not version_row.files:
-            return None
-        return package, version_row, version_row.files[0]
-    return None
+    return await packages.locate_file(
+        session, ECOSYSTEM, normalize_cargo_name(name), version=version
+    )
 
 
 @router.get("/api/v1/crates/{name}/{version}/download")
@@ -214,6 +206,7 @@ async def download(
             "artifact failed integrity verification", status.HTTP_502_BAD_GATEWAY
         )
     except artifacts.ArtifactError as exc:
+        log.warning("artifact fetch failed: %s", exc)
         return cargo_error(str(exc), status.HTTP_502_BAD_GATEWAY)
 
     await packages.bump_download_counters(session, package.id, file_row.id)

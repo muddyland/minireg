@@ -27,12 +27,23 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from ..config import settings
 from ..models import Ecosystem, Package, PackageVersion, PackageVulnerability, Vulnerability
 from ..upstreams.base import get_http_client
 
 log = logging.getLogger(__name__)
+
+
+def _bump(counter: str) -> None:
+    """Record a fail-open. Imported lazily to avoid a cycle with main."""
+    try:
+        from ..main import bump
+
+        bump(counter)
+    except Exception:  # pragma: no cover - metrics must never break a scan
+        pass
 
 OSV_ECOSYSTEM = {
     Ecosystem.npm: "npm",
@@ -409,6 +420,7 @@ class OsvScanner:
             try:
                 raw_results = await self._query_batch(queries, timeout=timeout)
             except (TimeoutError, RuntimeError) as exc:
+                _bump("cve.batch.failed")
                 log.warning("OSV batch failed: %s", exc)
                 for name, version in batch:
                     results[(name, version)] = ScanResult(None, name, version, scanned=False)
@@ -639,7 +651,9 @@ class OsvScanner:
 
         versions_updated = 0
         for version_id, score in worst.items():
-            version_row = await self.session.get(PackageVersion, version_id)
+            version_row = await self.session.get(
+                PackageVersion, version_id, options=[defer(PackageVersion.metadata_json)]
+            )
             if version_row is not None and version_row.max_cvss != score:
                 version_row.max_cvss = score
                 versions_updated += 1
@@ -654,7 +668,11 @@ class OsvScanner:
             p.id: p
             for p in (
                 await self.session.execute(
-                    select(Package).where(
+                    # cached_document is the whole upstream packument. A
+                    # rescore touches every package that has a CVE, so
+                    # selecting the entity here is the OOM the project already
+                    # had once, triggered from an admin button.
+                    select(Package).options(defer(Package.cached_document)).where(
                         Package.id.in_(
                             select(PackageVersion.package_id).where(
                                 PackageVersion.id.in_([link.version_id for link in links] or [0])
@@ -668,7 +686,9 @@ class OsvScanner:
             v.id: v
             for v in (
                 await self.session.execute(
-                    select(PackageVersion).where(
+                    select(PackageVersion)
+                    .options(defer(PackageVersion.metadata_json))
+                    .where(
                         PackageVersion.id.in_([link.version_id for link in links] or [0])
                     )
                 )
@@ -792,7 +812,15 @@ async def inline_scan(
             timeout=settings.osv_inline_timeout_seconds,
         )
     except (TimeoutError, asyncio.CancelledError):
-        log.info("inline OSV scan timed out for %s@%s", package_name, version)
+        # A fail-open. With block_unscored off (the default) the version is
+        # about to be served unscanned, which is exactly the state an operator
+        # needs to be able to see.
+        _bump("cve.scan.timeout")
+        log.warning(
+            "inline OSV scan timed out for %s@%s; serving it unscanned",
+            package_name,
+            version,
+        )
         return ScanResult(None, package_name, version, scanned=False)
     except Exception as exc:
         log.warning("inline OSV scan failed for %s@%s: %s", package_name, version, exc)

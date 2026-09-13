@@ -27,6 +27,20 @@ def _engine_kwargs(url: str) -> dict:
         "max_overflow": settings.db_max_overflow,
         "pool_pre_ping": True,
         "pool_recycle": 1800,
+        # Waiting forever for a connection turns a slow upstream into a total
+        # outage: cached, purely local requests queue behind cold fetches that
+        # are holding connections across the network. Fail fast instead.
+        "pool_timeout": settings.db_pool_timeout_seconds,
+        "connect_args": {
+            "server_settings": {
+                # A runaway query cannot pin a connection indefinitely, and an
+                # abandoned transaction cannot hold row locks forever.
+                "statement_timeout": str(int(settings.db_statement_timeout_seconds * 1000)),
+                "idle_in_transaction_session_timeout": str(
+                    int(settings.db_idle_transaction_timeout_seconds * 1000)
+                ),
+            }
+        },
     }
 
 
@@ -124,8 +138,17 @@ async def create_schema() -> None:
             ):
                 try:
                     await conn.execute(text(stmt))
-                except Exception as exc:  # pragma: no cover - index creation is best effort
-                    log.warning("index creation skipped: %s", exc)
+                except Exception as exc:
+                    # Loud, and named. A missing trigram index degrades search
+                    # to a sequential scan over a table that can hold most of
+                    # PyPI, and a warning nobody reads is how that goes
+                    # unnoticed for months.
+                    log.error(
+                        "COULD NOT CREATE INDEX -- search and log pruning will be "
+                        "slow until this is fixed. Statement: %s. Error: %s",
+                        stmt.split(" ON ")[0],
+                        exc,
+                    )
 
 
 async def dispose_engine() -> None:

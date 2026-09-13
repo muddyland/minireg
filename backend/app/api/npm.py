@@ -424,22 +424,14 @@ async def get_tarball(
     name = npm_path_to_name(package_name)
     normalized = name.lower()
 
-    lookup = await packages.fetch_package(session, ECOSYSTEM, name)
-    if lookup.package is None:
-        return npm_error("package not found", status.HTTP_404_NOT_FOUND)
-    package = lookup.package
-
-    file_row = (
-        await session.execute(
-            select(PackageFile)
-            .join(PackageVersion, PackageVersion.id == PackageFile.version_id)
-            .where(PackageVersion.package_id == package.id, PackageFile.filename == filename)
-        )
-    ).scalar_one_or_none()
-    if file_row is None:
+    # A narrow join, not the whole package graph: fetch_package eager-loads
+    # every version and the Package entity, which carries the entire upstream
+    # packument. Deserialising 37 MB of JSON per concurrent tarball request is
+    # what the container's memory limit is there to survive.
+    located = await packages.locate_file(session, ECOSYSTEM, normalized, filename=filename)
+    if located is None:
         return npm_error("tarball not found", status.HTTP_404_NOT_FOUND)
-
-    version_row = await session.get(PackageVersion, file_row.version_id)
+    package, version_row, file_row = located
 
     # Policy is enforced on the artifact path too -- a blocked package must not
     # be downloadable even if a client already has the metadata cached.
@@ -474,6 +466,7 @@ async def get_tarball(
         log.error("digest mismatch serving %s: %s", filename, exc)
         return npm_error("artifact failed integrity verification", status.HTTP_502_BAD_GATEWAY)
     except artifacts.ArtifactError as exc:
+        log.warning("artifact fetch failed: %s", exc)
         return npm_error(str(exc), status.HTTP_502_BAD_GATEWAY)
 
     await packages.bump_download_counters(session, package.id, file_row.id)
