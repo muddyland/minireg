@@ -83,8 +83,8 @@ onMounted(load)
     <div>
       <h1>Vulnerabilities</h1>
       <p class="page-sub">
-        CVEs affecting indexed packages, sourced from OSV.dev. Only records carrying a CVE
-        identifier are tracked.
+        Advisories affecting indexed packages, from OSV.dev. Malicious-package records are
+        always tracked, because malware is rarely assigned a CVE.
       </p>
     </div>
     <div class="row">

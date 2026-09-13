@@ -247,3 +247,26 @@ class TestCvss4Approximation:
         }
         _score, stype, _vector = best_severity(record)
         assert stype == "CVSS_V4"
+
+
+class TestAdvisoryUpsertOrdering:
+    """Concurrent scans must take row locks in the same order.
+
+    The hourly refresh now drains for minutes rather than doing a single
+    batch, so it overlaps with an admin-triggered scan far more often. Both
+    upsert into `vulnerabilities`; iterating a set meant each process picked
+    its own order, and Postgres deadlocked.
+    """
+
+    def test_hydrate_iterates_ids_in_sorted_order(self):
+        import inspect
+
+        from app.services.osv import OsvScanner
+
+        source = inspect.getsource(OsvScanner._hydrate)
+        assert "sorted(missing)" in source, (
+            "advisory ids must be hydrated in a deterministic order, or two "
+            "concurrent scans can deadlock upserting the same rows"
+        )
+        # And the upserts must follow that order, not the set's.
+        assert source.index("sorted(missing)") < source.index("_upsert_vulnerability")

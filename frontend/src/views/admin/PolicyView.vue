@@ -182,7 +182,8 @@ onMounted(load)
         <div class="card-body">
           <p class="dim small mb">
             Blocks any package version whose highest CVSS base score falls inside the range. Scores
-            come from OSV.dev, restricted to records carrying a CVE.
+            come from OSV.dev. Malicious-package advisories are always scored critical, whatever
+            severity they carry.
           </p>
 
           <label class="check mb">

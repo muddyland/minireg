@@ -167,7 +167,7 @@ onMounted(load)
               </span>
             </div>
             <div class="row" style="justify-content: space-between">
-              <span class="dim">Redis cache</span>
+              <span class="dim">Valkey cache</span>
               <span class="badge" :class="health.checks.redis.ok ? 'badge-ok' : 'badge-warn'">
                 {{ health.checks.redis.ok ? 'ok' : 'unavailable' }}
               </span>

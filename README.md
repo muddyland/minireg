@@ -22,11 +22,29 @@ Then [read the setup guide](docs/installation.md).
 
 ---
 
+## Screenshots
+
+A development instance with npmjs, PyPI and crates.io configured as upstreams
+and a few dozen packages cached. Every number and advisory below is real.
+
+| | |
+|---|---|
+| [![Package detail](docs/images/package.png)](docs/images/package.png) | [![Search](docs/images/search.png)](docs/images/search.png) |
+| **Package detail** — every version, its files, and the CVEs against it | **Search** — one index across npm, PyPI and cargo |
+| [![Dashboard](docs/images/dashboard.png)](docs/images/dashboard.png) | [![Vulnerabilities](docs/images/vulnerabilities.png)](docs/images/vulnerabilities.png) |
+| **Dashboard** — traffic, cache hit rate, upstream health | **Vulnerabilities** — advisories, scores, and what each one affects |
+| [![Package policy](docs/images/policy.png)](docs/images/policy.png) | [![Client setup](docs/images/setup.png)](docs/images/setup.png) |
+| **Package policy** — block by name, version range, or CVSS score | **Client setup** — copy-paste config for every client |
+
+---
+
 ## Documentation
 
 All of this is also served inside the running registry — the **?** in the top
 bar — so a deployment with no route to the internet still has its
 documentation, matching the version actually running.
+
+[![In-app documentation](docs/images/docs.png)](docs/images/docs.png)
 
 | | |
 |---|---|

@@ -533,8 +533,18 @@ class OsvScanner:
             async with sem:
                 return await self._fetch_vuln(osv_id, timeout=timeout)
 
+        # Sorted, so every process that touches an overlapping set of
+        # advisories takes their row locks in the same order.
+        #
+        # `missing` is a set, so iteration order varied per process. Two
+        # concurrent scans -- the hourly refresh and an admin pressing "Scan
+        # new versions", which now overlap far more often since the refresh
+        # drains for minutes rather than doing one batch -- would upsert the
+        # same ids in opposite orders and deadlock in Postgres. Consistent
+        # ordering is the standard fix, and costs nothing.
+        ordered = sorted(missing)
         fetched = await asyncio.gather(
-            *(_fetch(i) for i in missing), return_exceptions=True
+            *(_fetch(i) for i in ordered), return_exceptions=True
         )
         for record in fetched:
             if not isinstance(record, dict):
