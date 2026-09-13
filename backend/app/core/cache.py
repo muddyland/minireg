@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 import time
 from typing import Any
 
@@ -23,10 +24,13 @@ _redis: aioredis.Redis | None = None
 # Process-local guard so N concurrent requests for the same cold packument
 # collapse into one upstream fetch even before Redis is consulted.
 _local_locks: dict[str, asyncio.Lock] = {}
+# Backoff between reconnect attempts when the cache is down.
+_RECONNECT_INTERVAL = 30.0
+_next_reconnect_at: float = 0.0
 
 
 async def init_redis() -> aioredis.Redis | None:
-    global _redis
+    global _redis, _next_reconnect_at
     try:
         _redis = aioredis.from_url(
             settings.redis_url,
@@ -37,11 +41,33 @@ async def init_redis() -> aioredis.Redis | None:
             health_check_interval=30,
         )
         await _redis.ping()
-        log.info("redis connected: %s", settings.redis_url)
+        _next_reconnect_at = 0.0
+        log.info("cache connected: %s", settings.redis_url)
     except Exception as exc:
-        log.warning("redis unavailable, running without cache: %s", exc)
+        log.warning("cache unavailable, running degraded: %s", exc)
         _redis = None
+        _next_reconnect_at = time.monotonic() + _RECONNECT_INTERVAL
     return _redis
+
+
+async def ensure_redis() -> aioredis.Redis | None:
+    """Reconnect if the cache was down at boot.
+
+    The connection used to be made exactly once during startup. If the cache
+    container came up a second later than the app -- an ordinary outcome after
+    a host reboot, since `depends_on` only waits for the container, not for a
+    usable socket -- the process ran for its whole life with no cache, no herd
+    guard and, worst of all, no rate limiting, while the healthcheck stayed
+    green.
+    """
+    global _next_reconnect_at
+    if _redis is not None:
+        return _redis
+    now = time.monotonic()
+    if now < _next_reconnect_at:
+        return None
+    _next_reconnect_at = now + _RECONNECT_INTERVAL
+    return await init_redis()
 
 
 async def close_redis() -> None:
@@ -98,38 +124,80 @@ async def cache_delete_prefix(prefix: str) -> None:
                 break
 
 
+# Release only our own lock. Deleting by key alone means a holder whose work
+# outran the TTL deletes the *next* holder's lock on the way out -- with a
+# 300 s artifact TTL and a slow upstream, that is a real window.
+_RELEASE_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
 class herd_guard:
     """Collapse concurrent cold-cache work for the same key.
 
     Local asyncio lock first (cheap, covers the common single-replica case),
     then an optional Redis lock so a multi-replica deployment doesn't stampede
     an upstream either.
+
+    Yields whether the lock was actually taken. With ``wait=True`` (the
+    default) that is always True by the time the body runs; with
+    ``wait=False`` the body runs immediately and must check, which is what a
+    singleton background job wants.
     """
 
-    def __init__(self, key: str, ttl: int = 30):
+    def __init__(self, key: str, ttl: int = 30, *, wait: bool = True):
         self.key = f"lock:{key}"
         self.ttl = ttl
+        self.wait = wait
+        self._token = secrets.token_hex(16).encode()
         self._local = _local_locks.setdefault(self.key, asyncio.Lock())
         self._held_remote = False
+        self._held_local = False
 
-    async def __aenter__(self) -> herd_guard:
-        await self._local.acquire()
-        if _redis is not None:
-            try:
-                for _ in range(int(self.ttl * 10)):
-                    if await _redis.set(self.key, b"1", nx=True, ex=self.ttl):
-                        self._held_remote = True
-                        return self
-                    await asyncio.sleep(0.1)
-            except Exception:
-                pass
-        return self
+    async def __aenter__(self) -> bool:
+        if self.wait:
+            await self._local.acquire()
+            self._held_local = True
+        else:
+            self._held_local = not self._local.locked()
+            if self._held_local:
+                await self._local.acquire()
+            else:
+                return False
+
+        if _redis is None:
+            return True
+        try:
+            attempts = int(self.ttl * 10) if self.wait else 1
+            for _ in range(max(1, attempts)):
+                if await _redis.set(self.key, self._token, nx=True, ex=self.ttl):
+                    self._held_remote = True
+                    return True
+                if not self.wait:
+                    return False
+                await asyncio.sleep(0.1)
+        except Exception:
+            # Redis is unreachable: the process-local lock is the whole guard.
+            return True
+        # Waited out the TTL without getting it. Proceed rather than hang; the
+        # cost is a duplicated upstream fetch, not a stuck request.
+        log.warning("herd guard %s not acquired within its TTL; proceeding", self.key)
+        return True
 
     async def __aexit__(self, *exc) -> None:
         if self._held_remote and _redis is not None:
             with contextlib.suppress(Exception):
-                await _redis.delete(self.key)
-        self._local.release()
+                await _redis.eval(_RELEASE_SCRIPT, 1, self.key, self._token)
+        if self._held_local:
+            self._local.release()
+        # One Lock per package name and per file id, kept for the life of the
+        # process, is a slow leak on a registry that sees hundreds of thousands
+        # of names. Nothing is waiting on an unlocked lock, so drop it.
+        if not self._local.locked():
+            _local_locks.pop(self.key, None)
 
 
 def rate_limit_retry_after(window: int = 60) -> int:
@@ -137,7 +205,29 @@ def rate_limit_retry_after(window: int = 60) -> int:
     return max(1, window - int(time.time()) % window)
 
 
-async def rate_limit(key: str, limit: int, window: int = 60) -> tuple[bool, int]:
+# Fallback counters for when the cache is unreachable. Bounded, per-process
+# and approximate -- worth having anyway, because failing open on the *login*
+# bucket turns a cache outage into an open door for password guessing.
+_local_counters: dict[tuple[str, int], int] = {}
+_local_counter_window: int = 0
+
+
+def _local_rate_limit(key: str, limit: int, window: int) -> tuple[bool, int]:
+    global _local_counter_window
+    bucket = int(time.time()) // window
+    if bucket != _local_counter_window:
+        _local_counters.clear()
+        _local_counter_window = bucket
+    if len(_local_counters) > 100_000:
+        _local_counters.clear()
+    count = _local_counters.get((key, bucket), 0) + 1
+    _local_counters[(key, bucket)] = count
+    return count <= limit, max(0, limit - count)
+
+
+async def rate_limit(
+    key: str, limit: int, window: int = 60, *, fail_closed: bool = False
+) -> tuple[bool, int]:
     """Fixed-window counter. Returns (allowed, remaining).
 
     The window number is part of the key, so the count genuinely resets every
@@ -149,15 +239,18 @@ async def rate_limit(key: str, limit: int, window: int = 60) -> tuple[bool, int]
     of *silence*: a busy CI runner that tripped the limit once stayed locked
     out for as long as it kept retrying.)
     """
-    if _redis is None or not settings.rate_limit_enabled or limit <= 0:
+    if not settings.rate_limit_enabled or limit <= 0:
         return True, limit
+    client = await ensure_redis()
+    if client is None:
+        return _local_rate_limit(key, limit, window) if fail_closed else (True, limit)
     try:
         bucket = int(time.time()) // window
         rkey = f"rl:{key}:{window}:{bucket}"
-        pipe = _redis.pipeline()
+        pipe = client.pipeline()
         pipe.incr(rkey)
         pipe.expire(rkey, window * 2)
         count, _ = await pipe.execute()
         return int(count) <= limit, max(0, limit - int(count))
     except Exception:
-        return True, limit
+        return _local_rate_limit(key, limit, window) if fail_closed else (True, limit)

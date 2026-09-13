@@ -220,6 +220,52 @@ def verify_digests(request: UploadRequest, stored) -> None:
             )
 
 
+#: Nothing legitimate puts a megabyte of core metadata in a wheel, and
+#: `ZipFile.read` will happily inflate whatever the central directory claims.
+MAX_METADATA_BYTES = 4 * 1024 * 1024
+
+
+def _read_metadata_member(archive: zipfile.ZipFile) -> str | None:
+    """Read `*.dist-info/METADATA` with a bound on the inflated size."""
+    candidates = [
+        info
+        for info in archive.infolist()
+        if info.filename.endswith(".dist-info/METADATA") and info.filename.count("/") == 1
+    ]
+    if not candidates:
+        return None
+    info = candidates[0]
+    # Trust the header enough to reject early, then bound the actual read so a
+    # lying header cannot turn a 5 MB wheel into a 4 GB allocation.
+    if info.file_size > MAX_METADATA_BYTES:
+        return None
+    with archive.open(info) as handle:
+        data = handle.read(MAX_METADATA_BYTES + 1)
+    if len(data) > MAX_METADATA_BYTES:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def extract_wheel_metadata_from_path(path, filename: str) -> dict[str, Any] | None:
+    """Same as :func:`extract_wheel_metadata`, reading the zip from disk.
+
+    Used on the PEP 658 read path, where the wheel is already a blob on the
+    filesystem: `zipfile` seeks to the central directory and inflates one
+    member, so a 900 MB wheel costs a few kilobytes of memory instead of being
+    loaded whole.
+    """
+    if not str(filename).endswith(".whl"):
+        return None
+    try:
+        with zipfile.ZipFile(path) as archive:
+            raw = _read_metadata_member(archive)
+    except (zipfile.BadZipFile, KeyError, OSError):
+        return None
+    if raw is None:
+        return None
+    return _parse_metadata(raw)
+
+
 def extract_wheel_metadata(content: bytes, filename: str) -> dict[str, Any] | None:
     """Pull ``*.dist-info/METADATA`` out of a wheel.
 
@@ -230,17 +276,15 @@ def extract_wheel_metadata(content: bytes, filename: str) -> dict[str, Any] | No
         return None
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
-            candidates = [
-                n
-                for n in archive.namelist()
-                if n.endswith(".dist-info/METADATA") and n.count("/") == 1
-            ]
-            if not candidates:
-                return None
-            raw = archive.read(candidates[0]).decode("utf-8", "replace")
+            raw = _read_metadata_member(archive)
     except (zipfile.BadZipFile, KeyError, OSError):
         return None
+    if raw is None:
+        return None
+    return _parse_metadata(raw)
 
+
+def _parse_metadata(raw: str) -> dict[str, Any]:
     message = Parser().parsestr(raw)
     metadata: dict[str, Any] = {"_raw": raw}
     for key in message:

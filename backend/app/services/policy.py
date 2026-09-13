@@ -23,6 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.cache import cache_delete_prefix, cache_get_json, cache_set_json
+from ..core.naming import _PEP503_RE
 from ..core.semver import is_valid_range, satisfies
 from ..models import Ecosystem, PackageRule, RuleAction, Setting
 
@@ -68,10 +69,25 @@ class CvePolicy:
     # Deny only when the CVE has a fix available upstream, if set.
     require_fix_available: bool = False
 
-    def blocks(self, score: float | None) -> bool:
+    def blocks(self, score: float | None, *, scanned: bool = True) -> bool:
+        """Whether this policy denies a version with ``score``.
+
+        Three states, and conflating any two of them breaks the policy:
+
+        * ``scanned=False`` -- OSV never answered for this version. Unknown
+          risk, so ``block_unscored`` decides.
+        * ``score is None`` with ``scanned=True`` -- OSV answered and the
+          version *has* advisories, but none carried a usable severity. Also
+          unknown risk, so ``block_unscored`` decides here too.
+        * ``score == 0.0`` -- scanned, no advisories at all. Clean, and never
+          blocked. This is the case an earlier version got wrong: clean
+          versions were stored as ``None`` and so were indistinguishable from
+          unscanned, which made ``block_unscored`` deny every package in the
+          registry and left fail-closed mode unusable.
+        """
         if not self.enabled:
             return False
-        if score is None:
+        if not scanned or score is None:
             return self.block_unscored
         return self.min_score <= score <= self.max_score
 
@@ -107,14 +123,35 @@ class RuleSnapshot:
     id: int
 
 
-def _matches_name(pattern: str, normalized_name: str) -> bool:
+def _normalize_pattern(pattern: str, ecosystem: str) -> str:
+    """Normalize a rule pattern the same way the package name it is matched
+    against was normalized.
+
+    Package names are stored per-ecosystem canonical form, but rule patterns
+    are stored exactly as the admin typed them. Without this, a PyPI rule
+    written ``typing_extensions`` (the importable spelling, and the one people
+    reach for) never matched the stored ``typing-extensions`` and silently
+    blocked nothing.
+
+    Only PyPI folds separators -- PEP 503 collapses runs of ``-_.`` to a single
+    ``-``. npm and cargo names are lowercased but keep ``-`` and ``_`` distinct,
+    so folding them here would make one rule match two different crates.
+    Glob metacharacters survive all of these unchanged.
+    """
+    base = pattern.strip().lower()
+    if ecosystem == "pypi":
+        return _PEP503_RE.sub("-", base)
+    return base
+
+
+def _matches_name(pattern: str, normalized_name: str, ecosystem: str) -> bool:
     """Glob match against the *normalized* name.
 
-    ``fnmatchcase`` is used because both names are already lowercased by the
-    caller; ``fnmatch`` would additionally apply os.path rules on some
-    platforms, which we do not want.
+    ``fnmatchcase`` is used because both sides are already lowercased by
+    :func:`_normalize_pattern`; ``fnmatch`` would additionally apply os.path
+    rules on some platforms, which we do not want.
     """
-    return fnmatch.fnmatchcase(normalized_name, pattern.lower())
+    return fnmatch.fnmatchcase(normalized_name, _normalize_pattern(pattern, ecosystem))
 
 
 def _matches_version(spec: str | None, ecosystem: str, version: str | None) -> bool:
@@ -164,14 +201,29 @@ def _matches_version(spec: str | None, ecosystem: str, version: str | None) -> b
 
 
 class PolicyEngine:
+    """Rule and CVE evaluation.
+
+    One instance is created per request and may be asked about thousands of
+    versions (a packument render evaluates every version it is about to
+    serve). Rules and settings are therefore memoised on the instance: without
+    it, each ``evaluate`` cost three Redis round trips, so rendering a package
+    with 5,600 versions meant ~17,000 sequential lookups -- and three
+    *Postgres* queries apiece whenever the cache was down.
+    """
+
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+        self._rules: list[RuleSnapshot] | None = None
+        self._settings: dict[str, object] = {}
 
     # -- loading ------------------------------------------------------------ #
     async def _load_rules(self) -> list[RuleSnapshot]:
+        if self._rules is not None:
+            return self._rules
         cached = await cache_get_json(RULES_CACHE_KEY)
         if cached is not None:
-            return [RuleSnapshot(**r) for r in cached]
+            self._rules = [RuleSnapshot(**r) for r in cached]
+            return self._rules
 
         rows = (
             await self.session.execute(
@@ -190,15 +242,21 @@ class PolicyEngine:
             for r in rows
         ]
         await cache_set_json(RULES_CACHE_KEY, [asdict(s) for s in snapshots], CACHE_TTL)
+        self._rules = snapshots
         return snapshots
 
     async def get_setting(self, key: str, default=None):
+        if key in self._settings:
+            return self._settings[key]
         cached = await cache_get_json(f"{SETTINGS_CACHE_KEY}:{key}")
         if cached is not None:
-            return cached.get("v", default)
+            value = cached.get("v", default)
+            self._settings[key] = value
+            return value
         row = await self.session.get(Setting, key)
         value = row.value if row else default
         await cache_set_json(f"{SETTINGS_CACHE_KEY}:{key}", {"v": value}, CACHE_TTL)
+        self._settings[key] = value
         return value
 
     async def get_cve_policy(self) -> CvePolicy:
@@ -220,6 +278,7 @@ class PolicyEngine:
         max_cvss: float | None = None,
         has_fix: bool = False,
         scanned: bool = True,
+        _name_level: bool = False,
     ) -> Verdict:
         eco = ecosystem.value if isinstance(ecosystem, Ecosystem) else str(ecosystem)
         name = normalized_name.lower()
@@ -231,7 +290,7 @@ class PolicyEngine:
         for rule in applicable:
             if rule.action != RuleAction.block.value:
                 continue
-            if not _matches_name(rule.pattern, name):
+            if not _matches_name(rule.pattern, name, eco):
                 continue
             if not _matches_version(rule.version_spec, eco, version):
                 continue
@@ -247,9 +306,15 @@ class PolicyEngine:
             for rule in applicable:
                 if rule.action != RuleAction.allow.value:
                     continue
-                if _matches_name(rule.pattern, name) and _matches_version(
-                    rule.version_spec, eco, version
-                ):
+                if not _matches_name(rule.pattern, name, eco):
+                    continue
+                # At name level a version-scoped allow rule still allows the
+                # *package* -- we are deciding whether to serve the index at
+                # all, and which versions survive is settled per version
+                # further down. Requiring a version match here meant an
+                # allowlist of `lodash >=4.17.21` refused the packument
+                # outright, so no version of lodash could be installed.
+                if _name_level or _matches_version(rule.version_spec, eco, version):
                     break
             else:
                 return Verdict(
@@ -260,33 +325,46 @@ class PolicyEngine:
 
         # 3. CVE score policy.
         policy = await self.get_cve_policy()
-        if policy.enabled and version is not None:
-            if policy.require_fix_available and not has_fix:
-                # Admin opted to only block what is actually actionable.
-                return ALLOWED
-            effective = max_cvss if scanned else None
-            if policy.blocks(effective):
-                if effective is None:
-                    return Verdict(
-                        allowed=False,
-                        reason="package has not been scanned for CVEs and unscanned packages are blocked",
-                        source="cve",
-                    )
+        if version is not None and policy.blocks(max_cvss, scanned=scanned):
+            if not scanned:
                 return Verdict(
                     allowed=False,
                     reason=(
-                        f"blocked by CVE policy: highest CVSS {effective:.1f} falls within "
-                        f"the blocked range {policy.min_score:.1f}-{policy.max_score:.1f}"
+                        "package has not been scanned for CVEs and unscanned "
+                        "packages are blocked"
                     ),
                     source="cve",
                 )
+            if max_cvss is None:
+                return Verdict(
+                    allowed=False,
+                    reason=(
+                        "package has advisories with no published severity and "
+                        "unscored packages are blocked"
+                    ),
+                    source="cve",
+                )
+            # `require_fix_available` narrows a *score* block to what an
+            # operator can actually act on. It deliberately does not suppress
+            # the unscanned/unscored blocks above: those are not about a
+            # specific advisory, so "is there a fix" has no answer.
+            if policy.require_fix_available and not has_fix:
+                return ALLOWED
+            return Verdict(
+                allowed=False,
+                reason=(
+                    f"blocked by CVE policy: highest CVSS {max_cvss:.1f} falls within "
+                    f"the blocked range {policy.min_score:.1f}-{policy.max_score:.1f}"
+                ),
+                source="cve",
+            )
 
         return ALLOWED
 
     async def is_name_blocked(self, ecosystem: Ecosystem | str, normalized_name: str) -> Verdict:
         """Package-level check with no version context, used before we have
         resolved anything upstream."""
-        return await self.evaluate(ecosystem, normalized_name, version=None)
+        return await self.evaluate(ecosystem, normalized_name, version=None, _name_level=True)
 
 
 async def invalidate_policy_cache() -> None:

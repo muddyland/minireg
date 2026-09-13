@@ -367,6 +367,10 @@ class PackageVersion(Base):
     blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     block_reason: Mapped[str | None] = mapped_column(Text)
     max_cvss: Mapped[float | None] = mapped_column(Float)
+    # Whether any advisory on this version names an installable fixed release.
+    # Denormalized from package_vulnerabilities because the CVE policy consults
+    # it on every download, where a second query per version is not affordable.
+    has_fix: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     package: Mapped[Package] = relationship(back_populates="versions")

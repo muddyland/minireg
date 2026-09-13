@@ -11,6 +11,7 @@ Client credential shapes we must accept, because the tooling is not negotiable:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -68,6 +69,17 @@ class Identity:
             return False
         if self.token is None:
             return True
+        return self.token_has_scope(scope)
+
+    def token_has_scope(self, scope: str) -> bool:
+        """Scope check that never falls back to full authority.
+
+        Unlike :meth:`has_scope` this answers False for a session, so callers
+        that specifically care about *token* authority cannot be fooled by an
+        identity that simply has no token attached.
+        """
+        if self.token is None:
+            return False
         scopes = self.token.scopes or []
         return scope in scopes or "admin" in scopes
 
@@ -81,14 +93,25 @@ class Identity:
 
 
 def client_ip(request: Request) -> str | None:
-    """Honour X-Forwarded-For only for the left-most entry.
+    """The caller's address, counting back from the right of X-Forwarded-For.
 
-    Behind the bundled reverse proxy this is correct; if you front this with
-    something else, make sure it overwrites rather than appends.
+    The left-most entry is whatever the *client* sent. Reading it meant anyone
+    could pick their own rate-limit bucket, their own audit-log address, and
+    the "From IP" shown on a CLI approval screen, just by adding a header --
+    an nginx that appends with ``$proxy_add_x_forwarded_for`` (the common
+    copy-paste) preserves it verbatim.
+
+    Each proxy appends the peer it saw, so with ``TRUSTED_PROXY_HOPS`` proxies
+    in front, the last entry that no untrusted party could have written is the
+    Nth from the right. With the default single proxy that is the last entry.
     """
+    hops = max(1, settings.trusted_proxy_hops)
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        return forwarded.split(",")[0].strip()[:64]
+        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+        if parts:
+            index = max(0, len(parts) - hops)
+            return parts[index][:64]
     real = request.headers.get("x-real-ip")
     if real:
         return real.strip()[:64]
@@ -131,6 +154,55 @@ async def _token_identity(session: AsyncSession, presented: str) -> Identity | N
     return Identity(user=user, token=token, method="token")
 
 
+async def _basic_password_identity(
+    session: AsyncSession, request: Request, username: str, password: str
+) -> Identity:
+    """Username/password over HTTP Basic.
+
+    This runs on *every* route, not just the login endpoint, so it needs the
+    login endpoint's protections: without them it was an unthrottled,
+    unlogged password oracle that also cost a full argon2 verify per guess.
+
+    The resulting identity is marked ``basic_password`` and carries no token,
+    which :meth:`Identity.has_scope` treats as full user authority. That is
+    correct for a password -- it is the user's primary credential -- but it is
+    also why the guessing has to be as expensive here as it is at /auth/login.
+    """
+    from ..core.cache import rate_limit
+    from ..core.security import verify_password
+    from ..services.audit import LOGIN_FAILED, record_audit
+
+    ip = client_ip(request) or "unknown"
+    for key, limit in (
+        (f"login:ip:{ip}", settings.rate_limit_login_per_minute),
+        (f"login:user:{username[:150]}", settings.rate_limit_login_per_minute),
+    ):
+        allowed, _ = await rate_limit(key, limit, fail_closed=True)
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="too many login attempts",
+                headers={"Retry-After": str(rate_limit_retry_after())},
+            )
+
+    user = (
+        await session.execute(select(User).where(User.username == username))
+    ).scalar_one_or_none()
+    if user and user.is_active and verify_password(password, user.password_hash):
+        return Identity(user=user, method="basic_password")
+
+    with contextlib.suppress(Exception):
+        await record_audit(
+            session,
+            LOGIN_FAILED,
+            actor_username=username[:150],
+            success=False,
+            ip=ip,
+            detail={"method": "basic"},
+        )
+    return Identity()
+
+
 async def resolve_identity(
     request: Request, session: AsyncSession = Depends(get_session)
 ) -> Identity:
@@ -160,13 +232,7 @@ async def resolve_identity(
                 return Identity(user=identity.user, token=identity.token, method="basic")
             # Plain username/password Basic, for clients that cannot send Bearer.
             if username not in ("__token__", "token"):
-                from ..core.security import verify_password
-
-                user = (
-                    await session.execute(select(User).where(User.username == username))
-                ).scalar_one_or_none()
-                if user and user.is_active and verify_password(password, user.password_hash):
-                    return Identity(user=user, method="basic")
+                return await _basic_password_identity(session, request, username, password)
             return Identity()
 
         # An Authorization scheme we do not implement.
@@ -208,6 +274,35 @@ async def require_admin(identity: Identity = Depends(resolve_identity)) -> Ident
     if not identity.has_scope("admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="token lacks the 'admin' scope"
+        )
+    return identity
+
+
+async def require_primary_credential(
+    identity: Identity = Depends(resolve_identity),
+) -> Identity:
+    """A logged-in session, or an admin-scoped token.
+
+    Guards the routes that hand out or revoke authority. Everything else takes
+    the *user's* rights as the ceiling, which is right for a browser session
+    but wrong for a token: a leaked read-only CI token could POST /auth/tokens
+    asking for ``admin`` and be handed one, because the check only ever looked
+    at whether the *owner* was an admin. Scoping a token is only meaningful if
+    the token cannot widen itself.
+    """
+    if identity.user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if identity.token is not None and not identity.token_has_scope("admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "this action needs a browser session or an admin-scoped token; "
+                "a token cannot grant scopes it does not hold"
+            ),
         )
     return identity
 

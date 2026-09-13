@@ -96,7 +96,11 @@ class TestDeviceFlow:
         assert len(body["device_code"]) > 20
         assert len(body["user_code"]) == 9  # XXXX-XXXX
         assert body["verification_url"].endswith("/cli-login")
-        assert body["user_code"] in body["verification_url_complete"]
+        # No `verification_url_complete`: a link that pre-fills the code turns
+        # the approval screen into a phishing target, because the person never
+        # types the code and so never compares it with their own terminal.
+        assert "verification_url_complete" not in body
+        assert body["user_code"] not in body["verification_url"]
         assert body["interval"] >= 1
 
     async def test_start_needs_no_authentication(self, client):

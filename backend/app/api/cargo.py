@@ -184,6 +184,7 @@ async def download(
         package.normalized_name,
         version_row.version,
         max_cvss=version_row.max_cvss,
+        has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
     )
     if verdict.blocked:
@@ -289,6 +290,7 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
             package.normalized_name,
             version_row.version,
             max_cvss=version_row.max_cvss,
+            has_fix=version_row.has_fix,
             scanned=bool(version_row.scanned_at),
         )
         if verdict.blocked:

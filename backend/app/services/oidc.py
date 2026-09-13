@@ -47,6 +47,7 @@ class OidcProfile:
     issuer: str
     username: str
     email: str | None = None
+    email_verified: bool = False
     full_name: str | None = None
     groups: list[str] = field(default_factory=list)
     raw_claims: dict[str, Any] = field(default_factory=dict)
@@ -60,6 +61,10 @@ class OidcProfile:
         if not settings.oidc_user_group:
             return True
         return settings.oidc_user_group in self.groups or self.is_admin
+
+
+#: Signature algorithms accepted on an id_token. Asymmetric only.
+_ID_TOKEN_ALGORITHMS = ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256"]
 
 
 def discovery_url() -> str:
@@ -88,6 +93,15 @@ async def get_discovery() -> dict:
     for required in ("authorization_endpoint", "token_endpoint", "issuer"):
         if required not in document:
             raise OidcError(f"OIDC discovery document is missing '{required}'")
+    # The issuer we validate id_tokens against has to be the one the operator
+    # configured, not one the discovery document nominates for itself.
+    configured = (settings.oidc_issuer or "").rstrip("/")
+    advertised = str(document["issuer"]).rstrip("/")
+    if configured and advertised != configured:
+        raise OidcError(
+            f"OIDC discovery issuer '{advertised}' does not match the configured "
+            f"issuer '{configured}'"
+        )
     _discovery_cache[url] = (now, document)
     return document
 
@@ -163,7 +177,11 @@ async def verify_id_token(id_token: str, nonce: str) -> dict:
         claims = jwt.decode(
             id_token,
             signing_key.key,
-            algorithms=discovery.get("id_token_signing_alg_values_supported") or ["RS256"],
+            # An explicit asymmetric allowlist. Taking this from discovery
+            # means a tampered discovery document chooses the algorithm, and
+            # only PyJWT's key-type guard then stands between that and HMAC
+            # key confusion against the public JWKS key.
+            algorithms=_ID_TOKEN_ALGORITHMS,
             audience=settings.oidc_client_id,
             issuer=discovery["issuer"],
             options={"require": ["exp", "iat", "sub"]},
@@ -235,6 +253,9 @@ def build_profile(claims: dict, userinfo: dict | None = None) -> OidcProfile:
         issuer=str(merged.get("iss") or settings.oidc_issuer or ""),
         username=str(username),
         email=merged.get("email"),
+        # Only a provider-asserted verified email may be used to link an
+        # existing local account; see the callback in api/auth.py.
+        email_verified=bool(merged.get("email_verified")),
         full_name=merged.get("name") or merged.get("given_name"),
         groups=groups,
         raw_claims=merged,

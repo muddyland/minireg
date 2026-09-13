@@ -81,6 +81,10 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "web_url_template", "VARCHAR(512)"),
     ("device_authorizations", "requested_scopes", "JSONB"),
+    ("package_versions", "has_fix", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("packages", "owner_user_id", "BIGINT"),
+    ("upstreams", "name_patterns", "JSONB"),
+    ("upstreams", "require_digest", "BOOLEAN NOT NULL DEFAULT TRUE"),
 ]
 
 

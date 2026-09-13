@@ -9,12 +9,12 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..core.cache import rate_limit
-from ..core.deps import Identity, client_ip, require_user, resolve_identity
+from ..core.deps import Identity, client_ip, require_primary_credential, require_user, resolve_identity
 from ..core.security import (
     create_session_token,
     create_state_token,
@@ -34,9 +34,28 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 VALID_SCOPES = {"read", "publish", "admin"}
 
 
+def _safe_next(target: str | None) -> str:
+    """Only ever redirect to a path on this site.
+
+    ``//evil.example`` starts with "/" but is a protocol-relative URL, so a
+    plain ``startswith("/")`` check sent the user to another origin holding a
+    freshly minted session cookie -- an ideal setup for a fake "session
+    expired" prompt. Backslashes are folded to slashes by some browsers, so
+    they are rejected too.
+    """
+    if not target or not target.startswith("/"):
+        return "/"
+    if target.startswith("//") or "\\" in target:
+        return "/"
+    return target
+
+
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    # Bounded so a long username cannot overflow the audit row's column (which
+    # turned a failed login into a 500 and lost the audit record), and a
+    # multi-megabyte password cannot buy an argon2 verify over the whole thing.
+    username: str = Field(min_length=1, max_length=150)
+    password: str = Field(min_length=1, max_length=1024)
 
 
 class TokenCreateRequest(BaseModel):
@@ -184,7 +203,7 @@ async def change_password(
     payload: ChangePasswordRequest,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    identity: Identity = Depends(require_user),
+    identity: Identity = Depends(require_primary_credential),
 ) -> dict:
     user = identity.user
     assert user is not None
@@ -246,7 +265,7 @@ async def create_token(
     payload: TokenCreateRequest,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    identity: Identity = Depends(require_user),
+    identity: Identity = Depends(require_primary_credential),
 ) -> dict:
     user = identity.user
     assert user is not None
@@ -317,7 +336,11 @@ async def revoke_token(
     row = await session.get(ApiToken, token_id)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="token not found")
-    if row.user_id != identity.user_id and not identity.is_admin:
+    # Revoking someone else's token is an admin action, so it needs the admin
+    # scope and not merely an admin owner -- otherwise an admin's publish-only
+    # CI token could revoke anyone's credentials.
+    others = row.user_id != identity.user_id
+    if others and not (identity.is_admin and identity.has_scope("admin")):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not your token")
 
     row.revoked = True
@@ -360,7 +383,7 @@ async def oidc_login(next: str = "/") -> RedirectResponse:
     nonce = secrets.token_urlsafe(24)
     # All login state travels in the signed `state` parameter.
     state = create_state_token(
-        {"nonce": nonce, "verifier": verifier, "next": next if next.startswith("/") else "/"}
+        {"nonce": nonce, "verifier": verifier, "next": _safe_next(next)}
     )
     try:
         url = await oidc.build_authorization_url(_redirect_uri(), state, nonce, challenge)
@@ -453,15 +476,33 @@ async def oidc_callback(
         )
     ).scalar_one_or_none()
 
-    if user is None and profile.email:
-        # Link an existing local account with the same email on first OIDC login.
-        user = (
-            await session.execute(select(User).where(User.email == profile.email))
-        ).scalar_one_or_none()
-        if user is not None:
+    if user is None and profile.email and profile.email_verified:
+        # Link an existing local account with the same email on first OIDC
+        # login -- but only an email the provider says it verified, and only
+        # onto an account that is still local.
+        #
+        # Without those two conditions this was an account takeover: at an IdP
+        # where users can set their own email, claiming `admin@localhost` (the
+        # shipped bootstrap address) bound the existing admin row to the
+        # attacker's subject, flipped it to OIDC so its password could no
+        # longer be changed, and then rewrote its admin flag from the
+        # attacker's group membership.
+        candidates = (
+            await session.execute(
+                select(User).where(
+                    func.lower(User.email) == profile.email.lower(),
+                    User.provider == AuthProvider.local,
+                )
+            )
+        ).scalars().all()
+        # An ambiguous match is not a match. Email is not unique in this
+        # schema, and picking one arbitrarily is how you link the wrong person.
+        if len(candidates) == 1:
+            user = candidates[0]
             user.oidc_issuer = profile.issuer
             user.oidc_subject = profile.subject
             user.provider = AuthProvider.oidc
+            log.info("linked local account '%s' to OIDC subject", user.username)
 
     created = False
     if user is None:
@@ -509,7 +550,7 @@ async def oidc_callback(
     )
     await session.commit()
 
-    destination = state_payload.get("next") or "/"
+    destination = _safe_next(state_payload.get("next"))
     response = RedirectResponse(destination, status_code=status.HTTP_302_FOUND)
     _set_session_cookie(response, create_session_token(user.id, user.username, user.is_admin))
     return response

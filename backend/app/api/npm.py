@@ -26,6 +26,7 @@ Routes implemented (npm registry API):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import UTC, datetime
@@ -46,7 +47,7 @@ from ..core.deps import (
     rate_limited_read,
     resolve_identity,
 )
-from ..core.naming import max_semver, npm_path_to_name
+from ..core.naming import max_semver, npm_path_to_name, semver_key
 from ..db import get_session
 from ..models import DistTag, Ecosystem, Package, PackageFile, PackageVersion
 from ..services import artifacts, audit, npm_publish, npm_render, packages
@@ -193,9 +194,21 @@ async def get_dist_tags(
     if verdict.blocked:
         return npm_error(verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
 
-    tags = {t.tag: t.version for t in lookup.package.dist_tags}
-    if "latest" not in tags and lookup.package.latest_version:
-        tags["latest"] = lookup.package.latest_version
+    # A tag pointing at a blocked version is a download the client is about to
+    # be refused, so filter the same set the packument filters. `latest` is
+    # re-pointed at the newest version that survives rather than dropped, which
+    # is what lets `npm install pkg` degrade to an installable release.
+    blocked = await _blocked_versions(PolicyEngine(session), lookup.package)
+    tags = {
+        t.tag: t.version for t in lookup.package.dist_tags if t.version not in blocked
+    }
+    if "latest" not in tags:
+        survivors = [
+            v.version for v in lookup.package.versions if v.version not in blocked
+        ]
+        fallback = max_semver(survivors) if survivors else None
+        if fallback:
+            tags["latest"] = fallback
     return json_response(tags)
 
 
@@ -300,19 +313,35 @@ async def delete_dist_tag(
 # --------------------------------------------------------------------------- #
 # npm audit
 # --------------------------------------------------------------------------- #
+#: Names accepted in one `npm audit` call. The endpoint costs a query per
+#: name, so an unbounded body is a cheap way to make the database do work.
+MAX_AUDIT_BULK_NAMES = 4000
+
+
 @router.post("/-/npm/v1/security/advisories/bulk")
 async def audit_bulk(
-    request: Request, session: AsyncSession = Depends(get_session)
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    identity: Identity = Depends(rate_limited_read),
 ) -> Response:
     """``npm audit`` bulk endpoint.
 
     Answers from our own CVE store, so audit results match the CVE policy this
     registry actually enforces.
+
+    Carries the same read dependency as every other read route: it reports
+    which packages and versions are cached and what is known about them, which
+    is not something to hand out anonymously when reads require a token.
     """
     try:
         body = await request.json()
     except ValueError:
         return json_response({})
+    if isinstance(body, dict) and len(body) > MAX_AUDIT_BULK_NAMES:
+        return npm_error(
+            f"too many packages in one request (limit {MAX_AUDIT_BULK_NAMES})",
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+        )
     if not isinstance(body, dict):
         return json_response({})
 
@@ -399,6 +428,7 @@ async def get_tarball(
         normalized,
         version_row.version if version_row else None,
         max_cvss=version_row.max_cvss if version_row else None,
+        has_fix=bool(version_row and version_row.has_fix),
         scanned=bool(version_row and version_row.scanned_at),
     )
     if verdict.blocked:
@@ -896,6 +926,7 @@ async def _version_response(
         package.normalized_name,
         resolved,
         max_cvss=version_row.max_cvss,
+        has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
     )
     if verdict.blocked:
@@ -1022,12 +1053,33 @@ async def _scan_new_versions(session: AsyncSession, package: Package) -> None:
 
     scanner = OsvScanner(session)
     # Bound the work: a cold popular package can have hundreds of versions, and
-    # only the resolvable ones matter for an install.
-    targets = sorted(unscanned, key=lambda v: v.version, reverse=True)[:25]
+    # only the resolvable ones matter for an install. Order by semver, not by
+    # string -- lexically `9.0.0` beats `10.2.1`, so a package past its ninth
+    # major release had its newest versions dropped from the sample and served
+    # unscanned. The dist-tag targets are always included: those are what an
+    # unpinned install actually resolves to.
+    tagged = {t.version for t in package.dist_tags}
+    if package.latest_version:
+        tagged.add(package.latest_version)
+    pinned = [v for v in unscanned if v.version in tagged]
+    rest = sorted(unscanned, key=lambda v: semver_key(v.version), reverse=True)
+    targets: list = []
+    for version_row in [*pinned, *rest]:
+        if version_row not in targets:
+            targets.append(version_row)
+        if len(targets) >= 25:
+            break
     try:
-        results = await scanner.scan_versions(
-            ECOSYSTEM, [(package.name, v.version) for v in targets]
+        # The inline budget is what keeps a cold packument from hanging on a
+        # slow OSV. Without it this used the 30 s API timeout, twice, while a
+        # client waited.
+        results = await asyncio.wait_for(
+            scanner.scan_versions(ECOSYSTEM, [(package.name, v.version) for v in targets]),
+            timeout=settings.osv_inline_timeout_seconds,
         )
+    except (TimeoutError, asyncio.CancelledError):
+        log.info("inline scan budget exceeded for %s; leaving versions unscanned", package.name)
+        return
     except Exception:
         log.debug("inline scan batch failed for %s", package.name, exc_info=True)
         return
@@ -1046,6 +1098,7 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
             package.normalized_name,
             version_row.version,
             max_cvss=version_row.max_cvss,
+            has_fix=version_row.has_fix,
             scanned=bool(version_row.scanned_at),
         )
         if verdict.blocked:

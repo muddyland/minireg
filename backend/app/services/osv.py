@@ -40,6 +40,14 @@ OSV_ECOSYSTEM = {
     Ecosystem.cargo: "crates.io",
 }
 CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
+# OpenSSF malicious-package advisories. These are the records that say "this
+# release is malware", and they are precisely what a registry billed as
+# supply-chain defence exists to stop.
+MAL_RE = re.compile(r"^MAL-\d{4}-\d+$", re.IGNORECASE)
+# Malware has no CVSS vector to compute, and "we do not know how bad it is"
+# is the wrong reading of a confirmed backdoor. Score it at the top of the
+# scale so any sane block range catches it.
+MALICIOUS_SCORE = 10.0
 
 # CVSS v3/v4 qualitative rating scale (FIRST.org).
 SEVERITY_BANDS = (
@@ -67,6 +75,17 @@ def severity_label(score: float | None) -> str | None:
         if score >= threshold:
             return label
     return "none"
+
+
+def is_malicious(record: dict) -> bool:
+    """Whether an OSV record is a malicious-package (MAL-*) advisory."""
+    ident = record.get("id") or ""
+    if MAL_RE.match(ident):
+        return True
+    return any(
+        isinstance(alias, str) and MAL_RE.match(alias)
+        for alias in record.get("aliases") or []
+    )
 
 
 def extract_cve(record: dict) -> str | None:
@@ -246,12 +265,34 @@ def best_severity(record: dict) -> tuple[float | None, str | None, str | None]:
             if score is not None:
                 candidates.append((2, score, "CVSS_V3", raw["vectorString"]))
 
+    # Last resort: the qualitative label. GHSA records essentially always carry
+    # one even when they publish no vector, and treating those as "unscored"
+    # made a `block >= 7.0` rule quietly ignore every GHSA-only advisory. The
+    # band floor is deliberately conservative -- it is the lowest score that
+    # still earns the label, so we never inflate a severity.
+    if not candidates:
+        label = ((record.get("database_specific") or {}).get("severity") or "")
+        floor = _SEVERITY_LABEL_FLOOR.get(str(label).strip().upper())
+        if floor is not None:
+            return floor, "LABEL", str(label).strip().upper()
+
     if not candidates:
         return None, None, None
     # Prefer the newest CVSS version; break ties on the higher score.
     candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
     _, score, stype, vector = candidates[0]
     return score, stype or None, vector or None
+
+
+# Floor of each qualitative band, used only when a record publishes a label
+# but no CVSS vector.
+_SEVERITY_LABEL_FLOOR = {
+    "CRITICAL": 9.0,
+    "HIGH": 7.0,
+    "MODERATE": 4.0,
+    "MEDIUM": 4.0,
+    "LOW": 0.1,
+}
 
 
 def _parse_dt(value) -> datetime | None:
@@ -263,13 +304,23 @@ def _parse_dt(value) -> datetime | None:
         return None
 
 
+# A GIT range's `fixed` event names a commit SHA. That is not installable from
+# a registry, and reporting it as the fixed version -- which happened whenever
+# OSV listed the git range first -- masked the real ECOSYSTEM fix and made the
+# finding look unfixable. Any other range type (including a record that omits
+# the field) is treated as naming a release.
+_UNINSTALLABLE_RANGE_TYPES = {"GIT"}
+
+
 def fixed_version_for(record: dict, package_name: str, ecosystem: str) -> str | None:
-    """First ``fixed`` bound OSV lists for this package, if any."""
+    """First installable ``fixed`` bound OSV lists for this package, if any."""
     for affected in record.get("affected") or []:
         pkg = affected.get("package") or {}
         if pkg.get("name", "").lower() != package_name.lower():
             continue
         for rng in affected.get("ranges") or []:
+            if (rng.get("type") or "").upper() in _UNINSTALLABLE_RANGE_TYPES:
+                continue
             for event in rng.get("events") or []:
                 if "fixed" in event:
                     return event["fixed"]
@@ -363,6 +414,21 @@ class OsvScanner:
                     results[(name, version)] = ScanResult(None, name, version, scanned=False)
                 continue
 
+            # querybatch answers one result per query, in order. If it does
+            # not, we cannot tell which answer belongs to which package, and
+            # padding the gap with "no vulnerabilities" would stamp the whole
+            # batch as scanned and clean -- which is what a degraded OSV, a
+            # proxy error page with a JSON body, or a WAF used to produce.
+            if len(raw_results) != len(batch):
+                log.warning(
+                    "OSV batch returned %d results for %d queries; treating as unscanned",
+                    len(raw_results),
+                    len(batch),
+                )
+                for name, version in batch:
+                    results[(name, version)] = ScanResult(None, name, version, scanned=False)
+                continue
+
             # Collect every distinct OSV id in this batch, then hydrate once.
             needed: set[str] = set()
             per_item_ids: list[list[str]] = []
@@ -370,25 +436,38 @@ class OsvScanner:
                 ids = [v["id"] for v in (entry.get("vulns") or []) if v.get("id")]
                 per_item_ids.append(ids)
                 needed.update(ids)
-            while len(per_item_ids) < len(batch):
-                per_item_ids.append([])
 
             hydrated = await self._hydrate(needed, ecosystem, timeout=timeout)
 
-            for (name, version), ids in zip(batch, per_item_ids, strict=False):
+            for (name, version), ids in zip(batch, per_item_ids, strict=True):
                 cves = []
                 max_score = None
                 has_fix = False
                 for osv_id in ids:
                     record = hydrated.get(osv_id)
                     if record is None:
-                        continue  # not a CVE, or hydration failed
+                        continue  # filtered out, or hydration failed
+                    # The fix bound is package-specific, so it can only be
+                    # resolved here where the package name is known -- not in
+                    # _hydrate, which serves a whole batch of packages at once.
+                    if record.get("raw"):
+                        record = {
+                            **record,
+                            "fixed_version": fixed_version_for(
+                                record["raw"], name, ecosystem.value
+                            ),
+                        }
                     cves.append(record)
                     score = record.get("cvss_score")
                     if score is not None and (max_score is None or score > max_score):
                         max_score = score
                     if record.get("fixed_version"):
                         has_fix = True
+                if not cves:
+                    # Scanned, nothing found. Recorded as a real zero rather
+                    # than None so the policy engine can tell "clean" from
+                    # "we do not know" -- see CvePolicy.blocks.
+                    max_score = 0.0
                 results[(name, version)] = ScanResult(
                     version_id=None,
                     package_name=name,
@@ -433,20 +512,35 @@ class OsvScanner:
         if not missing:
             return cached
 
+        # Bounded fan-out. A batch covering a heavily-advised package can name
+        # hundreds of distinct ids, and firing them all at once is what earns
+        # the 429 that then fails the whole batch.
+        sem = asyncio.Semaphore(settings.osv_hydrate_concurrency)
+
+        async def _fetch(osv_id: str):
+            async with sem:
+                return await self._fetch_vuln(osv_id, timeout=timeout)
+
         fetched = await asyncio.gather(
-            *(self._fetch_vuln(i, timeout=timeout) for i in missing), return_exceptions=True
+            *(_fetch(i) for i in missing), return_exceptions=True
         )
         for record in fetched:
             if not isinstance(record, dict):
                 continue
             cve_id = extract_cve(record)
-            if settings.osv_cve_only and not cve_id:
-                # Not a CVE: by policy we ignore GHSA-only / MAL-only records.
+            malicious = is_malicious(record)
+            # OSV_CVE_ONLY drops advisory noise that carries no CVE, but a
+            # malicious-package record is never noise: npm and PyPI malware
+            # almost never gets a CVE assigned, so honouring the flag here
+            # meant the registry scanned malware and recorded it as clean.
+            if settings.osv_cve_only and not cve_id and not malicious:
                 continue
             osv_id = record.get("id")
             if not osv_id:
                 continue
             score, stype, vector = best_severity(record)
+            if malicious and score is None:
+                score, stype, vector = MALICIOUS_SCORE, "MALICIOUS", None
             row = {
                 "id": osv_id,
                 "cve_id": cve_id or osv_id,
@@ -606,12 +700,23 @@ class OsvScanner:
     # -- persistence -------------------------------------------------------- #
     async def apply_to_version(
         self, version_row: PackageVersion, result: ScanResult, package_name: str
-    ) -> None:
-        """Persist scan output onto a stored version and its CVE links."""
-        if not result.scanned:
-            return
+    ) -> bool:
+        """Persist scan output onto a stored version and its CVE links.
 
+        Returns whether the stored verdict changed, so a caller that holds the
+        package identity can drop the rendered documents that have the old
+        verdict baked into them.
+        """
+        if not result.scanned:
+            return False
+
+        changed = (
+            version_row.max_cvss != result.max_score
+            or version_row.scanned_at is None
+            or version_row.has_fix != result.has_fix
+        )
         version_row.max_cvss = result.max_score
+        version_row.has_fix = result.has_fix
         version_row.scanned_at = datetime.now(UTC)
 
         existing_links = {
@@ -628,8 +733,9 @@ class OsvScanner:
         for record in result.cves:
             osv_id = record["id"]
             seen.add(osv_id)
-            fixed = None
-            if record.get("raw"):
+            # scan_versions already resolved this against the package name.
+            fixed = record.get("fixed_version")
+            if fixed is None and record.get("raw"):
                 fixed = fixed_version_for(record["raw"], package_name, "")
             if osv_id in existing_links:
                 existing_links[osv_id].fixed_version = fixed
@@ -645,6 +751,8 @@ class OsvScanner:
         for osv_id, link in existing_links.items():
             if osv_id not in seen:
                 await self.session.delete(link)
+                changed = True
+        return changed
 
     async def scan_and_apply(
         self, ecosystem: Ecosystem, version_row: PackageVersion, package_name: str, *, timeout=None
@@ -656,7 +764,13 @@ class OsvScanner:
             (package_name, version_row.version),
             ScanResult(None, package_name, version_row.version, scanned=False),
         )
-        await self.apply_to_version(version_row, result, package_name)
+        if await self.apply_to_version(version_row, result, package_name):
+            from ..core.naming import normalize_name_for
+            from .packages import invalidate_package_cache
+
+            await invalidate_package_cache(
+                ecosystem.value, normalize_name_for(ecosystem.value, package_name)
+            )
         return result
 
 

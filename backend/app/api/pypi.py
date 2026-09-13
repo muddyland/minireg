@@ -18,6 +18,7 @@ Routes:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import UTC, datetime
@@ -227,6 +228,7 @@ async def get_file(
         package.normalized_name,
         version_row.version,
         max_cvss=version_row.max_cvss,
+        has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
     )
     if verdict.blocked:
@@ -296,19 +298,37 @@ async def _get_core_metadata(session: AsyncSession, project: str, filename: str)
     located = await _locate_file(session, project, filename)
     if located is None:
         return PlainTextResponse("Not Found", status_code=status.HTTP_404_NOT_FOUND)
-    _package, _version_row, file_row = located
+    package, version_row, file_row = located
+
+    # Policy first. Without it this route both described a blocked release and,
+    # on a cache miss below, fetched the blocked wheel from upstream to do so.
+    verdict = await PolicyEngine(session).evaluate(
+        ECOSYSTEM,
+        package.normalized_name,
+        version_row.version,
+        max_cvss=version_row.max_cvss,
+        has_fix=version_row.has_fix,
+        scanned=bool(version_row.scanned_at),
+    )
+    if verdict.blocked:
+        return PlainTextResponse(
+            verdict.reason or "blocked", status_code=status.HTTP_403_FORBIDDEN
+        )
 
     stored = (file_row.core_metadata or {}).get("_raw")
     if stored:
         return PlainTextResponse(stored, media_type="text/plain")
 
-    # Not extracted yet: pull it out of the cached wheel on demand.
+    # Not extracted yet: pull it out of the cached wheel. Read the METADATA
+    # member straight from the blob on disk -- loading the whole wheel into
+    # memory to reach a few kilobytes of text is how a handful of concurrent
+    # `pip install torch` requests used to exhaust the container.
     await artifacts.ensure_cached(session, file_row)
-    content = await get_store().read_bytes(file_row.blob_sha256)
-    if content is None:
-        return PlainTextResponse("Not Found", status_code=status.HTTP_404_NOT_FOUND)
-
-    metadata = pypi_publish.extract_wheel_metadata(content, file_row.filename)
+    metadata = await asyncio.to_thread(
+        pypi_publish.extract_wheel_metadata_from_path,
+        get_store().blob_path(file_row.blob_sha256),
+        file_row.filename,
+    )
     if not metadata or "_raw" not in metadata:
         return PlainTextResponse("Not Found", status_code=status.HTTP_404_NOT_FOUND)
 
@@ -334,7 +354,13 @@ async def project_json(
     lookup = await packages.fetch_package(session, ECOSYSTEM, project)
     if lookup.package is None:
         return json_response({"message": "Not Found"}, status.HTTP_404_NOT_FOUND)
-    return json_response(pypi_render.render_json_api_project(lookup.package))
+    # The simple index filters blocked versions; this view has to agree with
+    # it, or the JSON API becomes a directory of the very releases the
+    # registry refuses to serve, file URLs included.
+    excluded = await _blocked_versions(PolicyEngine(session), lookup.package)
+    return json_response(
+        pypi_render.render_json_api_project(lookup.package, excluded_versions=excluded)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -621,6 +647,7 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
             package.normalized_name,
             version_row.version,
             max_cvss=version_row.max_cvss,
+            has_fix=version_row.has_fix,
             scanned=bool(version_row.scanned_at),
         )
         if verdict.blocked:

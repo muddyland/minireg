@@ -35,7 +35,7 @@ from sqlalchemy.orm import defer
 
 from ..config import settings
 from ..core.cache import rate_limit
-from ..core.deps import Identity, client_ip, require_user
+from ..core.deps import Identity, client_ip, require_primary_credential, require_user
 from ..core.naming import normalize_name_for
 from ..core.security import generate_token
 from ..db import get_session
@@ -128,7 +128,7 @@ async def device_start(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     ip = client_ip(request)
-    allowed, _ = await rate_limit(f"cli:start:{ip}", 20)
+    allowed, _ = await rate_limit(f"cli:start:{ip}", 20, fail_closed=True)
     if not allowed:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="too many login attempts"
@@ -169,8 +169,12 @@ async def device_start(
     return {
         "device_code": device_code,
         "user_code": user_code,
+        # No `verification_url_complete`. RFC 8628 section 5.4 warns that a
+        # pre-filled approval page is a phishing primitive: the target clicks
+        # a link, sees a code they never typed next to machine details the
+        # *initiator* supplied, and approves a token into someone else's
+        # terminal. Making them type the code is the whole check.
         "verification_url": f"{settings.public_url}/cli-login",
-        "verification_url_complete": f"{settings.public_url}/cli-login?code={user_code}",
         "expires_in": int(DEVICE_CODE_TTL.total_seconds()),
         "interval": POLL_INTERVAL_SECONDS,
     }
@@ -246,7 +250,7 @@ async def device_pending(
     identity: Identity = Depends(require_user),
 ) -> dict:
     """What the browser shows on the approval screen."""
-    allowed, _ = await rate_limit(f"cli:lookup:{client_ip(request)}", 30)
+    allowed, _ = await rate_limit(f"cli:lookup:{client_ip(request)}", 30, fail_closed=True)
     if not allowed:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="slow down")
 
@@ -288,9 +292,11 @@ async def device_approve(
     payload: DeviceApproveRequest,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    identity: Identity = Depends(require_user),
+    identity: Identity = Depends(require_primary_credential),
 ) -> dict:
-    allowed, _ = await rate_limit(f"cli:approve:{client_ip(request)}", 30)
+    allowed, _ = await rate_limit(
+        f"cli:approve:{client_ip(request)}", 30, fail_closed=True
+    )
     if not allowed:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="slow down")
 
@@ -328,12 +334,17 @@ async def device_approve(
         await session.commit()
         return {"ok": True, "approved": False}
 
-    # A CLI token can never exceed the authority of the person approving it.
+    # A CLI token can never exceed the authority of the person approving it,
+    # nor the authority of the credential they are approving with -- otherwise
+    # a leaked read-only token could approve itself an admin CLI token.
     granted = {s for s in payload.scopes if s in ("read", "publish", "admin")} or {"read"}
     if "admin" in granted and not user.is_admin:
         granted.discard("admin")
     if "publish" in granted and not (user.can_publish or user.is_admin):
         granted.discard("publish")
+    if identity.token is not None:
+        granted &= set(identity.token.scopes or [])
+    granted = granted or {"read"}
 
     full_token, prefix, token_hash = generate_token()
     api_token = ApiToken(
@@ -505,18 +516,21 @@ async def audit_packages(
         entry = known.get((normalized, version))
         cves: list = []
         max_cvss = None
+        has_fix = False
         scanned = False
 
         if entry is not None:
             _name, version_row = entry
             cves = by_version.get(version_row.id, [])
             max_cvss = version_row.max_cvss
+            has_fix = version_row.has_fix
             scanned = version_row.scanned_at is not None
         else:
             result = scanned_now.get((item.name, item.version))
             if result is not None and getattr(result, "scanned", False):
                 scanned = True
                 max_cvss = result.max_score
+                has_fix = result.has_fix
                 cves = dedupe_by_cve(
                     [
                         {
@@ -542,7 +556,12 @@ async def audit_packages(
             unscanned.append({"name": item.name, "version": item.version})
 
         verdict = await policy.evaluate(
-            ecosystem, normalized, version, max_cvss=max_cvss, scanned=scanned
+            ecosystem,
+            normalized,
+            version,
+            max_cvss=max_cvss,
+            has_fix=has_fix,
+            scanned=scanned,
         )
 
         if cves or verdict.blocked:

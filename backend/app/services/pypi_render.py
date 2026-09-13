@@ -276,17 +276,27 @@ def render_index_html(names: list[str]) -> str:
     return "\n".join(lines)
 
 
-def render_json_api_project(package: Package) -> dict[str, Any]:
+def render_json_api_project(
+    package: Package, *, excluded_versions: set[str] | None = None
+) -> dict[str, Any]:
     """Warehouse-compatible ``/pypi/{name}/json``.
 
     Not a PEP, but pervasive in tooling, so we serve a faithful subset.
+
+    ``excluded_versions`` carries the policy verdict, exactly as the simple
+    index does. A blocked release is omitted entirely rather than marked,
+    because this document is a list of things you can install.
     """
+    excluded = excluded_versions or set()
+    visible = [v for v in package.versions if v.version not in excluded]
     latest = package.latest_version
-    latest_row = next((v for v in package.versions if v.version == latest), None)
+    if latest in excluded:
+        latest = sort_pypi_versions([v.version for v in visible])[-1] if visible else None
+    latest_row = next((v for v in visible if v.version == latest), None)
     metadata = (latest_row.metadata_json if latest_row else {}) or {}
 
     releases: dict[str, list[dict]] = {}
-    for version_row in package.versions:
+    for version_row in visible:
         releases[version_row.version] = [
             {
                 "filename": f.filename,

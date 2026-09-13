@@ -205,11 +205,11 @@ class TestHousekeepingRefreshFootprint:
         """Ties the test above to the real source, so editing one fails the other."""
         import inspect
 
-        from app.main import housekeeping_loop
+        from app.main import _cve_refresh_task
 
-        source = inspect.getsource(housekeeping_loop)
+        source = inspect.getsource(_cve_refresh_task)
         assert "select(Package.ecosystem, Package.name, PackageVersion)" in source, (
-            "housekeeping_loop no longer selects scalar package columns; "
+            "the CVE refresh no longer selects scalar package columns; "
             "selecting the Package entity re-introduces the OOM"
         )
         assert "defer(PackageVersion.metadata_json)" in source

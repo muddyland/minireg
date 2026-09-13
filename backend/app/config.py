@@ -5,8 +5,13 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_PLACEHOLDER_SECRETS = {
+    "change-me-in-production-please-32b+",
+    "change-me-generate-a-long-random-value",
+}
 
 
 class Settings(BaseSettings):
@@ -43,12 +48,32 @@ class Settings(BaseSettings):
 
     # --- Storage ------------------------------------------------------------
     storage_path: str = "/data/packages"
-    # 0 disables the cap.
+    # Refuse to cache new upstream artifacts once the blob store exceeds this.
+    # Publishes are still accepted -- locally published packages exist nowhere
+    # else, so dropping them to save space would lose data, while a cached
+    # artifact can always be re-fetched. 0 disables the cap.
     storage_quota_bytes: int = 0
     # Immutable artifacts: once fetched, never re-fetched unless evicted.
     cache_artifacts: bool = True
     # Stream threshold: files larger than this are streamed rather than buffered.
     stream_chunk_size: int = 256 * 1024
+
+    # --- Request / response limits ------------------------------------------
+    # Largest publish body accepted, checked against Content-Length before the
+    # body is read. npm sends the tarball base64-encoded inside a JSON
+    # document, so the wire size is ~1.4x the tarball and the peak resident
+    # cost is several times that again.
+    max_publish_bytes: int = 256 * 1024 * 1024
+    # Largest upstream metadata document (packument, simple page, index file)
+    # we will buffer. Public packuments top out around 40 MB today.
+    max_metadata_bytes: int = 96 * 1024 * 1024
+    # Largest artifact we will stream from an upstream into the blob store.
+    # 0 disables the cap.
+    max_artifact_bytes: int = 2 * 1024 * 1024 * 1024
+    # Total wall-clock budget for one artifact download, independent of the
+    # per-chunk read timeout -- a trickling upstream otherwise holds the
+    # herd-guard lock indefinitely.
+    artifact_download_timeout_seconds: float = 900.0
 
     # --- Auth ---------------------------------------------------------------
     session_cookie: str = "minireg_session"
@@ -75,6 +100,16 @@ class Settings(BaseSettings):
     oidc_username_claim: str = "preferred_username"
 
     # --- Upstream fetching --------------------------------------------------
+    # Artifact URLs come out of upstream metadata, so they are attacker-chosen
+    # whenever an upstream is hostile or spoofed. Fetches are restricted to the
+    # upstream's own host plus these, and never to a private or link-local
+    # address unless explicitly allowed.
+    upstream_artifact_hosts: str = (
+        "registry.npmjs.org,files.pythonhosted.org,pypi.org,"
+        "static.crates.io,crates.io,index.crates.io"
+    )
+    upstream_allow_private_addresses: bool = False
+    upstream_allow_plaintext_http: bool = False
     upstream_timeout_seconds: float = 20.0
     upstream_connect_timeout_seconds: float = 5.0
     upstream_max_connections: int = 100
@@ -93,10 +128,18 @@ class Settings(BaseSettings):
     # Inline scan budget; on timeout we fail-open (or closed, see below) and
     # queue a background scan.
     osv_inline_timeout_seconds: float = 4.0
-    osv_fail_closed: bool = False
     osv_refresh_interval_seconds: int = 6 * 3600
-    # CVE-only: ignore OSV records that carry no CVE alias.
-    osv_cve_only: bool = True
+    # Ignore OSV records that carry no CVE alias. Malicious-package (MAL-*)
+    # advisories are always kept regardless of this flag: npm and PyPI malware
+    # is rarely assigned a CVE, so honouring it there would filter out exactly
+    # the records this registry exists to act on.
+    osv_cve_only: bool = False
+    # Concurrent /v1/vulns fetches while hydrating one batch.
+    osv_hydrate_concurrency: int = 8
+    # Wall-clock budget for the CVE refresh pass in one housekeeping cycle.
+    # The pass keeps taking batches until the backlog is drained or the budget
+    # is spent, so a large backlog clears in days rather than weeks.
+    osv_housekeeping_budget_seconds: float = 600.0
 
     # --- Rate limiting ------------------------------------------------------
     rate_limit_enabled: bool = True
@@ -104,6 +147,10 @@ class Settings(BaseSettings):
     rate_limit_authenticated_per_minute: int = 3000
     rate_limit_publish_per_minute: int = 60
     rate_limit_login_per_minute: int = 10
+    # Number of reverse proxies in front of the app. The client address is
+    # taken this many hops from the right of X-Forwarded-For; everything to the
+    # left of that was written by something we do not control.
+    trusted_proxy_hops: int = 1
 
     # --- Housekeeping -------------------------------------------------------
     download_log_retention_days: int = 365
@@ -113,6 +160,37 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @model_validator(mode="after")
+    def _reject_placeholder_secrets(self) -> Settings:
+        """Refuse to run in production with a guessable signing key.
+
+        The key signs session cookies and, unless CREDENTIAL_KEY is set
+        separately, derives the key that encrypts every stored upstream
+        credential. Anyone who knows it can mint an admin session. The shipped
+        placeholders pass a "is it set?" check in compose, so the check has to
+        look at the value.
+        """
+        if self.environment != "prod":
+            return self
+        placeholder = (
+            not self.secret_key
+            or len(self.secret_key) < 32
+            or self.secret_key in _PLACEHOLDER_SECRETS
+            or self.secret_key.lower().startswith("change-me")
+        )
+        if placeholder:
+            raise ValueError(
+                "SECRET_KEY is unset, too short, or still the shipped placeholder. "
+                "Generate one with: python -c 'import secrets; print(secrets.token_urlsafe(48))'"
+            )
+        return self
+
+    @property
+    def artifact_host_allowlist(self) -> frozenset[str]:
+        return frozenset(
+            h.strip().lower() for h in self.upstream_artifact_hosts.split(",") if h.strip()
+        )
 
     @property
     def npm_base(self) -> str:

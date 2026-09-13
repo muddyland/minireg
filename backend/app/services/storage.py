@@ -136,6 +136,11 @@ class BlobStore:
             raise
 
     # -- reads ------------------------------------------------------------- #
+    def blob_path(self, sha256: str) -> Path:
+        """Filesystem path of a stored blob, for readers that can work
+        incrementally instead of loading the whole artifact."""
+        return self.path_for(sha256)
+
     async def read_bytes(self, sha256: str) -> bytes | None:
         path = self.path_for(sha256)
         if not path.is_file():

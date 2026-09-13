@@ -1,13 +1,15 @@
 <script setup>
-import { onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, ref } from 'vue'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()
-const route = useRoute()
 
-const code = ref((route.query.code || '').toString().toUpperCase())
+// Deliberately not seeded from the query string. A link that pre-fills the
+// code and jumps straight to the confirm step is how a device-flow approval
+// gets phished: the recipient never types the code, so they never check that
+// it is the one their own terminal is showing.
+const code = ref('')
 const pending = ref(null)
 const error = ref(null)
 const busy = ref(false)
@@ -29,13 +31,11 @@ async function lookup() {
   busy.value = true
   try {
     pending.value = await api.cliPending(value)
-    // Pre-select what the CLI asked for, filtered to what this person can
-    // actually grant — the server enforces the same ceiling on approval.
-    const requested = pending.value.requested_scopes || ['read']
-    scopes.value = requested.filter(
-      (s) => s === 'read' || (s === 'publish' && auth.canPublish) || (s === 'admin' && auth.isAdmin),
-    )
-    if (!scopes.value.includes('read')) scopes.value.push('read')
+    // Start at read only. The requested scopes are shown so the person can see
+    // what the tool asked for, but pre-ticking `admin` meant a one-click
+    // approval handed out the strongest token the approver could mint.
+    // Widening is a deliberate action; the server caps it either way.
+    scopes.value = ['read']
     if (pending.value.already_approved) {
       error.value = 'That code has already been used.'
       pending.value = null
@@ -64,9 +64,7 @@ async function decide(approve) {
   }
 }
 
-onMounted(() => {
-  if (code.value) lookup()
-})
+const requestedScopes = computed(() => pending.value?.requested_scopes || ['read'])
 </script>
 
 <template>
@@ -137,9 +135,14 @@ onMounted(() => {
         <div class="card-body">
           <p class="dim small mb">
             A command line tool is asking to sign in as
-            <strong>{{ auth.user?.username }}</strong>. Check that these details match the machine
-            you are sitting at.
+            <strong>{{ auth.user?.username }}</strong>. Approve this only if you started it
+            yourself, on the machine in front of you.
           </p>
+
+          <div class="alert alert-warn small mb">
+            The details below are self-reported by the tool that asked. They are not verified,
+            so a matching hostname is not proof the request is yours.
+          </div>
 
           <div class="detail-grid mb">
             <span class="dim">Hostname</span>
@@ -148,6 +151,8 @@ onMounted(() => {
             <span class="mono small">{{ pending.platform || 'not reported' }}</span>
             <span class="dim">From IP</span>
             <span class="mono">{{ pending.ip || 'unknown' }}</span>
+            <span class="dim">Requested</span>
+            <span class="mono small">{{ requestedScopes.join(', ') }}</span>
           </div>
 
           <div class="field">

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -75,75 +77,184 @@ async def bootstrap_admin() -> None:
         )
 
         if not settings.bootstrap_admin_password:
-            log.warning(
-                "\n"
-                "=========================================================\n"
-                " Created the initial admin account.\n"
-                "   username: %s\n"
-                "   password: %s\n"
-                " This password is shown once. Change it after logging in.\n"
-                "=========================================================",
-                user.username,
-                password,
-            )
+            # Not into the log. Docker's json-file driver keeps stdout for the
+            # life of the container, so a password printed here is readable by
+            # anyone with the docker socket or a log shipper, forever. A 0600
+            # file next to the data can be read once and deleted.
+            secret_path = Path(settings.storage_path).parent / "initial-admin-password"
+            written = False
+            try:
+                fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as handle:
+                    handle.write(f"{user.username}\n{password}\n")
+                written = True
+            except OSError as exc:
+                log.error("could not write the initial admin password file: %s", exc)
+            if written:
+                log.warning(
+                    "\n"
+                    "=========================================================\n"
+                    " Created the initial admin account '%s'.\n"
+                    " The generated password was written to:\n"
+                    "   %s\n"
+                    " Read it, log in, change it, then delete that file.\n"
+                    "=========================================================",
+                    user.username,
+                    secret_path,
+                )
+            else:
+                log.warning(
+                    "Created the initial admin account '%s' but could not store its "
+                    "password. Set BOOTSTRAP_ADMIN_PASSWORD and restart, or reset it "
+                    "from the database.",
+                    user.username,
+                )
         else:
             log.info("created initial admin account '%s'", user.username)
 
 
-async def housekeeping_loop() -> None:
-    """Retention pruning, orphan-blob GC, and background CVE refresh."""
-    from .models import Package, PackageVersion
+async def _prune_task() -> None:
     from .services.artifacts import collect_orphan_blobs
+
+    async with session_scope() as session:
+        removed = await prune_old_logs(session)
+        orphans = await collect_orphan_blobs(session)
+        if removed or orphans:
+            log.info("housekeeping: pruned=%s orphan_blobs=%d", removed, orphans)
+    get_store().cleanup_tmp()
+
+
+async def _cve_refresh_task() -> None:
+    """Re-scan the oldest versions until the backlog clears or time runs out.
+
+    One batch per hour could not keep up: with a 77k backlog and a batch of
+    200, a full pass took about sixteen days, so the six-hour refresh interval
+    was fiction and a CVE published today reached an already-scanned version a
+    fortnight later. This keeps taking batches within a wall-clock budget.
+
+    Batches are also isolated. A batch that always fails -- one malformed
+    version making OSV reject the whole query, say -- used to leave all 200
+    rows with a null ``scanned_at``, so the same 200 were reselected every hour
+    and nothing behind them was ever scanned. Here a failed batch is retried in
+    halves, and a single poisonous row is skipped rather than blocking the
+    queue.
+    """
+    from .models import Package, PackageVersion
     from .services.osv import OsvScanner
+
+    if not settings.osv_enabled:
+        return
+
+    deadline = time.monotonic() + settings.osv_housekeeping_budget_seconds
+    cutoff = datetime.now(UTC) - timedelta(seconds=settings.osv_refresh_interval_seconds)
+    total = 0
+
+    while time.monotonic() < deadline:
+        async with session_scope() as session:
+            # Select the two package columns the scan actually uses rather than
+            # the Package entity. The entity drags cached_document -- the whole
+            # upstream packument, 18MB for playwright and 37MB for vite -- once
+            # per *row*, so a 200-row batch pulled and JSON-parsed multiple GB
+            # and got the container OOM-killed. metadata_json is deferred for
+            # the same reason; apply_to_version never reads it.
+            rows = (
+                await session.execute(
+                    select(Package.ecosystem, Package.name, PackageVersion)
+                    .join(PackageVersion, PackageVersion.package_id == Package.id)
+                    .options(defer(PackageVersion.metadata_json))
+                    .where(
+                        (PackageVersion.scanned_at.is_(None))
+                        | (PackageVersion.scanned_at < cutoff)
+                    )
+                    # Never-scanned first, then oldest. Within that, the
+                    # versions people actually resolve to: a package's own
+                    # `latest` and its most-downloaded releases earn their scan
+                    # before some 0.0.1 nobody installs.
+                    .order_by(
+                        PackageVersion.scanned_at.asc().nullsfirst(),
+                        PackageVersion.published_at.desc().nullslast(),
+                    )
+                    .limit(settings.osv_batch_size)
+                )
+            ).all()
+            if not rows:
+                break
+
+            scanner = OsvScanner(session)
+            grouped: dict = {}
+            for eco, name, version in rows:
+                grouped.setdefault(eco, []).append((name, version))
+            for ecosystem, items in grouped.items():
+                await _scan_group(scanner, ecosystem, items)
+            total += len(rows)
+
+        if len(rows) < settings.osv_batch_size:
+            break
+
+    if total:
+        log.info("background CVE refresh scanned %d versions", total)
+
+
+async def _scan_group(scanner, ecosystem, items: list) -> None:
+    """Scan one ecosystem's slice, splitting on failure so one bad row cannot
+    wedge the queue behind it."""
+    try:
+        results = await scanner.scan_versions(
+            ecosystem, [(n, v.version) for n, v in items]
+        )
+    except Exception:
+        if len(items) == 1:
+            name, version = items[0]
+            # Mark it examined so the queue moves on; the next refresh cycle
+            # will try again rather than this one spinning on it forever.
+            log.warning(
+                "CVE scan permanently failing for %s@%s; skipping", name, version.version
+            )
+            version.scanned_at = datetime.now(UTC)
+            return
+        mid = len(items) // 2
+        log.warning("CVE batch of %d failed; retrying in halves", len(items))
+        await _scan_group(scanner, ecosystem, items[:mid])
+        await _scan_group(scanner, ecosystem, items[mid:])
+        return
+
+    for name, version in items:
+        result = results.get((name, version.version))
+        if result is not None:
+            await scanner.apply_to_version(version, result, name)
+
+
+async def housekeeping_loop() -> None:
+    """Retention pruning, orphan-blob GC, and background CVE refresh.
+
+    Each task has its own error boundary. They used to share one, so a failure
+    while pruning logs silently skipped the GC and the CVE refresh for the
+    whole hour.
+
+    A Redis lock keeps this to one runner: replicas all execute this loop, and
+    without the lock they duplicate every OSV call and race each other's
+    upserts.
+    """
+    from .core.cache import herd_guard
 
     # Stagger the first run so a restart storm does not converge on one moment.
     await asyncio.sleep(60)
     while True:
         try:
-            async with session_scope() as session:
-                removed = await prune_old_logs(session)
-                orphans = await collect_orphan_blobs(session)
-                if removed or orphans:
-                    log.info("housekeeping: pruned=%s orphan_blobs=%d", removed, orphans)
-            get_store().cleanup_tmp()
-
-            if settings.osv_enabled:
-                cutoff = datetime.now(UTC) - timedelta(seconds=settings.osv_refresh_interval_seconds)
-                async with session_scope() as session:
-                    # Select the two package columns the scan actually uses
-                    # rather than the Package entity. The entity drags
-                    # cached_document -- the whole upstream packument, 18MB for
-                    # playwright and 37MB for vite -- once per *row*, so a
-                    # 200-row batch pulled and JSON-parsed multiple GB and got
-                    # the container OOM-killed. metadata_json is deferred for
-                    # the same reason; apply_to_version never reads it.
-                    rows = (
-                        await session.execute(
-                            select(Package.ecosystem, Package.name, PackageVersion)
-                            .join(PackageVersion, PackageVersion.package_id == Package.id)
-                            .options(defer(PackageVersion.metadata_json))
-                            .where(
-                                (PackageVersion.scanned_at.is_(None))
-                                | (PackageVersion.scanned_at < cutoff)
-                            )
-                            .order_by(PackageVersion.scanned_at.asc().nullsfirst())
-                            .limit(settings.osv_batch_size)
-                        )
-                    ).all()
-                    if rows:
-                        scanner = OsvScanner(session)
-                        grouped: dict = {}
-                        for eco, name, version in rows:
-                            grouped.setdefault(eco, []).append((name, version))
-                        for ecosystem, items in grouped.items():
-                            results = await scanner.scan_versions(
-                                ecosystem, [(n, v.version) for n, v in items]
-                            )
-                            for name, version in items:
-                                result = results.get((name, version.version))
-                                if result is not None:
-                                    await scanner.apply_to_version(version, result, name)
-                        log.info("background CVE refresh scanned %d versions", len(rows))
+            async with herd_guard("housekeeping", ttl=3600, wait=False) as acquired:
+                if acquired:
+                    for name, task in (
+                        ("prune", _prune_task),
+                        ("cve-refresh", _cve_refresh_task),
+                    ):
+                        try:
+                            await task()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            log.exception("housekeeping task %s failed", name)
+                else:
+                    log.debug("housekeeping already running elsewhere; skipping")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -218,8 +329,29 @@ async def security_headers(request: Request, call_next):
 
 
 @app.get("/health", tags=["meta"])
-async def health() -> dict:
-    return {"status": "ok", "service": settings.app_name, "version": "1.0.0"}
+async def health() -> JSONResponse:
+    """Liveness, and the container healthcheck target.
+
+    Deliberately touches the database. A constant 200 meant a process whose
+    connection pool was wedged or whose disk was full stayed "healthy"
+    forever, so `restart: unless-stopped` never restarted it. Kept cheap and
+    short-timeout so a slow query cannot make the healthcheck itself the
+    outage.
+    """
+    from sqlalchemy import text
+
+    from .db import get_engine
+
+    payload = {"status": "ok", "service": settings.app_name, "version": "1.0.0"}
+    try:
+        async with asyncio.timeout(2):
+            async with get_engine().connect() as conn:
+                await conn.execute(text("SELECT 1"))
+    except Exception as exc:
+        log.warning("health check failed: %s", exc)
+        payload["status"] = "degraded"
+        return JSONResponse(payload, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    return JSONResponse(payload)
 
 
 @app.get("/api/health/detailed", tags=["meta"])
