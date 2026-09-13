@@ -247,9 +247,14 @@ from vulnerabilities where cve_id = 'CVE-2024-12345';
 ### A package shows no CVEs but should
 
 - It has never been scanned — **Vulnerabilities → Scan new versions**.
-- The advisory has no CVE alias. GHSA-only and MAL-only records are ignored by
-  design (`OSV_CVE_ONLY`).
+- The advisory has no CVE alias and `OSV_CVE_ONLY` is on. It defaults to off.
+  Malicious-package records (`MAL-*`) are kept either way and scored critical,
+  so this never hides malware.
 - OSV genuinely has nothing for that version.
+
+A version that was scanned and found clean and one that could not be scanned
+are different states, and the admin UI shows which. Only the second is
+affected by **Block versions that could not be scanned**.
 
 ### Package count jumped into the hundreds of thousands
 

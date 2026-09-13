@@ -208,16 +208,27 @@ minireg audit --fail-on high
 
 | Exit | Meaning |
 |---|---|
-| `0` | Nothing at or above the threshold |
+| `0` | Nothing at or above the threshold, and everything was checked |
 | `1` | The audit could not run (not logged in, registry unreachable) |
 | `2` | A finding at or above the threshold, or a blocked dependency |
+| `3` | Something could not be checked at all |
 
 `--fail-on` accepts `low`, `medium`, `high`, `critical`, or `never` (the
 default). Blocked dependencies always trip a non-zero exit when any threshold
 is set, because they will not install.
 
-Distinguish `1` from `2` in CI — `1` is a broken pipeline, `2` is a real
-finding.
+**Exit 3 is the one worth understanding.** "We could not check" is not "we
+checked and it is fine", and several ordinary situations produce zero findings:
+OSV being unreachable, `--offline`, a package the registry has never seen, or a
+dependency list past the server's on-demand scan cap. Exiting 0 on those turns
+a CI gate into decoration, so unchecked dependencies fail by default whenever
+`--fail-on` is given. Pass `--no-fail-on-unscanned` to accept them.
+
+`--json` does not disable any of this. It prints the findings, the unscanned
+count and the blocked flag, and then exits with the same code.
+
+Distinguish the codes in CI — `1` is a broken pipeline, `2` is a real finding,
+`3` means your gate did not actually cover everything.
 
 ### Fixing what it finds
 

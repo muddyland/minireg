@@ -10,9 +10,13 @@ mirror** — see [Spec compliance](#spec-compliance) for why publishing is not
 part of it.
 
 ```bash
-cp .env.example .env     # set SECRET_KEY and PUBLIC_URL
+cp .env.example .env     # set SECRET_KEY and PUBLIC_URL, then chmod 600 .env
 docker compose up -d --build
+docker compose exec minireg cat /data/initial-admin-password
 ```
+
+The app will not start in production with a placeholder `SECRET_KEY`. Generate
+one with `python3 -c "import secrets; print(secrets.token_urlsafe(48))"`.
 
 Then [read the setup guide](docs/installation.md).
 
@@ -41,14 +45,21 @@ Then [read the setup guide](docs/installation.md).
   served without re-fetching.
 - **Tiers upstreams.** Any number per ecosystem, grouped into tiers. Tier 1 is
   exhausted before tier 2; within a tier the upstreams are raced and the first
-  success wins. A failing upstream is quarantined and recovers on its own.
+  success wins. A failing upstream is quarantined and recovers on its own. Only
+  an authoritative *404* lets a lower tier answer — a tier that errors fails the
+  request rather than handing its names down, and an upstream can reserve
+  namespaces (`@corp/*`) that no other upstream may answer for.
 - **Publishes.** `npm publish` and `twine upload` work against it, gated on an
   API token, and can be mirrored to a GitLab package registry. Cargo is
-  read-only.
+  read-only. A name an upstream already serves cannot be published here, the
+  first publisher owns the name, and a version that is withdrawn cannot be
+  reused with different content.
 - **Indexes GitLab.** A GitLab npm or PyPI registry can be an upstream for
   reads, a publish target, or both.
-- **Scans for CVEs** against [OSV.dev](https://osv.dev) — CVE records only. New
-  versions are scanned inline, before they are served.
+- **Scans for CVEs** against [OSV.dev](https://osv.dev). New versions are
+  scanned inline, before they are served. Malicious-package advisories
+  (`MAL-*`) are always retained and scored critical, whatever the CVE-only
+  filter is set to — npm and PyPI malware is rarely assigned a CVE.
 - **Blocks packages** by name glob, by version range, or by CVSS score range.
   Enforced on metadata, downloads, and publishes, without exception.
 - **Audits everything.** Every login and admin action is recorded; every
@@ -157,13 +168,29 @@ costs speed, not correctness. See [Architecture](docs/architecture.md).
 ```bash
 # Backend
 cd backend
-python -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest          # 641 tests
+python -m venv .venv
+.venv/bin/pip install --require-hashes -r requirements.lock   # what ships
+.venv/bin/pip install --no-deps -e .
+.venv/bin/pip install -r requirements-dev.txt                 # test + lint tools
+.venv/bin/python -m pytest          # 798 tests
 
 # Frontend
 cd frontend
 npm install && npm run dev          # proxies to :8000
 ```
+
+Two directories matter. `pytest` must run from `backend/`, because
+`asyncio_mode` lives in `backend/pyproject.toml` and losing it makes every
+async test fail with "async def functions are not natively supported". `ruff`
+is the opposite — run it from the repo root, so it covers the CLI too:
+
+```bash
+ruff check backend/app backend/tests cli
+```
+
+Install the lock rather than `-e '.[dev]'` alone: that resolves the unbounded
+ranges in `pyproject.toml` and silently tests against different versions than
+the image ships. CI installs exactly the three lines above.
 
 Spec compliance is tested against the specs' own examples where they publish
 them — node-semver's fixture tables, the FIRST.org CVSS reference vectors, the
@@ -173,17 +200,62 @@ PEP-documented formats — rather than against our own reading of them.
 
 ## Security
 
+A caching proxy that also accepts publishes is a single point through which
+every dependency on every machine behind it arrives. The properties below are
+the ones that matter for that job.
+
+**Nobody can substitute a package for someone else**
+
+- A name any configured upstream serves cannot be published here — checked
+  against the upstreams, not just against what is already cached, so a public
+  package nobody has requested yet is protected too. Admins reserve genuinely
+  private namespaces explicitly.
+- The first publisher owns a name. Publishing further versions, moving
+  dist-tags, deprecating and unpublishing all check ownership; admin overrides
+  need an admin-*scoped* credential, not merely an admin owner.
+- An unpublished version leaves a tombstone carrying its digests, so the
+  number cannot be reused with different bytes.
+- Uploads cannot attach a file to a release that came from an upstream.
+- `integrity` is recomputed from the stored bytes, never echoed back from the
+  publish document.
+
+**Upstreams are not trusted with more than their answer**
+
+- Artifact URLs come out of upstream metadata, so fetches are restricted to
+  the upstream's own host plus an allowlist, never to a private or link-local
+  address, and re-checked on every redirect hop.
+- Credentials go only to the upstream's own origin, so a 302 to object storage
+  cannot carry a GitLab token off-site.
+- A response naming a different package than the one requested is discarded.
+- Every digest an upstream advertised is verified before the artifact is served
+  or cached, and upstreams can be required to publish one at all.
+
+**Credentials do not widen**
+
+- A token can never mint a token with scopes it does not itself hold; the same
+  applies to approving a CLI login.
 - Argon2id password hashing; API tokens stored as SHA-256 of the secret half
-  and shown exactly once.
-- Upstream credentials encrypted at rest, never returned by the API.
+  and shown exactly once. Upstream credentials encrypted at rest, never
+  returned by the API.
 - An `Authorization` header is authoritative — a rejected token never falls
-  back to a session cookie, so revocation is immediate.
-- Publishing always requires a token; passwords are refused.
-- Downloads verified against every digest the upstream advertised before being
-  served or cached.
-- Login attempts limited per IP **and** per username; both outcomes audited.
+  back to a session cookie. Sessions carry a version that a password change
+  bumps, so changing it ejects every other session.
+- Login attempts limited per IP **and** per username, over Basic auth as well
+  as the login endpoint, and both outcomes audited. Those limits fall back to
+  an in-process counter rather than failing open if the cache is unreachable.
+- OIDC links to an existing local account only on a provider-verified email,
+  and the login flow is bound to the browser that started it.
 - The CLI authenticates by OAuth device flow, so no password reaches the
-  terminal and SSO works unchanged.
+  terminal and SSO works unchanged. The approval page does not accept a
+  pre-filled code, which is what makes phishing one worthwhile.
+
+**Client addresses are not caller-supplied** — forwarding headers are read only
+from a configured proxy, and counted from the right. See
+[Installation](docs/installation.md#behind-a-reverse-proxy).
+
+**Its own dependencies are pinned** — `requirements.lock` with hashes,
+installed with `--require-hashes` by both the image and CI, and CI audits the
+project against itself.
 
 ---
 
@@ -192,8 +264,17 @@ PEP-documented formats — rather than against our own reading of them.
 - **CVSS v4 is approximated** — its real model is a lookup table. v3 is used
   when a record publishes both, and a v4 vector declaring any impact never
   scores below 2.0 so an error cannot understate a vulnerability to harmless.
-- **No migration framework.** Additive columns are applied at startup;
-  destructive changes would need handling manually.
+- **No migration framework.** Additive columns are applied at startup, under an
+  advisory lock; destructive changes need handling manually.
+- **The CLI is distributed with integrity, not authenticity.** The installer
+  and self-update verify a checksum, but it is served from the same origin as
+  the script, so TLS remains the root of trust. Self-update refuses to run
+  under `--insecure` or over plaintext HTTP for that reason. Real signing needs
+  a key and somewhere to keep it.
+- **CVE scanning fails open by default.** If OSV is unreachable a version is
+  served unscanned; the alternative is refusing installs during someone else's
+  outage. Turn on **Block versions that could not be scanned** to invert that,
+  and watch the `cve.scan.timeout` counter on `/api/metrics` either way.
 - **The PyPI index lists only known projects.** Use **Upstreams → Index** to
   populate search from an upstream.
 - **`yanked` is PyPI-only** — npm has no equivalent concept.

@@ -300,8 +300,17 @@ before_script:
 
 audit:
   script:
+    # Fails on a high-or-worse finding, on a dependency the registry blocks,
+    # and on anything that could not be checked at all. See
+    # [the CLI](cli.md#failing-a-build) for the exit codes.
     - minireg audit --fail-on high
 ```
+
+A CI runner shares the anonymous rate limit with every other machine behind the
+same address. Give it a token — `minireg configure` above uses `MINIREG_TOKEN`
+— so it draws on the higher per-user limit instead. Scope that token to `read`:
+a token cannot grant itself scopes it does not hold, so a `read` token stays
+harmless if the job log leaks it.
 
 ### Docker builds
 

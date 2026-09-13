@@ -1,0 +1,18 @@
+# Test and lint tooling, kept separate from requirements.lock so the runtime
+# dependency set installs pinned and hashed while the tools stay flexible.
+#
+#   pip install --require-hashes -r requirements.lock
+#   pip install --no-deps -e .
+#   pip install -r requirements-dev.txt
+#
+# Installing `-e .[dev]` on its own instead would resolve the unbounded ranges
+# in pyproject.toml and quietly test against different versions than the image
+# ships -- which is how CI ended up running redis 8 against an image pinned
+# below 6.
+pytest>=8.3.3
+pytest-asyncio>=0.24.0
+pytest-cov>=5.0.0
+aiosqlite>=0.20.0
+respx>=0.21.1
+ruff>=0.6
+pip-tools>=7.4

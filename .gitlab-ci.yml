@@ -43,7 +43,9 @@ test:backend:
     # bounds -- so CI was testing against different versions than the image
     # shipped, and the drift was invisible until something broke in prod.
     - pip install --quiet --require-hashes -r backend/requirements.lock
-    - cd backend && pip install --quiet --no-deps -e "." && pip install --quiet pytest pytest-asyncio pytest-cov aiosqlite respx
+    - cd backend
+    - pip install --quiet --no-deps -e "."
+    - pip install --quiet -r requirements-dev.txt
   script:
     # Import smoke test first — fails in seconds on broken wiring, rather than
     # after the whole suite has collected.

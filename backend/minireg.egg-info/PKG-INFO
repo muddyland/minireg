@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: minireg
 Version: 1.0.0
-Summary: Caching npm + PyPI package registry with tiered upstreams, OIDC, and CVE policy
+Summary: Caching npm + PyPI + cargo package registry with tiered upstreams, OIDC, and CVE policy
 Requires-Python: >=3.12
 Requires-Dist: fastapi>=0.115.0
 Requires-Dist: uvicorn[standard]>=0.32.0
@@ -27,3 +27,4 @@ Requires-Dist: pytest-asyncio>=0.24.0; extra == "dev"
 Requires-Dist: pytest-cov>=5.0.0; extra == "dev"
 Requires-Dist: aiosqlite>=0.20.0; extra == "dev"
 Requires-Dist: respx>=0.21.1; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"
