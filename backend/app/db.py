@@ -101,7 +101,9 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "web_url_template", "VARCHAR(512)"),
     ("device_authorizations", "requested_scopes", "JSONB"),
     ("package_versions", "has_fix", "BOOLEAN NOT NULL DEFAULT FALSE"),
-    ("packages", "owner_user_id", "BIGINT"),
+    # INTEGER, not BIGINT: users.id is Integer, and a fresh database built by
+    # create_all must end up with the same type as a migrated one.
+    ("packages", "owner_user_id", "INTEGER"),
     ("upstreams", "name_patterns", "JSONB"),
     ("upstreams", "require_digest", "BOOLEAN NOT NULL DEFAULT TRUE"),
     ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
@@ -138,6 +140,10 @@ async def create_schema() -> None:
 
             # Trigram index powers substring package search without a full scan.
             for stmt in (
+                # Matches the index create_all builds from `index=True` on
+                # Package.owner_user_id, so a migrated schema equals a fresh one.
+                "CREATE INDEX IF NOT EXISTS ix_packages_owner_user_id "
+                "ON packages (owner_user_id)",
                 "CREATE INDEX IF NOT EXISTS ix_package_name_trgm "
                 "ON packages USING gin (normalized_name gin_trgm_ops)",
                 "CREATE INDEX IF NOT EXISTS ix_package_desc_trgm "
