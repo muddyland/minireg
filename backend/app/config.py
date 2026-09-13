@@ -158,6 +158,13 @@ class Settings(BaseSettings):
     # taken this many hops from the right of X-Forwarded-For; everything to the
     # left of that was written by something we do not control.
     trusted_proxy_hops: int = 1
+    # Peers whose X-Forwarded-For we will read at all. A request arriving from
+    # anywhere else is treated as coming straight from the client, header or
+    # no header -- otherwise anyone who can reach the port directly picks
+    # their own address. Defaults to the private ranges, because the shipped
+    # topology puts the container behind a proxy on the same host and binds it
+    # to loopback.
+    trusted_proxy_ips: str = "127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 
     # --- Housekeeping -------------------------------------------------------
     download_log_retention_days: int = 365
@@ -192,6 +199,21 @@ class Settings(BaseSettings):
                 "Generate one with: python -c 'import secrets; print(secrets.token_urlsafe(48))'"
             )
         return self
+
+    @property
+    def trusted_proxy_networks(self) -> tuple:
+        import ipaddress
+
+        networks = []
+        for item in self.trusted_proxy_ips.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                networks.append(ipaddress.ip_network(item, strict=False))
+            except ValueError:
+                continue
+        return tuple(networks)
 
     @property
     def artifact_host_allowlist(self) -> frozenset[str]:

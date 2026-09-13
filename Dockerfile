@@ -86,17 +86,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 
 # One worker per container. The download-log batcher and the housekeeping loop
 # are per-process, so scale out with replicas rather than --workers.
-# --forwarded-allow-ips is the *proxy's* address, not "*". With "*" anything
-# that can reach the port directly can forge the client address, and the app
-# keys rate limits and audit records on it. The compose file passes the bridge
-# gateway; override TRUSTED_PROXY_IPS if you front this differently.
+# uvicorn's --forwarded-allow-ips only governs `request.client`; it does not
+# understand CIDRs and it is not what the application reads. The address used
+# for rate limits and audit records is resolved in core.deps.client_ip, which
+# checks the peer against TRUSTED_PROXY_IPS before believing any forwarding
+# header. Keep both narrow.
 #
 # --timeout-graceful-shutdown lets in-flight artifact streams finish; the
 # compose stop_grace_period is set slightly higher so the runtime does not
 # SIGKILL through it.
-CMD ["sh", "-c", "exec uvicorn app.main:app \
-     --host 0.0.0.0 --port 8000 \
-     --proxy-headers \
-     --forwarded-allow-ips "${TRUSTED_PROXY_IPS:-127.0.0.1}" \
-     --timeout-graceful-shutdown 50 \
-     --no-access-log"]
+# Kept on one line: a JSON-array CMD cannot span lines with backslashes, and
+# splitting it produced an argv of literal "[sh," tokens.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips \"${UVICORN_FORWARDED_ALLOW_IPS:-127.0.0.1}\" --timeout-graceful-shutdown 50 --no-access-log"]

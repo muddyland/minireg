@@ -12,9 +12,11 @@ Client credential shapes we must accept, because the tooling is not negotiable:
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
@@ -105,6 +107,15 @@ def client_ip(request: Request) -> str | None:
     in front, the last entry that no untrusted party could have written is the
     Nth from the right. With the default single proxy that is the last entry.
     """
+    peer = request.client.host if request.client else None
+
+    # Forwarding headers are only meaningful from a proxy we put there. From
+    # anyone else they are just a field the caller filled in, so a direct
+    # connection to the port could otherwise choose its own rate-limit bucket
+    # and its own audit-log address.
+    if not _is_trusted_proxy(peer):
+        return peer[:64] if peer else None
+
     hops = max(1, settings.trusted_proxy_hops)
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
@@ -115,7 +126,18 @@ def client_ip(request: Request) -> str | None:
     real = request.headers.get("x-real-ip")
     if real:
         return real.strip()[:64]
-    return request.client.host if request.client else None
+    return peer[:64] if peer else None
+
+
+@lru_cache(maxsize=4096)
+def _is_trusted_proxy(peer: str | None) -> bool:
+    if not peer:
+        return False
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return any(address in network for network in settings.trusted_proxy_networks)
 
 
 async def _token_identity(session: AsyncSession, presented: str) -> Identity | None:

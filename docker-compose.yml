@@ -88,9 +88,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    # Everything except the two the entrypoint needs to drop from root to the
+    # valkey user. Removing those as well leaves it looping on
+    # "setpriv: setresuid failed" and never becoming healthy.
     cap_drop: [ALL]
-    security_opt:
-      - no-new-privileges:true
+    cap_add: [SETUID, SETGID, DAC_OVERRIDE]
     logging:
       driver: json-file
       options:
@@ -188,8 +190,11 @@ services:
       # this many hops from the right of X-Forwarded-For; anything further left
       # was written by the caller.
       TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}
-      # Address uvicorn will accept proxy headers from.
-      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-172.16.0.0/12}
+      # Peers whose forwarding headers are believed. The container is reached
+      # through the host's proxy over the docker bridge, so this is the
+      # private ranges by default. Anything else is treated as a direct
+      # client and cannot choose its own address.
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
     volumes:
       - package-storage:/data
     ports:

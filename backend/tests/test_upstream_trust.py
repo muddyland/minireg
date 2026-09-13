@@ -110,3 +110,52 @@ class TestNamespaceClaims:
         internal = _upstream("internal", "https://npm.internal.test", ["@CORP/*"])
         chosen = claimants_for([internal], "@corp/thing", Ecosystem.npm)
         assert [u.name for u in chosen] == ["internal"]
+
+
+class TestClientAddress:
+    """Rate limits, the login throttle and every audit record key on this, so
+    it must not be something the caller can choose."""
+
+    @staticmethod
+    def _request(peer, headers=None):
+        from starlette.datastructures import Headers
+
+        class _Client:
+            host = peer
+
+        class _Request:
+            client = _Client() if peer else None
+
+            def __init__(self):
+                self.headers = Headers(headers or {})
+
+        return _Request()
+
+    def test_a_direct_caller_cannot_choose_its_address(self):
+        from app.core.deps import client_ip
+
+        # Peer outside the trusted-proxy ranges: the header is just a field
+        # they filled in.
+        request = self._request("203.0.113.9", {"x-forwarded-for": "1.2.3.4"})
+        assert client_ip(request) == "203.0.113.9"
+
+    def test_a_trusted_proxy_is_believed(self):
+        from app.core.deps import client_ip
+
+        request = self._request("172.20.0.1", {"x-forwarded-for": "198.51.100.7"})
+        assert client_ip(request) == "198.51.100.7"
+
+    def test_a_forged_prefix_is_ignored(self):
+        """nginx appends, so a client that sends its own X-Forwarded-For ends
+        up on the left. The rightmost entry is the one nginx wrote."""
+        from app.core.deps import client_ip
+
+        request = self._request(
+            "172.20.0.1", {"x-forwarded-for": "1.2.3.4, 198.51.100.7"}
+        )
+        assert client_ip(request) == "198.51.100.7"
+
+    def test_no_header_falls_back_to_the_peer(self):
+        from app.core.deps import client_ip
+
+        assert client_ip(self._request("172.20.0.1")) == "172.20.0.1"
