@@ -5,14 +5,14 @@
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Liveness. Used by the container healthcheck |
-| `GET /api/health/detailed` | Database, Redis, and storage status |
+| `GET /api/health/detailed` | Database, Valkey, and storage status |
 
 ```bash
 curl -fsS https://registry.example.com/api/health/detailed | jq
 ```
 
 `degraded` means the database or storage is unreachable — the registry cannot
-serve. Redis being down reports `ok` overall, because it is an accelerator: the
+serve. Valkey being down reports `ok` overall, because it is an accelerator: the
 registry gets slower, not broken.
 
 The **Dashboard** shows the same information plus upstream health.
@@ -86,9 +86,9 @@ Worth alerting on:
 |---|---|---|
 | Upstream health | Dashboard, `/api/admin/upstreams` | Any enabled upstream unhealthy |
 | Disk free | `/api/health/detailed` → `storage.disk_free` | Below 15% |
-| Cache hit rate | Dashboard | Sustained drop — usually a `META_CACHE_TTL` or Redis problem |
+| Cache hit rate | Dashboard | Sustained drop — usually a `META_CACHE_TTL` or Valkey problem |
 | Failed logins | Audit log, `auth.login.failed` | Spike |
-| Redis | `/api/health/detailed` | Down (degrades performance) |
+| Valkey | `/api/health/detailed` | Down (degrades performance) |
 
 ```bash
 # Unhealthy upstreams
@@ -176,10 +176,10 @@ minireg:
     replicas: 3
 ```
 
-All replicas share the database, Redis, and the storage volume — which must be
+All replicas share the database, Valkey, and the storage volume — which must be
 a shared filesystem (NFS, EFS) for multi-host deployments.
 
-Redis matters more as you scale: it holds the distributed lock that collapses
+Valkey matters more as you scale: it holds the distributed lock that collapses
 concurrent cold-cache fetches into one upstream request. Without it, N replicas
 make N upstream requests for the same cold package.
 

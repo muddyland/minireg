@@ -11,7 +11,7 @@
                      └───┬──────────────┬───────────┘
                          │              │
               ┌──────────▼───┐   ┌──────▼──────────┐
-              │ PostgreSQL   │   │ Redis           │
+              │ PostgreSQL   │   │ Valkey          │
               │ metadata     │   │ hot metadata    │
               │ policy, CVEs │   │ locks, limits   │
               │ audit, stats │   │ (optional)      │
@@ -25,7 +25,7 @@
 ```
 
 One container serves the registry APIs, the admin API, and the built SPA.
-Postgres holds everything except artifact bytes; Redis is an accelerator;
+Postgres holds everything except artifact bytes; Valkey is an accelerator;
 artifacts live on disk keyed by content hash.
 
 ---
@@ -39,10 +39,10 @@ and cheap append-only writes for the download log. Postgres does all four well.
 The append-only tables use BRIN indexes on their timestamps — roughly a
 thousandth the size of a b-tree for a monotonic column.
 
-**Redis.** Caches rendered documents with a short TTL, which absorbs a CI fleet
+**Valkey.** Caches rendered documents with a short TTL, which absorbs a CI fleet
 asking for the same hundred packages at once. It also provides the distributed
 lock that collapses concurrent cold-cache fetches into one upstream request,
-and the rate limiter. Everything degrades to a no-op when Redis is unavailable:
+and the rate limiter. Everything degrades to a no-op when Valkey is unavailable:
 the registry gets slower, not broken.
 
 **Local disk, content-addressed.** Artifacts are immutable, so the SHA-256 of
@@ -58,7 +58,7 @@ one copy.
 ```
 request
   → policy: is the name blocked?           (before any network access)
-  → Redis: rendered document?              short TTL
+  → Valkey: rendered document?              short TTL
   → Postgres: local rows, fresh?           local publishes never go stale
   → upstream resolver                      tiered, raced
   → persist
@@ -223,7 +223,7 @@ backend/app/
     semver.py     node-semver versions and ranges
     security.py   hashing, tokens, JWTs, credential encryption
     deps.py       identity resolution, RBAC, rate limiting
-    cache.py      Redis, herd guard, rate limiter
+    cache.py      Valkey, herd guard, rate limiter
   services/
     resolver.py   tiered upstream routing
     packages.py   persistence and the shared read path

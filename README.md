@@ -143,11 +143,11 @@ provider reads `index.crates.io` and the artifact it resolves hashes to the
 
 ## Stack
 
-FastAPI · PostgreSQL 16 · Redis · Vue 3 · Docker Compose
+FastAPI · PostgreSQL 16 · Valkey · Vue 3 · Docker Compose
 
 Postgres because the read path needs one indexed lookup per packument, JSONB
 for verbatim upstream documents, trigram indexes for search, and cheap
-append-only writes for telemetry. Redis is strictly an accelerator — losing it
+append-only writes for telemetry. Valkey is strictly an accelerator — losing it
 costs speed, not correctness. See [Architecture](docs/architecture.md).
 
 ---

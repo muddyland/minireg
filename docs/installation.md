@@ -9,7 +9,7 @@
 | Disk | 10 GB | Grows with cached artifacts; see [Operations](operations.md#storage) |
 | CPU | 2 cores | The registry is I/O bound, not CPU bound |
 
-Nothing else is needed on the host. Postgres, Redis, and the application are
+Nothing else is needed on the host. Postgres, Valkey, and the application are
 all containers, and the application image is built locally from the included
 `Dockerfile` — nothing is pulled from an image registry.
 
@@ -186,6 +186,6 @@ docker compose down          # stop, keep data
 docker compose down -v       # stop and delete all data
 ```
 
-`-v` removes the Postgres database, the Redis cache, and every cached artifact.
+`-v` removes the Postgres database, the Valkey cache, and every cached artifact.
 Packages published directly to this registry cannot be recovered from an
 upstream — back up the `package-storage` volume first if you have any.

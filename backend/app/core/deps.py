@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..core.cache import rate_limit
+from ..core.cache import rate_limit, rate_limit_retry_after
 from ..core.security import (
     decode_session_token,
     extract_bearer,
@@ -266,7 +266,11 @@ async def enforce_rate_limit(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="rate limit exceeded",
-            headers={"Retry-After": "60", "X-RateLimit-Remaining": str(remaining)},
+            headers={
+                "Retry-After": str(rate_limit_retry_after()),
+                "X-RateLimit-Limit": str(ceiling),
+                "X-RateLimit-Remaining": str(remaining),
+            },
         )
 
 

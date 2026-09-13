@@ -41,7 +41,7 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 | `DB_POOL_SIZE` | `20` | Per process. With N replicas, Postgres needs `N × (pool + overflow)` connections. |
 | `DB_MAX_OVERFLOW` | `20` | Burst above the pool. |
 | `DB_ECHO` | `false` | Logs every SQL statement. Debugging only. |
-| `REDIS_URL` | `redis://redis:6379/0` | Optional. Without it the registry still works, just slower. |
+| `REDIS_URL` | `redis://redis:6379/0` | Optional. Valkey or Redis, same protocol. Without it the registry still works, just slower. |
 | `META_CACHE_TTL` | `60` | Seconds a rendered packument / index page stays fresh. |
 | `META_NEGATIVE_CACHE_TTL` | `30` | How long a "not found" is remembered. |
 | `SEARCH_CACHE_TTL` | `120` | Search result caching. |
@@ -91,7 +91,7 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 
 ### Rate limits
 
-Per minute. Requires Redis; without it, limiting is disabled.
+Per minute. Requires Valkey; without it, limiting is disabled.
 
 | Variable | Default |
 |---|---|
@@ -101,8 +101,15 @@ Per minute. Requires Redis; without it, limiting is disabled.
 | `RATE_LIMIT_PUBLISH_PER_MINUTE` | `60` |
 | `RATE_LIMIT_LOGIN_PER_MINUTE` | `10` |
 
-A CI fleet behind one NAT address shares the anonymous limit. Either raise it,
-or give CI a token so it uses the authenticated limit.
+Counts reset on a fixed one-minute boundary; a rejected request gets a `429`
+whose `Retry-After` says how many seconds are left in the window, and
+`X-RateLimit-Limit` / `X-RateLimit-Remaining` say which budget it hit.
+
+Anonymous requests are counted per client IP, authenticated ones per user. A
+CI fleet behind one NAT address therefore shares the anonymous limit. Either
+raise it in `.env`, or give CI a token so it draws on the authenticated limit.
+A typical `npm ci` fetches one tarball per locked package, so size the limit
+to the largest lockfile times the number of jobs that can start together.
 
 ### Retention
 

@@ -197,7 +197,7 @@ including scheme and any port.
 
 ### Everything is slow
 
-Check Redis. `/api/health/detailed` reports it. Without Redis there is no
+Check Valkey. `/api/health/detailed` reports it. Without Valkey there is no
 metadata cache and no request coalescing, so every request hits Postgres and
 concurrent cold requests each hit the upstream.
 
@@ -212,7 +212,7 @@ To reduce it: lower `OSV_INLINE_TIMEOUT_SECONDS`, or turn off
 ### Cache hit rate dropped
 
 - `META_CACHE_TTL` was lowered.
-- Redis is evicting under memory pressure — raise `REDIS_MAXMEMORY`.
+- Valkey is evicting under memory pressure — raise `REDIS_MAXMEMORY`.
 - Traffic genuinely shifted to packages that were not cached.
 
 ### The database is growing

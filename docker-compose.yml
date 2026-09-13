@@ -57,13 +57,16 @@ services:
       - jit=off
     networks: [minireg]
 
+  # Valkey, the BSD-licensed Redis fork. Wire-compatible: the app still talks
+  # to it through redis-py at REDIS_URL, and the service name, volume and
+  # REDIS_* variables keep their names so an existing .env carries over.
   redis:
-    image: redis:7-alpine
+    image: valkey/valkey:8-alpine
     restart: unless-stopped
     # Headroom over maxmemory for fragmentation and client buffers.
     mem_limit: ${REDIS_MEM_LIMIT:-768m}
     command:
-      - redis-server
+      - valkey-server
       - --maxmemory
       - ${REDIS_MAXMEMORY:-512mb}
       # The cache is disposable: evict rather than error when it fills.
@@ -76,7 +79,7 @@ services:
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -135,6 +138,16 @@ services:
       META_CACHE_TTL: ${META_CACHE_TTL:-60}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
       UPSTREAM_TIER_PARALLEL: ${UPSTREAM_TIER_PARALLEL:-true}
+
+      # -- rate limits (per minute; see docs/configuration.md) ---------------
+      # Anonymous traffic is limited per client IP, so a CI fleet behind one
+      # NAT address shares RATE_LIMIT_ANONYMOUS_PER_MINUTE. Authenticated
+      # traffic is limited per user.
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_ANONYMOUS_PER_MINUTE: ${RATE_LIMIT_ANONYMOUS_PER_MINUTE:-600}
+      RATE_LIMIT_AUTHENTICATED_PER_MINUTE: ${RATE_LIMIT_AUTHENTICATED_PER_MINUTE:-3000}
+      RATE_LIMIT_PUBLISH_PER_MINUTE: ${RATE_LIMIT_PUBLISH_PER_MINUTE:-60}
+      RATE_LIMIT_LOGIN_PER_MINUTE: ${RATE_LIMIT_LOGIN_PER_MINUTE:-10}
 
       # -- OSV / CVE ----------------------------------------------------------
       OSV_ENABLED: ${OSV_ENABLED:-true}

@@ -1,6 +1,6 @@
-"""Redis-backed cache, distributed lock, and rate limiter.
+"""Valkey/Redis-backed cache, distributed lock, and rate limiter.
 
-Everything degrades to a no-op when Redis is unavailable so a Redis outage
+Everything degrades to a no-op when the cache server is unavailable so a Redis outage
 slows the registry down but never takes it offline.
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from typing import Any
 
 import orjson
@@ -131,15 +132,31 @@ class herd_guard:
         self._local.release()
 
 
+def rate_limit_retry_after(window: int = 60) -> int:
+    """Seconds until the current fixed window rolls over (at least 1)."""
+    return max(1, window - int(time.time()) % window)
+
+
 async def rate_limit(key: str, limit: int, window: int = 60) -> tuple[bool, int]:
-    """Fixed-window counter. Returns (allowed, remaining)."""
+    """Fixed-window counter. Returns (allowed, remaining).
+
+    The window number is part of the key, so the count genuinely resets every
+    ``window`` seconds no matter how steady the traffic is. Refreshing the TTL
+    on every hit is then harmless -- it only ever touches the current window's
+    key -- and it keeps the key alive even if a crash lands between INCR and
+    EXPIRE on the first hit. (An earlier version keyed on ``key`` alone and
+    refreshed the TTL per request, which made the "window" end only after 60 s
+    of *silence*: a busy CI runner that tripped the limit once stayed locked
+    out for as long as it kept retrying.)
+    """
     if _redis is None or not settings.rate_limit_enabled or limit <= 0:
         return True, limit
     try:
-        rkey = f"rl:{key}:{window}"
+        bucket = int(time.time()) // window
+        rkey = f"rl:{key}:{window}:{bucket}"
         pipe = _redis.pipeline()
         pipe.incr(rkey)
-        pipe.expire(rkey, window)
+        pipe.expire(rkey, window * 2)
         count, _ = await pipe.execute()
         return int(count) <= limit, max(0, limit - int(count))
     except Exception:
