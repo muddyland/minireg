@@ -50,7 +50,7 @@ from ..core.deps import (
 from ..core.naming import max_semver, npm_path_to_name, semver_key
 from ..db import get_session
 from ..models import DistTag, Ecosystem, Package, PackageFile, PackageVersion
-from ..services import artifacts, audit, npm_publish, npm_render, packages
+from ..services import artifacts, audit, npm_publish, npm_render, ownership, packages
 from ..services.osv import inline_scan
 from ..services.policy import PolicyEngine
 from ..services.storage import get_store
@@ -240,6 +240,16 @@ async def set_dist_tag(
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
+    try:
+        await ownership.authorize_mutation(
+            package,
+            user_id=identity.user_id,
+            is_admin=identity.is_admin and identity.has_scope("admin"),
+            action="retag",
+        )
+    except ownership.PublishDenied as denied:
+        return npm_error(denied.reason, denied.status_code)
+
     exists = (
         await session.execute(
             select(PackageVersion).where(
@@ -289,6 +299,16 @@ async def delete_dist_tag(
     package = await packages.get_package_row(session, ECOSYSTEM, name.lower(), load_files=False)
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
+
+    try:
+        await ownership.authorize_mutation(
+            package,
+            user_id=identity.user_id,
+            is_admin=identity.is_admin and identity.has_scope("admin"),
+            action="retag",
+        )
+    except ownership.PublishDenied as denied:
+        return npm_error(denied.reason, denied.status_code)
 
     row = next((t for t in package.dist_tags if t.tag == tag), None)
     if row is None:
@@ -340,7 +360,7 @@ async def audit_bulk(
     if isinstance(body, dict) and len(body) > MAX_AUDIT_BULK_NAMES:
         return npm_error(
             f"too many packages in one request (limit {MAX_AUDIT_BULK_NAMES})",
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status.HTTP_413_CONTENT_TOO_LARGE,
         )
     if not isinstance(body, dict):
         return json_response({})
@@ -516,18 +536,7 @@ async def publish(
     # squatted locally to bypass the policy.
     verdict = await PolicyEngine(session).is_name_blocked(ECOSYSTEM, normalized)
     if verdict.blocked:
-        await audit.record_audit(
-            session,
-            audit.PACKAGE_PUBLISH_DENIED,
-            actor_user_id=identity.user_id,
-            actor_username=identity.username,
-            target_type="package",
-            target_id=f"npm:{parsed.name}",
-            success=False,
-            ip=client_ip(request),
-            detail={"reason": verdict.reason},
-        )
-        await session.commit()
+        await _record_publish_denied(session, request, identity, parsed.name, verdict.reason)
         return npm_error(verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
 
     if parsed.intent == "deprecate":
@@ -535,17 +544,72 @@ async def publish(
     return await _handle_publish(session, request, identity, parsed)
 
 
+async def _record_publish_denied(
+    session: AsyncSession,
+    request: Request,
+    identity: Identity,
+    target: str,
+    reason: str | None,
+    extra: dict | None = None,
+    *,
+    actor: tuple[int | None, str | None] | None = None,
+) -> None:
+    """Audit a refused publish on a session with nothing else pending.
+
+    ``actor`` lets a caller that has just rolled back pass the identity it
+    captured beforehand. Reading it off ``identity`` after a rollback would
+    lazy-load an expired User inside a sync attribute access, which asyncio
+    SQLAlchemy cannot do.
+    """
+    actor_id, actor_name = actor if actor is not None else (
+        identity.user_id,
+        identity.username,
+    )
+    await audit.record_audit(
+        session,
+        audit.PACKAGE_PUBLISH_DENIED,
+        actor_user_id=actor_id,
+        actor_username=actor_name,
+        target_type="package",
+        target_id=f"npm:{target}",
+        success=False,
+        ip=client_ip(request),
+        detail={"reason": reason, **(extra or {})},
+    )
+    await session.commit()
+
+
 async def _handle_publish(
     session: AsyncSession, request: Request, identity: Identity, parsed: npm_publish.PublishRequest
 ) -> Response:
     normalized = parsed.name.lower()
-    package = await packages.get_package_row(session, ECOSYSTEM, normalized)
+
+    # Ownership first, before a single row is touched. Everything below flips
+    # `is_local`, and a package with any local version is never refreshed from
+    # upstream again -- so the check has to happen before the mutation, not
+    # after it.
+    try:
+        grant = await ownership.authorize_publish(
+            session,
+            ECOSYSTEM,
+            parsed.name,
+            user_id=identity.user_id,
+            is_admin=identity.is_admin and identity.has_scope("admin"),
+        )
+        for version in parsed.versions:
+            await ownership.assert_not_retired(session, ECOSYSTEM, normalized, version)
+    except ownership.PublishDenied as denied:
+        await _record_publish_denied(session, request, identity, parsed.name, denied.reason)
+        return npm_error(denied.reason, denied.status_code)
+
+    package = grant.package
     if package is None:
         package = Package(
             ecosystem=ECOSYSTEM,
             name=parsed.name,
             normalized_name=normalized,
             is_local=True,
+            owner_user_id=grant.owner_user_id,
         )
         # Initialise the collections so SQLAlchemy treats them as loaded.
         # Touching an unloaded relationship on a brand-new instance would
@@ -555,6 +619,8 @@ async def _handle_publish(
         session.add(package)
         await session.flush()
     package.is_local = True
+    if package.owner_user_id is None:
+        package.owner_user_id = grant.owner_user_id
     if parsed.description:
         package.description = parsed.description
 
@@ -598,18 +664,25 @@ async def _handle_publish(
             scanned=scan.scanned,
         )
         if cve_verdict.blocked:
-            await audit.record_audit(
+            # Capture the actor before the rollback expires the ORM objects
+            # the Identity is holding.
+            actor = (identity.user_id, identity.username)
+            # Roll back everything this request touched before recording the
+            # denial. Committing here used to persist the package row and its
+            # `is_local` flip: a refused publish of `express` froze the cached
+            # package at its current versions, and a refused publish of a name
+            # we had never cached created an empty local package that answered
+            # 404 for everyone, forever.
+            await session.rollback()
+            await _record_publish_denied(
                 session,
-                audit.PACKAGE_PUBLISH_DENIED,
-                actor_user_id=identity.user_id,
-                actor_username=identity.username,
-                target_type="package",
-                target_id=f"npm:{parsed.name}@{version}",
-                success=False,
-                ip=client_ip(request),
-                detail={"reason": cve_verdict.reason, "max_cvss": scan.max_score},
+                request,
+                identity,
+                f"{parsed.name}@{version}",
+                cve_verdict.reason,
+                extra={"max_cvss": scan.max_score},
+                actor=actor,
             )
-            await session.commit()
             return npm_error(cve_verdict.reason or "blocked by CVE policy", status.HTTP_403_FORBIDDEN)
 
         version_row = PackageVersion(
@@ -644,7 +717,11 @@ async def _handle_publish(
                 sha1=stored.sha1,
                 md5=stored.md5,
                 blake2b_256=stored.blake2b_256,
-                integrity=declared.get("integrity") or stored.integrity,
+                # Recomputed from the stored bytes, never copied from the
+                # publish document. A client-supplied SRI string is served to
+                # every installer, so a wrong one -- deliberate or not -- makes
+                # the version permanently uninstallable with EINTEGRITY.
+                integrity=stored.integrity,
                 upload_time=datetime.now(UTC),
                 cached_at=datetime.now(UTC),
             )
@@ -658,7 +735,12 @@ async def _handle_publish(
             await OsvScanner(session).apply_to_version(version_row, scan, parsed.name)
 
     # dist-tags from the publish document; default `latest` when absent.
-    tags = parsed.dist_tags or {}
+    # A tag naming a version that does not exist is a broken package -- npm
+    # resolves `latest` before anything else and reports "no matching version
+    # found" -- so the document's tags are filtered to versions we actually
+    # have, the same check the standalone dist-tag endpoint already made.
+    known = {v.version for v in package.versions} | set(published)
+    tags = {t: v for t, v in (parsed.dist_tags or {}).items() if v in known}
     if not tags and published:
         tags = {"latest": max_semver(published) or published[-1]}
     existing_tags = {t.tag: t for t in package.dist_tags}
@@ -703,6 +785,16 @@ async def _handle_deprecate(
     package = await packages.get_package_row(session, ECOSYSTEM, parsed.name.lower())
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
+
+    try:
+        await ownership.authorize_mutation(
+            package,
+            user_id=identity.user_id,
+            is_admin=identity.is_admin and identity.has_scope("admin"),
+            action="deprecate",
+        )
+    except ownership.PublishDenied as denied:
+        return npm_error(denied.reason, denied.status_code)
 
     changed = {}
     by_version = {v.version: v for v in package.versions}
@@ -759,43 +851,12 @@ async def _forward_to_publish_targets(
             log.exception("mirror publish to %s raised", upstream.name)
 
 
-@router.delete("/{package_name:path}/-rev/{rev}")
-async def unpublish_package(
-    package_name: str,
-    rev: str,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-    identity: Identity = Depends(rate_limited_publish),
-) -> Response:
-    name = npm_path_to_name(package_name)
-    package = await packages.get_package_row(session, ECOSYSTEM, name.lower())
-    if package is None:
-        return npm_error("package not found", status.HTTP_404_NOT_FOUND)
-    if not package.is_local and not identity.is_admin:
-        return npm_error(
-            "only locally published packages can be unpublished", status.HTTP_403_FORBIDDEN
-        )
-
-    for version_row in package.versions:
-        for file_row in version_row.files:
-            await artifacts.purge_file(session, file_row)
-    await session.delete(package)
-
-    await audit.record_audit(
-        session,
-        audit.PACKAGE_UNPUBLISHED,
-        actor_user_id=identity.user_id,
-        actor_username=identity.username,
-        target_type="package",
-        target_id=f"npm:{name}",
-        ip=client_ip(request),
-        detail={"scope": "package"},
-    )
-    await session.commit()
-    await packages.invalidate_package_cache("npm", name.lower())
-    return json_response({"ok": True})
-
-
+# The per-version route is declared first on purpose. Both patterns start with
+# a greedy `{package_name:path}`, so whichever is registered first wins: with
+# the package-level route ahead of it, `DELETE /npm/pkg/-/pkg-1.0.0.tgz/-rev/1`
+# -- the URL `npm unpublish pkg@1.0.0` actually sends -- was swallowed by the
+# package route, which then looked up a package literally named
+# "pkg/-/pkg-1.0.0.tgz" and answered "package not found".
 @router.delete("/{package_name:path}/-/{filename}/-rev/{rev}")
 async def unpublish_version(
     package_name: str,
@@ -820,11 +881,31 @@ async def unpublish_version(
         return npm_error("version not found", status.HTTP_404_NOT_FOUND)
 
     version_row, file_row = target
-    if not version_row.is_local and not identity.is_admin:
+    if not version_row.is_local and not (identity.is_admin and identity.has_scope("admin")):
         return npm_error(
             "only locally published versions can be unpublished", status.HTTP_403_FORBIDDEN
         )
+    try:
+        await ownership.authorize_mutation(
+            package,
+            user_id=identity.user_id,
+            is_admin=identity.is_admin and identity.has_scope("admin"),
+            action="unpublish",
+        )
+    except ownership.PublishDenied as denied:
+        return npm_error(denied.reason, denied.status_code)
 
+    await ownership.retire_version(
+        session,
+        ECOSYSTEM,
+        package.normalized_name,
+        version_row.version,
+        version_row.normalized_version,
+        sha256=file_row.blob_sha256,
+        integrity=file_row.integrity,
+        user=identity.user,
+        username=identity.username,
+    )
     await artifacts.purge_file(session, file_row)
     await session.delete(version_row)
 
@@ -840,6 +921,65 @@ async def unpublish_version(
     )
     await session.commit()
     await packages.invalidate_package_cache("npm", package.normalized_name)
+    return json_response({"ok": True})
+
+
+@router.delete("/{package_name:path}/-rev/{rev}")
+async def unpublish_package(
+    package_name: str,
+    rev: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    identity: Identity = Depends(rate_limited_publish),
+) -> Response:
+    name = npm_path_to_name(package_name)
+    package = await packages.get_package_row(session, ECOSYSTEM, name.lower())
+    if package is None:
+        return npm_error("package not found", status.HTTP_404_NOT_FOUND)
+
+    try:
+        await ownership.authorize_mutation(
+            package,
+            user_id=identity.user_id,
+            is_admin=identity.is_admin and identity.has_scope("admin"),
+            action="unpublish",
+        )
+    except ownership.PublishDenied as denied:
+        return npm_error(denied.reason, denied.status_code)
+
+    for version_row in package.versions:
+        # Tombstone every local version before the rows go. Without this the
+        # version numbers become free again and can be republished with
+        # different bytes.
+        if version_row.is_local:
+            primary = next((f for f in version_row.files if f.blob_sha256), None)
+            await ownership.retire_version(
+                session,
+                ECOSYSTEM,
+                package.normalized_name,
+                version_row.version,
+                version_row.normalized_version,
+                sha256=primary.blob_sha256 if primary else None,
+                integrity=primary.integrity if primary else None,
+                user=identity.user,
+                username=identity.username,
+            )
+        for file_row in version_row.files:
+            await artifacts.purge_file(session, file_row)
+    await session.delete(package)
+
+    await audit.record_audit(
+        session,
+        audit.PACKAGE_UNPUBLISHED,
+        actor_user_id=identity.user_id,
+        actor_username=identity.username,
+        target_type="package",
+        target_id=f"npm:{name}",
+        ip=client_ip(request),
+        detail={"scope": "package"},
+    )
+    await session.commit()
+    await packages.invalidate_package_cache("npm", name.lower())
     return json_response({"ok": True})
 
 

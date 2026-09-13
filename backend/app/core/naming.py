@@ -110,6 +110,14 @@ def parse_dist_filename(filename: str) -> tuple[str, str, str] | None:
                 name, _, version = stem.rpartition("-")
                 if not name:
                     return None
+                # `packaging` only accepts .tar.gz/.zip, so this branch exists
+                # for .tar.bz2 and .tgz -- but the version still has to be a
+                # real one. Without the check, `foo-latest.tar.gz` uploaded
+                # cleanly and then sorted ahead of every real release.
+                try:
+                    Version(version)
+                except InvalidVersion:
+                    return None
                 return name, version, "sdist"
     if filename.endswith(".egg"):
         stem = filename[: -len(".egg")]
@@ -164,6 +172,12 @@ def is_valid_npm_name(name: str) -> tuple[bool, str | None]:
             if not part or part.startswith(".") or part.startswith("_"):
                 return False, "name cannot start with a period or an underscore"
             if _NPM_ILLEGAL_RE.search(part):
+                return False, "name can only contain URL-friendly characters"
+            # The same URL-safety check unscoped names get. Skipping it here
+            # let a scoped name through with Cyrillic look-alike letters,
+            # which sit beside the real package in search and in `npm view`
+            # output and are indistinguishable to a reader.
+            if quote(part, safe="") != part:
                 return False, "name can only contain URL-friendly characters"
         return True, None
 

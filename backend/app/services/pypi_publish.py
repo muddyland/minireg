@@ -22,6 +22,7 @@ from email.parser import Parser
 from io import BytesIO
 from typing import Any
 
+from ..config import settings
 from ..core.naming import (
     is_valid_pypi_name,
     normalize_pypi_name,
@@ -36,7 +37,8 @@ VALID_FILETYPES = {"sdist", "bdist_wheel", "bdist_egg", "bdist_wininst", "bdist_
 # Warehouse's allowed distribution extensions.
 ALLOWED_EXTENSIONS = (".tar.gz", ".zip", ".whl", ".egg")
 
-MAX_FILE_BYTES = 1024 * 1024 * 1024
+# Mirrors the transport-level cap in main.limit_body_size.
+MAX_FILE_BYTES = settings.max_publish_bytes
 
 # Fields that may appear more than once in the form.
 MULTIVALUED = {

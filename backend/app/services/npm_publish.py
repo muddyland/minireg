@@ -17,12 +17,15 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from ..config import settings
 from ..core.naming import is_valid_npm_name, is_valid_semver, npm_tarball_filename
 
 log = logging.getLogger(__name__)
 
 # npm's own cap; anything larger is almost certainly a mistake.
-MAX_ATTACHMENT_BYTES = 1024 * 1024 * 1024
+# Mirrors the transport-level cap in main.limit_body_size. Kept as a second
+# line of defence for a chunked request, which carries no Content-Length.
+MAX_ATTACHMENT_BYTES = settings.max_publish_bytes
 
 
 class PublishError(Exception):

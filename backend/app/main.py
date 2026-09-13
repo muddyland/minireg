@@ -306,6 +306,46 @@ if settings.environment == "dev":
     )
 
 
+#: Paths that accept a package upload. Everything else gets a much smaller
+#: ceiling, because nothing else has a legitimate reason to be large.
+_UPLOAD_METHODS = {"PUT", "POST"}
+_SMALL_BODY_LIMIT = 2 * 1024 * 1024
+
+
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    """Reject oversized bodies on Content-Length, before anything reads them.
+
+    An npm publish arrives as one JSON document with the tarball base64'd
+    inside it, so the handler holds the raw bytes, the parsed string and the
+    decoded tarball at once -- roughly four times the artifact. The size check
+    used to happen after all of that, against a 1 GiB ceiling, which made a
+    single authenticated publisher able to push the container past its memory
+    limit and take every in-flight download down with it.
+
+    A chunked request has no Content-Length; those are bounded by the reverse
+    proxy's own limit, which the shipped nginx config sets.
+    """
+    if request.method in _UPLOAD_METHODS:
+        raw_length = request.headers.get("content-length")
+        if raw_length and raw_length.isdigit():
+            length = int(raw_length)
+            path = request.url.path
+            is_upload = path.startswith(("/npm/", "/pypi/"))
+            limit = settings.max_publish_bytes if is_upload else _SMALL_BODY_LIMIT
+            if length > limit:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"request body is {length} bytes, over the "
+                            f"{limit} byte limit"
+                        )
+                    },
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                )
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)

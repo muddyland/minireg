@@ -35,7 +35,7 @@ from ..core.deps import Identity, client_ip, rate_limited_publish, rate_limited_
 from ..core.naming import normalize_pypi_name
 from ..db import get_session
 from ..models import Blob, Ecosystem, Package, PackageFile, PackageVersion
-from ..services import artifacts, audit, packages, pypi_publish, pypi_render
+from ..services import artifacts, audit, ownership, packages, pypi_publish, pypi_render
 from ..services.osv import OsvScanner, inline_scan
 from ..services.policy import PolicyEngine
 from ..services.storage import get_store
@@ -366,6 +366,41 @@ async def project_json(
 # --------------------------------------------------------------------------- #
 # Upload
 # --------------------------------------------------------------------------- #
+async def _record_publish_denied(
+    session: AsyncSession,
+    request: Request,
+    identity: Identity,
+    target: str,
+    reason: str | None,
+    extra: dict | None = None,
+    *,
+    actor: tuple[int | None, str | None] | None = None,
+) -> None:
+    """Audit a refused publish on a session with nothing else pending.
+
+    ``actor`` lets a caller that has just rolled back pass the identity it
+    captured beforehand. Reading it off ``identity`` after a rollback would
+    lazy-load an expired User inside a sync attribute access, which asyncio
+    SQLAlchemy cannot do.
+    """
+    actor_id, actor_name = actor if actor is not None else (
+        identity.user_id,
+        identity.username,
+    )
+    await audit.record_audit(
+        session,
+        audit.PACKAGE_PUBLISH_DENIED,
+        actor_user_id=actor_id,
+        actor_username=actor_name,
+        target_type="package",
+        target_id=f"pypi:{target}",
+        success=False,
+        ip=client_ip(request),
+        detail={"reason": reason, **(extra or {})},
+    )
+    await session.commit()
+
+
 @router.post("/legacy/")
 @router.post("/legacy")
 @router.post("/")
@@ -404,27 +439,34 @@ async def upload(
 
     verdict = await PolicyEngine(session).is_name_blocked(ECOSYSTEM, normalized)
     if verdict.blocked:
-        await audit.record_audit(
-            session,
-            audit.PACKAGE_PUBLISH_DENIED,
-            actor_user_id=identity.user_id,
-            actor_username=identity.username,
-            target_type="package",
-            target_id=f"pypi:{parsed.name}",
-            success=False,
-            ip=client_ip(request),
-            detail={"reason": verdict.reason},
-        )
-        await session.commit()
+        await _record_publish_denied(session, request, identity, parsed.name, verdict.reason)
         return upload_error(verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
 
-    package = await packages.get_package_row(session, ECOSYSTEM, normalized)
+    # Ownership before any mutation: the block below flips `is_local`, after
+    # which the package is authoritative and never refreshed from upstream.
+    try:
+        grant = await ownership.authorize_publish(
+            session,
+            ECOSYSTEM,
+            parsed.name,
+            user_id=identity.user_id,
+            is_admin=identity.is_admin and identity.has_scope("admin"),
+        )
+        await ownership.assert_not_retired(
+            session, ECOSYSTEM, normalized, parsed.normalized_version
+        )
+    except ownership.PublishDenied as denied:
+        await _record_publish_denied(session, request, identity, parsed.name, denied.reason)
+        return upload_error(denied.reason, denied.status_code)
+
+    package = grant.package
     if package is None:
         package = Package(
             ecosystem=ECOSYSTEM,
             name=parsed.name,
             normalized_name=normalized,
             is_local=True,
+            owner_user_id=grant.owner_user_id,
         )
         # Initialise the collections so SQLAlchemy treats them as loaded.
         # Touching an unloaded relationship on a brand-new instance would
@@ -434,6 +476,8 @@ async def upload(
         session.add(package)
         await session.flush()
     package.is_local = True
+    if package.owner_user_id is None:
+        package.owner_user_id = grant.owner_user_id
 
     normalized_version = parsed.normalized_version
     version_row = next(
@@ -442,6 +486,19 @@ async def upload(
 
     # PyPI never overwrites: a duplicate filename is an error.
     if version_row is not None:
+        # An existing release that came from upstream is not somewhere to add
+        # files. Only the filename was checked before, so a wheel with a
+        # different platform tag attached itself to the genuine release -- and
+        # pip prefers the more specific tag, so an exact pin installed it.
+        if not version_row.is_local:
+            reason = (
+                f"{parsed.name} {parsed.version} is mirrored from an upstream "
+                "registry; files cannot be added to it here."
+            )
+            await _record_publish_denied(
+                session, request, identity, f"{parsed.name}=={parsed.version}", reason
+            )
+            return upload_error(reason, status.HTTP_403_FORBIDDEN)
         for existing in version_row.files:
             if existing.filename == parsed.filename:
                 return upload_error(
@@ -472,18 +529,22 @@ async def upload(
         scanned=scan.scanned,
     )
     if cve_verdict.blocked:
-        await audit.record_audit(
+        # Capture the actor before the rollback expires the ORM objects the
+        # Identity is holding.
+        actor = (identity.user_id, identity.username)
+        # Discard the package row and its `is_local` flip. Committing them on
+        # a refused publish froze a cached project at its current releases, or
+        # created an empty local one that answered 404 for everybody.
+        await session.rollback()
+        await _record_publish_denied(
             session,
-            audit.PACKAGE_PUBLISH_DENIED,
-            actor_user_id=identity.user_id,
-            actor_username=identity.username,
-            target_type="package",
-            target_id=f"pypi:{parsed.name}=={parsed.version}",
-            success=False,
-            ip=client_ip(request),
-            detail={"reason": cve_verdict.reason, "max_cvss": scan.max_score},
+            request,
+            identity,
+            f"{parsed.name}=={parsed.version}",
+            cve_verdict.reason,
+            extra={"max_cvss": scan.max_score},
+            actor=actor,
         )
-        await session.commit()
         return upload_error(
             cve_verdict.reason or "blocked by CVE policy", status.HTTP_403_FORBIDDEN
         )

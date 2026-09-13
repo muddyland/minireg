@@ -307,6 +307,16 @@ class Package(Base):
 
     # True when at least one version was published directly to this registry.
     is_local: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Who may publish further versions, retag, deprecate or unpublish this
+    # name. Set to the first publisher; NULL for a name that only ever arrived
+    # from an upstream. Without this there was no ownership at all: any
+    # publish-scoped token could add a version to any package, including a
+    # cached public one, and locally published packages are never refreshed
+    # from upstream again -- so one publish permanently replaced `lodash` for
+    # every consumer of the registry.
+    owner_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
     origin_upstream_id: Mapped[int | None] = mapped_column(
         ForeignKey("upstreams.id", ondelete="SET NULL")
     )
@@ -381,6 +391,46 @@ class PackageVersion(Base):
     __table_args__ = (
         UniqueConstraint("package_id", "normalized_version", name="uq_version_pkg_ver"),
         Index("ix_version_scan", "scanned_at"),
+    )
+
+
+class RetiredVersion(Base):
+    """A version that was published here and then unpublished.
+
+    Unpublishing used to delete the row and the blob outright, which made the
+    (name, version) pair free again: the same version could be republished
+    with different bytes, and only a lockfile's recorded digest would notice.
+    npm learned this in 2016 and PyPI enforces it too -- a version number is a
+    promise about content, and deletion must not take the promise with it.
+
+    The digests of what was served are kept so a republish attempt can be told
+    apart from an identical re-upload.
+    """
+
+    __tablename__ = "retired_versions"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    ecosystem: Mapped[Ecosystem] = mapped_column(
+        Enum(Ecosystem, native_enum=False, length=8), nullable=False
+    )
+    normalized_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    version: Mapped[str] = mapped_column(String(128), nullable=False)
+    normalized_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    integrity: Mapped[str | None] = mapped_column(String(255))
+    removed_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    removed_by_username: Mapped[str | None] = mapped_column(String(150))
+    removed_at: Mapped[datetime] = _now_col()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "ecosystem",
+            "normalized_name",
+            "normalized_version",
+            name="uq_retired_eco_name_ver",
+        ),
     )
 
 

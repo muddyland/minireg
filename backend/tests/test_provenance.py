@@ -212,6 +212,15 @@ class TestProvenanceEndpoint:
 
     async def test_multiple_upstreams_are_all_listed(self, client):
         # Two upstreams contribute versions of the same package.
+        #
+        # Seeded by publishing first and registering the upstreams afterwards:
+        # publishing a name an upstream already serves is refused outright now,
+        # because doing so shadows the upstream package for every consumer of
+        # the mirror. The rows are relabelled below to stand in for a merged
+        # or failed-over fetch, which is what this test is actually about.
+        await client.put("/npm/shared", json=publish_body("shared", "1.0.0"))
+        await client.put("/npm/shared", json=publish_body("shared", "2.0.0"))
+
         async with db_module.session_scope() as session:
             session.add_all(
                 [
@@ -233,9 +242,6 @@ class TestProvenanceEndpoint:
                     ),
                 ]
             )
-
-        await client.put("/npm/shared", json=publish_body("shared", "1.0.0"))
-        await client.put("/npm/shared", json=publish_body("shared", "2.0.0"))
 
         # Attribute one version to each upstream, as a merged/failover fetch would.
         from sqlalchemy import update
