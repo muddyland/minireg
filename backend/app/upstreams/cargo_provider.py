@@ -253,7 +253,7 @@ class CargoProvider(UpstreamProvider):
         if resp.status_code != 200:
             return []
         try:
-            data = resp.json()
+            data = self.check_body_size(resp).json()
         except ValueError:
             return []
 

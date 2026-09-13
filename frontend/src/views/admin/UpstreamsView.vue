@@ -22,6 +22,8 @@ const blank = () => ({
   auth_header_name: '',
   timeout_seconds: 20,
   verify_ssl: true,
+  name_patterns: '',
+  require_digest: true,
   gitlab_project_id: '',
   gitlab_group_id: '',
   allow_publish: false,
@@ -102,6 +104,8 @@ function openEdit(upstream) {
     gitlab_group_id: upstream.gitlab_group_id || '',
     auth_header_name: upstream.auth_header_name || '',
     web_url_template: upstream.web_url_template || '',
+    name_patterns: (upstream.name_patterns || []).join(', '),
+    require_digest: upstream.require_digest !== false,
   }
   showForm.value = true
 }
@@ -114,6 +118,11 @@ async function save() {
   error.value = null
   const payload = { ...form.value }
   if (!payload.credential) delete payload.credential
+  // The form takes a comma-separated string; the API takes a list.
+  payload.name_patterns = (form.value.name_patterns || '')
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean)
   for (const key of ['gitlab_project_id', 'gitlab_group_id', 'auth_header_name', 'web_url_template']) {
     if (!payload[key]) payload[key] = null
   }
@@ -404,6 +413,24 @@ onMounted(load)
 
         <label class="check"><input v-model="form.enabled" type="checkbox" /> Enabled</label>
         <label class="check"><input v-model="form.verify_ssl" type="checkbox" /> Verify TLS certificates</label>
+        <label class="check">
+          <input v-model="form.require_digest" type="checkbox" />
+          Require a published digest for every artifact
+        </label>
+        <div class="field">
+          <label for="name-patterns">Reserved names</label>
+          <input
+            id="name-patterns"
+            v-model="form.name_patterns"
+            type="text"
+            placeholder="@corp/*, corp-*"
+          />
+          <p class="field-hint">
+            Comma-separated glob patterns. When set, only this upstream answers for
+            matching names, so a public registry can never take over an internal
+            package. Leave empty to serve anything.
+          </p>
+        </div>
         <label class="check">
           <input v-model="form.allow_publish" type="checkbox" />
           Mirror local publishes to this upstream

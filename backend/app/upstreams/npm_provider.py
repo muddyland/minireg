@@ -75,7 +75,7 @@ class NpmProvider(UpstreamProvider):
             raise UpstreamError(f"{self.name}: HTTP {resp.status_code}")
 
         try:
-            doc = resp.json()
+            doc = self.check_body_size(resp).json()
         except ValueError as exc:
             raise UpstreamError(f"{self.name}: invalid JSON packument") from exc
         if not isinstance(doc, dict) or "versions" not in doc:
@@ -163,7 +163,7 @@ class NpmProvider(UpstreamProvider):
         if resp.status_code != 200:
             return []
         try:
-            data = resp.json()
+            data = self.check_body_size(resp).json()
         except ValueError:
             return []
 

@@ -21,14 +21,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer, selectinload
 
 from ..config import settings
-from ..core.cache import cache_delete_prefix, herd_guard
+from ..core.cache import cache_delete_prefix, cache_get_json, cache_set_json, herd_guard
 from ..core.naming import (
     normalize_name_for,
     normalize_pypi_version,
 )
 from ..models import DistTag, Ecosystem, Package, PackageFile, PackageVersion, Upstream
 from ..upstreams.base import RemotePackage
-from .resolver import Resolver, ResolveResult
+from .resolver import Resolver, ResolveResult, TierUnavailable
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +125,10 @@ def is_stale(package: Package) -> bool:
     return datetime.now(UTC) - cached > timedelta(seconds=settings.meta_cache_ttl)
 
 
+class UpstreamNameMismatch(Exception):
+    """An upstream returned a document for a different package."""
+
+
 async def persist_remote_package(
     session: AsyncSession,
     ecosystem: Ecosystem,
@@ -140,6 +144,20 @@ async def persist_remote_package(
     """
     display_name = remote.name or requested_name or ""
     normalized = normalize_name_for(ecosystem.value, display_name)
+
+    # The row is keyed on the name the *upstream* declared, so an upstream
+    # that answered a request for `some-package` with a document named
+    # `@corp/internal-lib` wrote its versions into the internal package's row
+    # -- with attacker-chosen tarball URLs and matching digests, which then
+    # verify, because both sides came from the same place. Answer for the name
+    # you were asked about or the answer is discarded.
+    if requested_name:
+        expected = normalize_name_for(ecosystem.value, requested_name)
+        if expected != normalized:
+            raise UpstreamNameMismatch(
+                f"upstream answered a request for '{requested_name}' with a document "
+                f"named '{display_name}'"
+            )
 
     package = await get_package_row(session, ecosystem, normalized)
     if package is None:
@@ -320,6 +338,14 @@ async def fetch_package(
     if not allow_upstream:
         return PackageLookup(package=package, fresh=package is not None)
 
+    # A name nothing has: remember that briefly. Typos, private scopes that
+    # only exist on someone else's machine and probes otherwise walk every
+    # tier on every request, and the herd guard only collapses the concurrent
+    # ones. META_NEGATIVE_CACHE_TTL existed as a setting but was never read.
+    miss_key = cache_key(ecosystem.value, normalized, "miss")
+    if package is None and not force_refresh and await cache_get_json(miss_key):
+        return PackageLookup(package=None, fresh=False)
+
     # Collapse concurrent cold-cache fetches for the same package.
     async with herd_guard(cache_key(ecosystem.value, normalized, "fetch"), ttl=30):
         # Re-check: another waiter may have refreshed it while we queued.
@@ -328,16 +354,36 @@ async def fetch_package(
             return PackageLookup(package=package, fresh=True)
 
         resolver = Resolver(session)
-        result: ResolveResult | None = await resolver.resolve(ecosystem, name)
+        try:
+            result: ResolveResult | None = await resolver.resolve(ecosystem, name)
+        except TierUnavailable as exc:
+            # A tier failed rather than answering "not found". Serve what we
+            # have; do not let a lower tier take the name.
+            log.warning("resolution incomplete for %s:%s -- %s", ecosystem.value, name, exc)
+            await session.commit()
+            return PackageLookup(package=package, fresh=False)
         if result is None:
             # Upstreams do not have it. A stale local copy is better than a 404.
+            #
+            # The resolver records upstream health on the ORM objects, and on
+            # this path nothing else commits -- so during a full outage the
+            # failure counter never reached the threshold, the circuit breaker
+            # never tripped, and every request kept paying three retries per
+            # upstream while holding a pooled connection.
+            await session.commit()
             if package is not None:
                 return PackageLookup(package=package, fresh=False)
+            await cache_set_json(miss_key, {"miss": True}, settings.meta_negative_cache_ttl)
             return PackageLookup(package=None, fresh=False)
 
-        package = await persist_remote_package(
-            session, ecosystem, result.package, result.upstream, requested_name=name
-        )
+        try:
+            package = await persist_remote_package(
+                session, ecosystem, result.package, result.upstream, requested_name=name
+            )
+        except UpstreamNameMismatch as exc:
+            log.warning("discarding upstream response: %s", exc)
+            await session.rollback()
+            return PackageLookup(package=None, fresh=False)
         await session.commit()
         await invalidate_package_cache(ecosystem.value, normalized)
         return PackageLookup(
@@ -346,7 +392,9 @@ async def fetch_package(
 
 
 async def invalidate_package_cache(ecosystem: str, normalized_name: str) -> None:
-    await cache_delete_prefix(cache_key(ecosystem, normalized_name))
+    # Trailing separator: without it, refreshing `react` also dropped every
+    # cached document for `react-dom`, `react-router` and friends.
+    await cache_delete_prefix(f"{cache_key(ecosystem, normalized_name)}:")
 
 
 async def bump_download_counters(

@@ -10,6 +10,18 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-that-is-long-enough-32")
 os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:1/0")
 os.environ.setdefault("OSV_ENABLED", "false")
 os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
+# Artifact fetches are restricted to an allowlist of hosts, because the URL
+# comes out of upstream metadata and is attacker-chosen when an upstream is
+# hostile. The mock upstreams below serve their files from separate CDN hosts,
+# exactly as the real registries do, so those hosts are declared here the way
+# an operator would declare them in .env.
+os.environ.setdefault(
+    "UPSTREAM_ARTIFACT_HOSTS",
+    "registry.npmjs.org,files.pythonhosted.org,static.crates.io,"
+    "upstream.test,fallback.test,static.upstream.test,files.upstream.test,"
+    "cdn.upstream.test,internal.test",
+)
+os.environ.setdefault("UPSTREAM_ALLOW_PRIVATE_ADDRESSES", "true")
 
 from app.models import DistTag, Ecosystem, Package, PackageFile, PackageVersion
 from app.services.storage import BlobStore, set_store

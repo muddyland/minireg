@@ -329,7 +329,15 @@ class TestTieredFallback:
         assert fallback.call_count == 1
 
     @respx.mock
-    async def test_tier_two_is_used_when_tier_one_errors(self, proxy_client):
+    async def test_tier_two_is_NOT_used_when_tier_one_errors(self, proxy_client):
+        """A failing tier must not hand its names to the tier below.
+
+        This is dependency confusion. An internal registry that returns 503
+        for one request is not saying "no such package" -- but if a public
+        upstream is allowed to answer instead, its version list is persisted
+        and never removed, so the takeover outlives the outage. Only an
+        authoritative 404 lets the next tier answer.
+        """
         async with db_module.session_scope() as session:
             session.add(
                 Upstream(
@@ -343,13 +351,39 @@ class TestTieredFallback:
             )
 
         respx.get("https://upstream.test/leftpad").mock(return_value=httpx.Response(503))
-        respx.get("https://fallback.test/leftpad").mock(
+        fallback = respx.get("https://fallback.test/leftpad").mock(
             return_value=httpx.Response(200, json=UPSTREAM_PACKUMENT)
         )
 
         response = await proxy_client.get("/npm/leftpad")
-        assert response.status_code == 200
-        assert response.json()["name"] == "leftpad"
+        assert response.status_code == 404
+        assert fallback.call_count == 0
+
+    @respx.mock
+    async def test_an_upstream_answering_for_another_name_is_discarded(self, proxy_client):
+        """An upstream answers for the name it was asked about, or not at all.
+
+        The stored row used to be keyed on the name in the *response*, so a
+        hostile upstream could reply to a request for one package with a
+        document naming another and write attacker-chosen versions into it.
+        """
+        impostor = dict(UPSTREAM_PACKUMENT)
+        impostor["name"] = "@corp/internal-lib"
+        respx.get("https://upstream.test/leftpad").mock(
+            return_value=httpx.Response(200, json=impostor)
+        )
+
+        assert (await proxy_client.get("/npm/leftpad")).status_code == 404
+
+        async with db_module.session_scope() as session:
+            import sqlalchemy
+
+            from app.models import Package
+
+            names = (
+                await session.execute(sqlalchemy.select(Package.normalized_name))
+            ).scalars().all()
+            assert "@corp/internal-lib" not in names
 
     @respx.mock
     async def test_all_tiers_failing_is_404(self, proxy_client):

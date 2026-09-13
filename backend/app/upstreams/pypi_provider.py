@@ -145,7 +145,7 @@ class PyPIProvider(UpstreamProvider):
 
         content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
         if content_type == "application/vnd.pypi.simple.v1+json" or content_type == "application/json":
-            files, versions_hint, raw = self._parse_json(resp.json(), url)
+            files, versions_hint, raw = self._parse_json(self.check_body_size(resp).json(), url)
         else:
             files, versions_hint, raw = self._parse_html(resp.text, url)
 

@@ -25,6 +25,7 @@ tiers taking precedence on filename collisions.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
+from ..core.naming import normalize_name_for
 from ..models import Ecosystem, Upstream, UpstreamKind
 from ..upstreams.base import (
     RemotePackage,
@@ -71,6 +73,14 @@ def build_provider(upstream: Upstream) -> UpstreamProvider:
     return cls(upstream)
 
 
+class TierUnavailable(Exception):
+    """A tier failed rather than answering "not found".
+
+    Raised instead of falling through, so a transient upstream failure cannot
+    silently promote a lower tier's package to the name.
+    """
+
+
 @dataclass(slots=True)
 class ResolveResult:
     package: RemotePackage
@@ -86,6 +96,34 @@ async def load_upstreams(
         stmt = stmt.where(Upstream.enabled.is_(True))
     stmt = stmt.order_by(Upstream.tier.asc(), Upstream.priority.asc(), Upstream.id.asc())
     return list((await session.execute(stmt)).scalars().all())
+
+
+def claimants_for(
+    upstreams: list[Upstream], name: str, ecosystem: Ecosystem
+) -> list[Upstream]:
+    """Restrict resolution to the upstreams that claim this name.
+
+    An upstream may declare `name_patterns`, e.g. `["@corp/*"]`. If any
+    upstream claims a pattern matching this name, only those upstreams are
+    consulted -- a name inside a reserved namespace is never answered by a
+    public registry, whatever order the tiers are in and whatever the internal
+    one is doing right now.
+
+    Upstreams with no patterns are the general pool and serve everything else.
+    """
+    normalized = normalize_name_for(ecosystem.value, name)
+    claimed = [
+        u
+        for u in upstreams
+        if any(
+            fnmatch.fnmatchcase(normalized, str(p).strip().lower())
+            for p in (u.name_patterns or [])
+            if str(p).strip()
+        )
+    ]
+    if claimed:
+        return claimed
+    return [u for u in upstreams if not (u.name_patterns or [])]
 
 
 def group_by_tier(upstreams: list[Upstream]) -> list[tuple[int, list[Upstream]]]:
@@ -113,11 +151,16 @@ class Resolver:
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+        #: Failures seen while querying the current tier, as (upstream, why).
+        self.tier_errors: list[tuple[Upstream, str]] = []
 
     async def resolve(
         self, ecosystem: Ecosystem, name: str, *, merge_tier: bool | None = None
     ) -> ResolveResult | None:
         upstreams = await load_upstreams(self.session, ecosystem)
+        if not upstreams:
+            return None
+        upstreams = claimants_for(upstreams, name, ecosystem)
         if not upstreams:
             return None
         # PyPI merges by default because the Simple API is file-oriented and a
@@ -131,10 +174,24 @@ class Resolver:
         for tier, group in group_by_tier(upstreams):
             candidates = [u for u in group if not is_quarantined(u)]
             if not candidates:
+                # Every upstream in this tier is quarantined. That is a
+                # failure, not an absence, so do not let a lower tier answer.
+                if group:
+                    raise TierUnavailable(
+                        f"every tier-{tier} upstream for this ecosystem is quarantined"
+                    )
                 continue
 
+            self.tier_errors = []
             results = await self._query_tier(candidates, name, collect_all=merge_tier)
             if not results:
+                if self.tier_errors:
+                    # This tier could not answer, as opposed to answering "no".
+                    # Falling through here is dependency confusion: an internal
+                    # registry that times out once lets a public one claim the
+                    # name, and the versions it supplies are never removed.
+                    why = "; ".join(f"{u.name}: {e}" for u, e in self.tier_errors)
+                    raise TierUnavailable(f"tier {tier} could not be consulted ({why})")
                 continue
             if len(results) == 1 or not merge_tier:
                 package, upstream = results[0]
@@ -186,6 +243,15 @@ class Resolver:
         return found
 
     async def _query_one(self, upstream: Upstream, name: str) -> RemotePackage | None:
+        """Ask one upstream. Returns None for an authoritative 404.
+
+        A *failure* is recorded on ``self.tier_errors`` rather than reported
+        as a miss. The difference decides whether the next tier is consulted:
+        treating a timeout or an expired token the same as "no such package"
+        is how a single internal-registry blip let a public registry answer
+        for an internal name, permanently -- versions are never removed once
+        persisted, so the takeover survives the internal upstream recovering.
+        """
         provider = build_provider(upstream)
         try:
             package = await provider.fetch_package(name)
@@ -196,10 +262,12 @@ class Resolver:
             raise
         except UpstreamError as exc:
             await self._mark_failure(upstream, str(exc))
+            self.tier_errors.append((upstream, str(exc)))
             return None
         except Exception as exc:
             log.exception("upstream %s raised unexpectedly", upstream.name)
             await self._mark_failure(upstream, repr(exc))
+            self.tier_errors.append((upstream, repr(exc)))
             return None
         await self._mark_healthy(upstream)
         return package

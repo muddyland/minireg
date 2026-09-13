@@ -243,6 +243,14 @@ class Upstream(Base):
     )
     url: Mapped[str] = mapped_column(String(1024))
     tier: Mapped[int] = mapped_column(Integer, default=1, nullable=False, index=True)
+    # Glob patterns this upstream is allowed to answer for, e.g.
+    # ``["@corp/*"]``. Empty means "any name". When any upstream in an
+    # ecosystem claims a pattern, a name matching it is only ever resolved
+    # from upstreams that claim it -- which is what stops a public registry
+    # answering for an internal package after the internal one has a bad day.
+    name_patterns: Mapped[list] = mapped_column(JSONType, default=list)
+    # Refuse to cache an artifact this upstream published no digest for.
+    require_digest: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 

@@ -108,6 +108,14 @@ class BlobStore:
                         continue
                     digests.update(chunk)
                     await fh.write(chunk)
+                # Flush to the platter before the rename makes the blob
+                # reachable. Without this, a power loss between the two can
+                # leave a truncated file at the final path while the database
+                # has already committed its sha256 -- and reads are not
+                # re-verified, so it would be served with a correct-looking
+                # ETag forever.
+                await fh.flush()
+                await asyncio.to_thread(os.fsync, fh.fileno())
 
             sha256 = digests.sha256.hexdigest()
             final = self.path_for(sha256)

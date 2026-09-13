@@ -76,7 +76,7 @@ class _GitLabMixin:
             )
             if resp.status_code >= 400:
                 raise UpstreamError(f"{self.name}: HTTP {resp.status_code}")  # type: ignore[attr-defined]
-            batch = resp.json()
+            batch = self.check_body_size(resp).json()
             if not isinstance(batch, list) or not batch:
                 break
             results.extend(batch)

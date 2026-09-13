@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ...config import settings
 from ...core.deps import Identity, client_ip, require_admin
 from ...core.security import encrypt_credential, hash_password
 from ...core.semver import is_valid_range, parse_range
@@ -245,6 +246,33 @@ async def delete_user(
 # --------------------------------------------------------------------------- #
 # Upstreams
 # --------------------------------------------------------------------------- #
+def _validated_upstream_url(url: str) -> str:
+    """Upstream URLs must be absolute http(s).
+
+    The field was a bare string, so a typo produced an upstream that failed in
+    confusing ways much later, and a `file://` or `gopher://` value was
+    accepted outright.
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url.strip())
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="upstream URL must be an absolute http:// or https:// URL",
+        )
+    if parts.scheme == "http" and not settings.upstream_allow_plaintext_http:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "refusing a plaintext http:// upstream; metadata and artifacts "
+                "would be modifiable in transit. Set "
+                "UPSTREAM_ALLOW_PLAINTEXT_HTTP=true if an internal mirror needs it."
+            ),
+        )
+    return url.strip()
+
+
 class UpstreamCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     ecosystem: Ecosystem
@@ -258,6 +286,10 @@ class UpstreamCreate(BaseModel):
     auth_header_name: str | None = None
     timeout_seconds: float = Field(default=20.0, gt=0, le=300)
     verify_ssl: bool = True
+    #: Glob patterns this upstream is allowed to answer for, e.g. ["@corp/*"].
+    #: Claiming a pattern stops every other upstream serving those names.
+    name_patterns: list[str] = Field(default_factory=list)
+    require_digest: bool = True
     cache_artifacts: bool = True
     gitlab_project_id: str | None = None
     gitlab_group_id: str | None = None
@@ -277,6 +309,8 @@ class UpstreamUpdate(BaseModel):
     auth_header_name: str | None = None
     timeout_seconds: float | None = Field(default=None, gt=0, le=300)
     verify_ssl: bool | None = None
+    name_patterns: list[str] | None = None
+    require_digest: bool | None = None
     cache_artifacts: bool | None = None
     gitlab_project_id: str | None = None
     gitlab_group_id: str | None = None
@@ -301,6 +335,8 @@ def upstream_payload(upstream: Upstream) -> dict:
         "auth_header_name": upstream.auth_header_name,
         "timeout_seconds": upstream.timeout_seconds,
         "verify_ssl": upstream.verify_ssl,
+        "name_patterns": upstream.name_patterns or [],
+        "require_digest": upstream.require_digest,
         "cache_artifacts": upstream.cache_artifacts,
         "gitlab_project_id": upstream.gitlab_project_id,
         "gitlab_group_id": upstream.gitlab_group_id,
@@ -352,6 +388,7 @@ async def create_upstream(
 ) -> dict:
     _validate_kind(payload.ecosystem, payload.kind)
     data = payload.model_dump(exclude={"credential"})
+    data["url"] = _validated_upstream_url(data["url"])
     upstream = Upstream(**data, credential_enc=encrypt_credential(payload.credential))
     session.add(upstream)
     try:
@@ -395,7 +432,10 @@ async def update_upstream(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="upstream not found")
 
     changes: dict[str, Any] = {}
-    for field, value in payload.model_dump(exclude_unset=True, exclude={"credential"}).items():
+    updates = payload.model_dump(exclude_unset=True, exclude={"credential"})
+    if updates.get("url"):
+        updates["url"] = _validated_upstream_url(updates["url"])
+    for field, value in updates.items():
         if value is not None and getattr(upstream, field) != value:
             changes[field] = value
             setattr(upstream, field, value)

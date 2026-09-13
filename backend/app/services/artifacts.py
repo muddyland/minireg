@@ -12,16 +12,19 @@ Guarantees:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..core.cache import herd_guard
 from ..models import Blob, PackageFile, Upstream
+from ..upstreams.netguard import BlockedUrl, check_fetchable
 from .resolver import build_provider
 from .storage import get_store
 
@@ -30,6 +33,16 @@ log = logging.getLogger(__name__)
 
 class ArtifactError(Exception):
     pass
+
+
+def _as_artifact_error(exc: Exception, filename: str) -> ArtifactError:
+    """Wrap a low-level failure so route handlers answer 502 rather than 500.
+
+    `BlockedUrl` and `OSError` (a full disk, a read-only volume) both used to
+    escape as unhandled exceptions past every `except ArtifactError` in the
+    API layer.
+    """
+    return ArtifactError(f"{filename}: {exc}")
 
 
 class DigestMismatch(ArtifactError):
@@ -58,11 +71,54 @@ async def ensure_cached(
         upstream = None
         if file_row.upstream_id:
             upstream = await session.get(Upstream, file_row.upstream_id)
+            if upstream is None:
+                raise ArtifactError(
+                    f"{file_row.filename}: the upstream it came from no longer exists; "
+                    "re-resolve the package"
+                )
+            if not upstream.enabled:
+                # Disabling a compromised upstream has to stop fetches through
+                # it, not just stop new resolutions.
+                raise ArtifactError(
+                    f"{file_row.filename}: upstream '{upstream.name}' is disabled"
+                )
 
-        stored = await _download(file_row.upstream_url, upstream)
+        # Refuse to cache past the quota. Publishes are exempt (they have no
+        # upstream URL and reach this code only when already stored), because a
+        # local package exists nowhere else while a cached artifact can always
+        # be fetched again.
+        if settings.storage_quota_bytes:
+            used = await _stored_bytes(session)
+            if used >= settings.storage_quota_bytes:
+                raise ArtifactError(
+                    f"blob storage is at its quota ({used} of "
+                    f"{settings.storage_quota_bytes} bytes); not caching "
+                    f"{file_row.filename}"
+                )
+
+        try:
+            stored = await _download(file_row.upstream_url, upstream, file_row.filename)
+        except BlockedUrl as exc:
+            log.warning("refused to fetch %s: %s", file_row.upstream_url, exc)
+            raise _as_artifact_error(exc, file_row.filename) from exc
+        except TimeoutError as exc:
+            raise _as_artifact_error(
+                Exception("upstream download timed out"), file_row.filename
+            ) from exc
+        except OSError as exc:
+            log.error("storing %s failed: %s", file_row.filename, exc)
+            raise _as_artifact_error(exc, file_row.filename) from exc
 
         if verify:
-            _verify_digests(file_row, stored)
+            try:
+                _verify_digests(file_row, stored, require=_digest_required(upstream))
+            except (DigestMismatch, ArtifactError):
+                # The bytes are already in the blob store: put_stream renames
+                # into place before anything is verified. Nothing references
+                # them and orphan GC only walks Blob rows, so without this they
+                # sat on disk forever and were re-downloaded on every retry.
+                await _discard_unreferenced(session, stored.sha256)
+                raise
 
         # Record the blob, or bump its refcount if another file shares it.
         blob = await session.get(Blob, stored.sha256)
@@ -90,11 +146,39 @@ async def ensure_cached(
         return file_row
 
 
-def _verify_digests(file_row: PackageFile, stored) -> None:
+def _digest_required(upstream: Upstream | None) -> bool:
+    """Whether this upstream must advertise a digest for its artifacts."""
+    if upstream is None:
+        return False
+    value = getattr(upstream, "require_digest", None)
+    return True if value is None else bool(value)
+
+
+async def _stored_bytes(session: AsyncSession) -> int:
+    total = (await session.execute(select(func.coalesce(func.sum(Blob.size), 0)))).scalar()
+    return int(total or 0)
+
+
+async def _discard_unreferenced(session: AsyncSession, sha256: str) -> None:
+    """Delete a just-downloaded blob that no row points at."""
+    blob = await session.get(Blob, sha256)
+    if blob is not None:
+        return
+    with contextlib.suppress(Exception):
+        get_store().delete(sha256)
+
+
+def _verify_digests(file_row: PackageFile, stored, *, require: bool = False) -> None:
     """Compare against whatever the upstream told us to expect.
 
     We check every digest we were given, not just one: an upstream that
     publishes sha1 (npm) and one that publishes sha256 (PyPI) both get checked.
+
+    With ``require`` set, an artifact whose metadata carried *no* digest at all
+    is rejected rather than accepted on trust. Verification is otherwise
+    opt-in by the upstream: no advertised digest meant no check, and the
+    digest we then served to clients was derived from whatever bytes arrived,
+    so the client's own verification proved nothing.
     """
     checks = (
         ("sha256", file_row.sha256, stored.sha256),
@@ -102,6 +186,11 @@ def _verify_digests(file_row: PackageFile, stored) -> None:
         ("md5", file_row.md5, stored.md5),
         ("blake2b_256", file_row.blake2b_256, stored.blake2b_256),
     )
+    if require and not any(expected for _, expected, _ in checks) and not file_row.integrity:
+        raise ArtifactError(
+            f"{file_row.filename}: upstream published no digest for this artifact "
+            "and this upstream is configured to require one"
+        )
     for algorithm, expected, actual in checks:
         if expected and expected.lower() != actual.lower():
             raise DigestMismatch(
@@ -131,27 +220,65 @@ def _verify_digests(file_row: PackageFile, stored) -> None:
                 )
 
 
-async def _download(url: str, upstream: Upstream | None):
-    """Stream an artifact from an upstream into the blob store."""
-    if upstream is not None:
-        provider = build_provider(upstream)
-        response, chunks = await provider.stream(url)
-        try:
+def _capped(chunks: AsyncIterator[bytes], filename: str) -> AsyncIterator[bytes]:
+    """Stop a download that runs past the artifact size cap.
+
+    httpx transparently inflates `Content-Encoding`, so a small compressed
+    body can expand without limit; counting decoded bytes is the only place
+    the cap means anything.
+    """
+    limit = settings.max_artifact_bytes
+
+    async def _iter():
+        seen = 0
+        async for chunk in chunks:
+            seen += len(chunk)
+            if limit and seen > limit:
+                raise ArtifactError(
+                    f"{filename}: upstream artifact exceeds the {limit} byte limit"
+                )
+            yield chunk
+
+    return _iter()
+
+
+async def _download(url: str, upstream: Upstream | None, filename: str = "artifact"):
+    """Stream an artifact from an upstream into the blob store.
+
+    The URL comes from upstream metadata, so it is checked against the
+    allowlist before a socket is opened, and again on every redirect hop.
+    """
+    check_fetchable(url, upstream_url=upstream.url if upstream else None)
+
+    # The whole download gets one deadline. The client's read timeout is
+    # per-chunk, so an upstream trickling a byte every ten seconds never
+    # tripped it and held the herd-guard lock for that file indefinitely.
+    async with asyncio.timeout(settings.artifact_download_timeout_seconds):
+        if upstream is not None:
+            provider = build_provider(upstream)
+            response, chunks = await provider.stream(url)
+            try:
+                if response.status_code >= 400:
+                    raise ArtifactError(
+                        f"upstream returned HTTP {response.status_code} for {url}"
+                    )
+                return await get_store().put_stream(_capped(chunks, filename))
+            finally:
+                await response.aclose()
+
+        # No upstream row (e.g. an absolute URL from a merged document): fetch
+        # anonymously with the shared client.
+        from ..upstreams.base import get_http_client
+
+        client = get_http_client()
+        async with client.stream("GET", url, follow_redirects=True) as response:
+            for hop in response.history:
+                check_fetchable(str(hop.headers.get("location") or response.url))
             if response.status_code >= 400:
-                raise ArtifactError(f"upstream returned HTTP {response.status_code} for {url}")
-            return await get_store().put_stream(chunks)
-        finally:
-            await response.aclose()
-
-    # No upstream row (e.g. an absolute URL from a merged document): fetch
-    # anonymously with the shared client.
-    from ..upstreams.base import get_http_client
-
-    client = get_http_client()
-    async with client.stream("GET", url, follow_redirects=True) as response:
-        if response.status_code >= 400:
-            raise ArtifactError(f"HTTP {response.status_code} fetching {url}")
-        return await get_store().put_stream(response.aiter_bytes(settings.stream_chunk_size))
+                raise ArtifactError(f"HTTP {response.status_code} fetching {url}")
+            return await get_store().put_stream(
+                _capped(response.aiter_bytes(settings.stream_chunk_size), filename)
+            )
 
 
 async def stream_artifact(
