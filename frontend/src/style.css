@@ -449,6 +449,42 @@ input[type='checkbox'] {
 .copy-block { position: relative; }
 .copy-block .btn { position: absolute; top: 0.4rem; right: 0.4rem; }
 
+/* ---------- live tail ---------- */
+.live-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border-strong);
+  flex: none;
+}
+.live-toggle.connecting .live-dot { background: var(--warn); }
+.live-toggle.streaming { color: var(--text); }
+.live-toggle.streaming .live-dot {
+  background: var(--ok);
+  animation: live-pulse 1.8s ease-in-out infinite;
+}
+.live-toggle.error { color: var(--danger); }
+.live-toggle.error .live-dot { background: var(--danger); }
+
+@keyframes live-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--ok-soft); opacity: 1; }
+  50% { box-shadow: 0 0 0 4px var(--ok-soft); opacity: 0.65; }
+}
+
+/* A steady dot still says "connected"; the pulse is decoration. */
+@media (prefers-reduced-motion: reduce) {
+  .live-toggle.streaming .live-dot { animation: none; }
+}
+
 /* ---------- documentation ---------- */
 .topbar-icon { display: inline-flex; align-items: center; padding: 0 0.45rem; }
 .topbar-icon .nav-icon { opacity: 0.75; }

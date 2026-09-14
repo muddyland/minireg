@@ -77,6 +77,9 @@ onMounted(() => auth.loadOidcStatus())
           <router-link class="nav-link" :to="{ name: 'users' }">
             <NavIcon name="users" /> Users
           </router-link>
+          <router-link class="nav-link" :to="{ name: 'downloads' }">
+            <NavIcon name="downloads" /> Package requests
+          </router-link>
           <router-link class="nav-link" :to="{ name: 'audit' }">
             <NavIcon name="audit" /> Audit log
           </router-link>

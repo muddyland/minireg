@@ -123,6 +123,9 @@ export const api = {
   auditLog: (params) => request(`/api/admin/audit${qs(params)}`),
   auditActions: () => request('/api/admin/audit/actions'),
   downloadLog: (params) => request(`/api/admin/downloads${qs(params)}`),
+  // EventSource takes a URL, not a fetch call, so this is built rather than
+  // requested. Auth rides on the same-site session cookie.
+  downloadStreamUrl: (params) => `/api/admin/downloads/stream${qs(params)}`,
 
   // -- admin: security -----------------------------------------------------
   vulnerabilities: (params) => request(`/api/admin/vulnerabilities${qs(params)}`),

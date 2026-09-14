@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 
+import orjson
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,7 +17,7 @@ from sqlalchemy.orm import defer, selectinload
 
 from ...core.deps import Identity, client_ip, require_admin
 from ...core.naming import order_version_rows
-from ...db import get_session
+from ...db import get_session, session_scope
 from ...models import (
     AuditLog,
     Blob,
@@ -450,6 +454,154 @@ async def list_downloads(
             for r in rows
         ],
     }
+
+
+#: Concurrent live tails allowed. Each one wakes on a timer and takes a
+#: connection for a moment, so a handful is fine and an unbounded number
+#: would quietly eat the pool.
+MAX_DOWNLOAD_STREAMS = 8
+_active_streams = 0
+
+#: How often the tail looks for new rows. Requests are written by a batching
+#: recorder that drains every couple of seconds, so polling faster than this
+#: would spend queries to find nothing.
+STREAM_POLL_SECONDS = 1.0
+#: Rows emitted per tick. A burst bigger than this is drained over the next
+#: few ticks rather than flooding the browser in one frame.
+STREAM_BATCH = 200
+#: Idle comment interval. Proxies drop a connection that says nothing.
+STREAM_HEARTBEAT_SECONDS = 15.0
+#: A tail left open in a forgotten tab should not last forever.
+STREAM_MAX_SECONDS = 3600.0
+
+
+def _download_row(row: DownloadLog) -> dict:
+    return {
+        "id": row.id,
+        "ts": row.ts.isoformat() if row.ts else None,
+        "ecosystem": row.ecosystem,
+        "package_name": row.package_name,
+        "version": row.version,
+        "filename": row.filename,
+        "kind": row.kind,
+        "username": row.username,
+        "ip": row.ip,
+        "user_agent": row.user_agent,
+        "bytes_sent": row.bytes_sent,
+        "cache_hit": row.cache_hit,
+        "status": row.status,
+        "duration_ms": row.duration_ms,
+    }
+
+
+@router.get("/downloads/stream")
+async def stream_downloads(
+    request: Request,
+    ecosystem: Ecosystem | None = None,
+    package_name: str | None = None,
+    username: str | None = None,
+    since_id: int | None = Query(
+        default=None,
+        ge=0,
+        description=(
+            "Resume after this row id. Omit to start from the newest row. A "
+            "client reconnecting after the tail aged out should pass the last "
+            "id it saw, or it loses everything recorded during the gap."
+        ),
+    ),
+) -> StreamingResponse:
+    """Server-sent events: package requests as they are recorded.
+
+    Implemented by tailing the table on its primary key rather than by
+    subscribing to the in-process recorder. The recorder is per-process, so
+    an in-memory fan-out would show a replica only its own share of the
+    traffic; the table is what every replica agrees on.
+
+    The request's own session is deliberately not used. It is held for the
+    life of the response, and this response lives for as long as the operator
+    leaves the page open -- one pooled connection each would be a slow way to
+    exhaust the pool. Each poll opens and closes its own instead.
+    """
+    global _active_streams
+    if _active_streams >= MAX_DOWNLOAD_STREAMS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="too many live tails are open; close one and retry",
+        )
+
+    conditions = []
+    if ecosystem is not None:
+        conditions.append(DownloadLog.ecosystem == ecosystem.value)
+    if package_name:
+        conditions.append(DownloadLog.package_name == package_name)
+    if username:
+        conditions.append(DownloadLog.username == username)
+
+    async def events():
+        global _active_streams
+        _active_streams += 1
+        started = time.monotonic()
+        last_sent = started
+        cursor: int | None = None
+        try:
+            # Resume where the client left off, or start from "now": on a
+            # fresh connection the table's history is already on the page
+            # below, so replaying it would only duplicate rows.
+            if since_id is not None:
+                cursor = since_id
+            else:
+                async with session_scope() as session:
+                    cursor = (
+                        await session.execute(
+                            select(func.coalesce(func.max(DownloadLog.id), 0))
+                        )
+                    ).scalar_one()
+            yield f": tailing from #{cursor}\n\n"
+
+            while True:
+                if await request.is_disconnected():
+                    return
+                if time.monotonic() - started > STREAM_MAX_SECONDS:
+                    yield "event: expired\ndata: {}\n\n"
+                    return
+
+                async with session_scope() as session:
+                    rows = (
+                        await session.execute(
+                            select(DownloadLog)
+                            .where(and_(DownloadLog.id > cursor, *conditions))
+                            .order_by(DownloadLog.id.asc())
+                            .limit(STREAM_BATCH)
+                        )
+                    ).scalars().all()
+
+                if rows:
+                    cursor = rows[-1].id
+                    payload = orjson.dumps([_download_row(r) for r in rows]).decode()
+                    yield f"event: downloads\ndata: {payload}\n\n"
+                    last_sent = time.monotonic()
+                elif time.monotonic() - last_sent > STREAM_HEARTBEAT_SECONDS:
+                    yield ": keepalive\n\n"
+                    last_sent = time.monotonic()
+
+                await asyncio.sleep(STREAM_POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            _active_streams -= 1
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "cache-control": "no-cache, no-transform",
+            # nginx buffers proxied responses by default, which would hold
+            # every event until the buffer filled. The shipped config turns
+            # buffering off; this covers a config that does not.
+            "x-accel-buffering": "no",
+            "connection": "keep-alive",
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -26,6 +26,7 @@ const routes = [
   { path: '/admin/security', name: 'security', component: () => import('@/views/admin/SecurityView.vue'), meta: { admin: true } },
   { path: '/admin/packages', name: 'admin-packages', component: () => import('@/views/admin/PackagesView.vue'), meta: { admin: true } },
   { path: '/admin/storage', name: 'storage', component: () => import('@/views/admin/StorageView.vue'), meta: { admin: true } },
+  { path: '/admin/downloads', name: 'downloads', component: () => import('@/views/admin/DownloadsView.vue'), meta: { admin: true } },
   { path: '/admin/audit', name: 'audit', component: () => import('@/views/admin/AuditView.vue'), meta: { admin: true } },
 
   { path: '/:pathMatch(.*)*', redirect: '/search' },

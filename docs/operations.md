@@ -3,6 +3,19 @@
 Running the registry day to day: what to watch, what to back up, and what to
 tune when it is slow.
 
+## Watching traffic
+
+**Package requests** in the admin UI lists every metadata lookup and artifact
+download, with the user, the address, the size and whether it was a cache hit.
+Turning on **Live** tails it as requests arrive, which is the quickest way to
+see what a CI fleet is actually pulling, or to confirm a client is pointed
+here at all.
+
+The tail is server-sent events over the same connection the UI already uses.
+It needs no extra port, but it does need a proxy that will not buffer the
+response -- the shipped nginx config sets `proxy_buffering off`, and the
+endpoint also sends `X-Accel-Buffering: no` for configs that do not.
+
 ## Health
 
 | Endpoint | Purpose |

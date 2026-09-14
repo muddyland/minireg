@@ -232,6 +232,21 @@ All require an admin identity and, for token auth, the `admin` scope.
 `DELETE /api/admin/packages/{id}`, `POST /api/admin/cache/purge`,
 `POST /api/admin/cache/gc`
 
+**Package requests** — `GET /api/admin/downloads` for the paged log, and
+`GET /api/admin/downloads/stream` for a live tail as server-sent events.
+
+The tail takes the same `ecosystem`, `package_name` and `username` filters as
+the list, plus `since_id`. Omit `since_id` and it starts from the newest row,
+because the page already shows the history and replaying it would duplicate
+the table; pass the last id you saw to resume without a gap. Events are
+`downloads` (a JSON array of rows), `expired` when the server closes a tail
+that has reached its age cap, and `:` comments as keepalives. Reconnect on
+`expired`, passing `since_id`.
+
+Eight tails may be open at once; beyond that the endpoint answers `429`. Each
+one polls rather than holding a database connection open, so a page left open
+costs a query a second, not a connection.
+
 **Metrics** — `GET /api/metrics`. Request counts by status class, and counters
 for the failures that are otherwise silent: CVE scans that timed out and were
 served unscanned, and OSV batches that failed.
