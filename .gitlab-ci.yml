@@ -1,3 +1,11 @@
+# Registry setup and the mandatory dependency audit are shared across the
+# internal projects. $CI_TEMPLATES is a group variable holding the templates
+# project's path.
+include:
+  - project: $CI_TEMPLATES
+    ref: main
+    file: /audit.yml
+
 stages:
   - lint
   - test
@@ -5,56 +13,18 @@ stages:
 
 # ── Shared bases ──────────────────────────────────────────────────────────
 
-# Says which index pip is about to use, and fails naming it if it cannot be
-# reached. Without this, an unreachable index reports "Could not find a
-# version that satisfies the requirement <first package in the lockfile>
-# (from versions: none)", which reads like a broken lockfile and sends you
-# looking in entirely the wrong place.
-#
-# Written in Python, not curl: the slim images do not ship curl. Credentials
-# are stripped before printing, because PIP_INDEX_URL usually carries a token
-# and a CI job log is not somewhere to put one.
-.pip_preflight: &pip_preflight |
-  python - <<'PREFLIGHT'
-  import os, sys, urllib.error, urllib.parse, urllib.request
-
-  index = os.environ.get("PIP_INDEX_URL") or "https://pypi.org/simple/"
-  parts = urllib.parse.urlsplit(index)
-
-  # Probe without the credentials: they are pip's business, and passing
-  # userinfo to urlopen trips its netloc parser. A private index answering
-  # 401 is reachable, which is all this check is asking.
-  host = parts.hostname or ""
-  netloc = f"{host}:{parts.port}" if parts.port else host
-  probe = parts._replace(netloc=netloc).geturl()
-  safe = probe if not parts.username else parts._replace(netloc=f"***@{netloc}").geturl()
-  print(f"pip index: {safe}", flush=True)
-
-  try:
-      urllib.request.urlopen(probe, timeout=20).read(1)
-  except urllib.error.HTTPError as exc:
-      print(f"note: index root returned HTTP {exc.code}; reachable, continuing")
-  except Exception as exc:
-      sys.exit(
-          f"ERROR: the Python index at {safe} is not reachable from this runner "
-          f"({exc}).\n       Set PIP_INDEX_URL, or give the runner a route to it."
-      )
-  PREFLIGHT
-
+# The registry setup (image, pip preflight, npm auth) comes from the shared
+# templates; these only add what is specific to this project.
 .python_base:
-  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/python:3.12-slim
-  tags: [saas-linux-small-amd64]
+  extends: .minireg-python
   before_script:
-    - *pip_preflight
-    # No automatic fallback to public PyPI when a private index is down. For a
-    # registry whose job is controlling where dependencies come from, quietly
-    # reaching past it would be the wrong failure mode.
+    - !reference [.minireg-python, before_script]
     - pip install --quiet --require-hashes -r backend/requirements.lock
 
 .node_base:
-  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/node:22-alpine
-  tags: [saas-linux-small-amd64]
+  extends: .minireg-node
   before_script:
+    - !reference [.minireg-node, before_script]
     - cd frontend && npm ci
 
 # ── Lint ──────────────────────────────────────────────────────────────────
@@ -63,7 +33,7 @@ lint:backend:
   extends: .python_base
   stage: lint
   before_script:
-    - *pip_preflight
+    - !reference [.minireg-python, before_script]
     - pip install --quiet ruff
   script:
     # The CLI is shipped to users verbatim from /api/cli/download, so it is
@@ -79,7 +49,7 @@ test:backend:
   extends: .python_base
   stage: test
   before_script:
-    - *pip_preflight
+    - !reference [.minireg-python, before_script]
     # The locked runtime set first, then the test extras on top. Installing
     # only `-e .[dev]` resolved from pyproject.toml, which carries no upper
     # bounds -- so CI was testing against different versions than the image
@@ -120,36 +90,6 @@ build:frontend:
   artifacts:
     paths: [backend/app/static]
     expire_in: 14 days
-
-# The registry audits its own dependencies, through itself. A tool that tells
-# other people their lockfiles have CVEs should be held to the same standard,
-# and this is also the only end-to-end exercise of the audit endpoint against
-# real data.
-audit:dependencies:
-  extends: .python_base
-  stage: test
-  # The CLI is a single stdlib-only script and it is right here in the repo,
-  # so run that rather than downloading the deployed build. No curl (the slim
-  # image has none), no network install, and -- more to the point -- the job
-  # exercises the CLI from the commit under test instead of whatever is
-  # currently deployed.
-  #
-  # MINIREG_TOKEN is read from the environment by the CLI; make it a masked
-  # CI variable with a read-scoped token.
-  script:
-    - python cli/minireg.py --url "$MINIREG_URL" audit backend --fail-on high
-    - python cli/minireg.py --url "$MINIREG_URL" audit frontend --fail-on high
-  rules:
-    # Needs both the registry and a credential; the audit endpoint requires a
-    # signed-in user. Skipped where either is unset, rather than failing.
-    - if: '$MINIREG_URL && $MINIREG_TOKEN'
-  # `--fail-on high` also fails on dependencies that could not be checked at
-  # all, which is the point of the gate but does make the job depend on OSV
-  # being up. Retry rides out a blip; a real finding still fails all three.
-  retry:
-    max: 2
-    when: script_failure
-  allow_failure: false
 
 # ── Build ─────────────────────────────────────────────────────────────────
 
