@@ -19,6 +19,8 @@ from app.models import (
     Ecosystem,
     Package,
     RetiredVersion,
+    Upstream,
+    UpstreamKind,
     User,
 )
 from app.services.policy import invalidate_policy_cache
@@ -146,6 +148,58 @@ class TestUpstreamShadowing:
         # Shadowing is refused on its own terms; an admin who really wants it
         # reserves the namespace explicitly rather than punching through here.
         assert response.status_code == 403
+
+
+class TestShadowCheckAvailability:
+    """What happens when the registry cannot tell whether a name is taken."""
+
+    async def test_publish_is_refused_when_upstreams_cannot_be_reached(self, env):
+        """Fail closed. Answering "not found" on a timeout would mean a slow
+        upstream is all it takes to publish a name that shadows a public
+        package, which is the thing this check exists to prevent."""
+        client, tokens = env
+        async with db_module.session_scope() as session:
+            session.add(
+                Upstream(
+                    name="unreachable",
+                    ecosystem=Ecosystem.npm,
+                    kind=UpstreamKind.npm,
+                    url="https://nothing-here.example",
+                    tier=1,
+                )
+            )
+
+        response = await as_user(client, tokens["alice"]).put(
+            "/npm/brand-new-name", json=publish_body("brand-new-name", "1.0.0")
+        )
+        assert response.status_code == 503
+        assert "could not check" in response.json()["error"]
+
+    async def test_the_check_is_bounded(self, env, monkeypatch):
+        """A publish must not hang on an upstream that drops packets. The
+        resolver retries and walks tiers, so the check needs its own budget:
+        without one, a CI suite that published against unreachable upstreams
+        went from six seconds to seventy in a single file."""
+        import asyncio
+
+        from app.config import settings
+        from app.services import ownership
+
+        monkeypatch.setattr(settings, "publish_shadow_check_timeout_seconds", 0.2)
+
+        class Hanging:
+            def __init__(self, _session):
+                pass
+
+            async def resolve(self, *_a, **_k):
+                await asyncio.sleep(30)
+
+        monkeypatch.setattr("app.services.resolver.Resolver", Hanging)
+
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(ownership.ShadowCheckUnavailable):
+            await ownership._resolves_upstream(None, Ecosystem.npm, "anything")
+        assert asyncio.get_running_loop().time() - started < 5
 
 
 class TestOwnership:

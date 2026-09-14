@@ -21,6 +21,7 @@ Rule 1 is what makes this different from a plain registry: on npm, publishing
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import logging
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from ..core.naming import normalize_name_for
 from ..models import Ecosystem, Package, RetiredVersion, User
 from .policy import PolicyEngine
@@ -36,6 +38,10 @@ log = logging.getLogger(__name__)
 
 #: Setting key holding the private-namespace patterns.
 KEY_PUBLISH_NAMESPACES = "publish_namespaces"
+
+
+class ShadowCheckUnavailable(Exception):
+    """Could not determine whether the name already exists upstream."""
 
 
 class PublishDenied(Exception):
@@ -85,18 +91,25 @@ async def _resolves_upstream(session: AsyncSession, ecosystem: Ecosystem, name: 
     name that collides with a *public* package the registry has simply never
     been asked for yet.
 
-    A resolution error is treated as "not found" deliberately. Failing the
-    publish because an upstream is briefly down would be a worse trade than
-    accepting a name that will, at worst, be caught by the cached-row check
-    on the next attempt.
+    Bounded by its own timeout rather than the resolver's. The resolver
+    retries each upstream and walks tiers, so on a network that drops packets
+    instead of refusing them it can spend minutes -- which would be minutes a
+    publish hangs for.
+
+    Raises :class:`ShadowCheckUnavailable` when it cannot tell, rather than
+    reporting "not found". Answering "no" on a timeout would mean a slow
+    upstream is all it takes to publish a name that shadows a public package,
+    which is the one outcome this check exists to prevent.
     """
     from .resolver import Resolver
 
     try:
-        result = await Resolver(session).resolve(ecosystem, name)
-    except Exception:
-        log.warning("upstream shadow check failed for %s:%s", ecosystem.value, name)
-        return False
+        async with asyncio.timeout(settings.publish_shadow_check_timeout_seconds):
+            result = await Resolver(session).resolve(ecosystem, name)
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        raise ShadowCheckUnavailable("upstreams did not answer in time") from exc
+    except Exception as exc:
+        raise ShadowCheckUnavailable(str(exc)) from exc
     return result is not None
 
 
@@ -147,13 +160,24 @@ async def authorize_publish(
 
     # Brand new name here. Make sure it is not a public package we simply have
     # not been asked for yet.
-    if not reserved and check_upstream and await _resolves_upstream(
-        session, ecosystem, display_name
-    ):
-        raise PublishDenied(
-            f"'{display_name}' already exists in an upstream registry. Publishing it "
-            "here would shadow the upstream package for everyone using this mirror."
-        )
+    if not reserved and check_upstream:
+        try:
+            exists_upstream = await _resolves_upstream(session, ecosystem, display_name)
+        except ShadowCheckUnavailable as exc:
+            log.warning(
+                "shadow check unavailable for %s:%s -- %s", ecosystem.value, display_name, exc
+            )
+            raise PublishDenied(
+                f"could not check whether '{display_name}' already exists upstream "
+                f"({exc}). Refusing rather than risk shadowing a public package; "
+                "retry once the upstreams are reachable.",
+                status_code=503,
+            ) from exc
+        if exists_upstream:
+            raise PublishDenied(
+                f"'{display_name}' already exists in an upstream registry. Publishing it "
+                "here would shadow the upstream package for everyone using this mirror."
+            )
     return PublishGrant(package=None, owner_user_id=user_id, is_new_name=True)
 
 

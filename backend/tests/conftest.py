@@ -27,6 +27,45 @@ from app.models import DistTag, Ecosystem, Package, PackageFile, PackageVersion
 from app.services.storage import BlobStore, set_store
 
 
+@pytest.fixture(autouse=True)
+def no_real_network(monkeypatch):
+    """Fail fast if a test tries to reach the network for real.
+
+    Everything outbound is supposed to be mocked with respx, which intercepts
+    above the socket layer and so is unaffected by this. A call that gets
+    past respx used to leave the suite waiting on connect timeouts and
+    retries -- a publish now checks whether the name already resolves
+    upstream, and three provenance tests configure `.example` upstreams and
+    then publish. On a developer machine DNS says NXDOMAIN instantly and
+    nobody notices; on a CI network that blackholes instead, the same tests
+    hung for twenty-five minutes.
+
+    Failing loudly, naming the host, is much easier to act on than a hang.
+    """
+    import ipaddress
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def guard(host, *args, **kwargs):
+        name = host.decode() if isinstance(host, bytes) else host
+        if name in ("localhost", "", None):
+            return real_getaddrinfo(host, *args, **kwargs)
+        try:
+            # A literal address resolves locally without touching the network,
+            # and the SSRF guard's own tests hand it link-local literals on
+            # purpose. Only names need blocking.
+            ipaddress.ip_address(name)
+        except ValueError:
+            raise RuntimeError(
+                f"this test tried to resolve {name!r} for real. Mock it with "
+                "respx, or arrange the test so it does not reach the network."
+            ) from None
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", guard)
+
+
 @pytest.fixture
 def blob_store(tmp_path):
     store = BlobStore(str(tmp_path / "blobs"))

@@ -270,6 +270,12 @@ class TestProvenanceEndpoint:
         assert npmjs["index_url"] == "https://registry.npmjs.org/shared"
 
     async def test_entries_are_ordered_by_tier(self, client):
+        # Publish before the upstreams exist: publishing a name the registry
+        # has not seen consults them to make sure it is not shadowing a public
+        # package, and these are unreachable placeholders.
+        await client.put("/npm/ordered", json=publish_body("ordered", "1.0.0"))
+        await client.put("/npm/ordered", json=publish_body("ordered", "2.0.0"))
+
         async with db_module.session_scope() as session:
             session.add_all(
                 [
@@ -283,8 +289,6 @@ class TestProvenanceEndpoint:
                     ),
                 ]
             )
-        await client.put("/npm/ordered", json=publish_body("ordered", "1.0.0"))
-        await client.put("/npm/ordered", json=publish_body("ordered", "2.0.0"))
 
         from sqlalchemy import update
 
@@ -303,6 +307,11 @@ class TestProvenanceEndpoint:
         assert [u["name"] for u in remote] == ["tier-one", "tier-three"]
 
     async def test_deleted_upstream_is_reported_not_dropped(self, client):
+        # Publish before the upstreams exist: publishing a name the registry
+        # has not seen consults them to make sure it is not shadowing a public
+        # package, and these are unreachable placeholders.
+        await client.put("/npm/orphan", json=publish_body("orphan", "1.0.0"))
+
         async with db_module.session_scope() as session:
             session.add(
                 Upstream(
@@ -310,7 +319,6 @@ class TestProvenanceEndpoint:
                     kind=UpstreamKind.npm, url="https://t.example", tier=1,
                 )
             )
-        await client.put("/npm/orphan", json=publish_body("orphan", "1.0.0"))
 
         from sqlalchemy import delete, update
 

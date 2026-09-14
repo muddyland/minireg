@@ -124,6 +124,10 @@ class Settings(BaseSettings):
     upstream_retries: int = 2
     # A tier is exhausted before the next one is tried.
     upstream_tier_parallel: bool = True
+    # Budget for the "does this name already exist upstream?" check on a
+    # publish. The resolver retries and walks tiers, so without its own bound
+    # a publish can hang for minutes when upstreams are unreachable.
+    publish_shadow_check_timeout_seconds: float = 10.0
 
     # --- OSV / CVE ----------------------------------------------------------
     osv_enabled: bool = True
