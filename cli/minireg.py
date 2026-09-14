@@ -650,6 +650,37 @@ def discover(root: Path) -> list[tuple[Path, str, list[dict]]]:
     return found
 
 
+#: Packages per audit request. The server scans at most this many
+#: previously-unseen versions on demand in one call, so sending a bigger
+#: lockfile in a single request leaves the tail of it permanently unscanned
+#: -- a 520-package lockfile came back with 20 "could not be checked" every
+#: time, which fails a strict CI gate for a reason nobody can act on.
+AUDIT_CHUNK = 500
+
+
+def audit_request(registry, token, ecosystem, packages, args) -> dict:
+    """Audit a dependency set, in chunks the server can scan in full."""
+    merged = {"ecosystem": ecosystem, "checked": 0, "findings": [], "unscanned": [], "unscanned_total": 0}
+    for start in range(0, len(packages), AUDIT_CHUNK):
+        chunk = packages[start : start + AUDIT_CHUNK]
+        result = api(
+            registry,
+            "/api/cli/audit",
+            "POST",
+            {"ecosystem": ecosystem, "packages": chunk, "scan_unknown": not args.offline},
+            token=token,
+            timeout=180,
+            insecure=args.insecure,
+        )
+        merged["checked"] += result.get("checked") or 0
+        merged["findings"].extend(result.get("findings") or [])
+        merged["unscanned"].extend(result.get("unscanned") or [])
+        merged["unscanned_total"] += result.get("unscanned_total") or 0
+    merged["findings"].sort(key=lambda f: (f.get("max_cvss") or 0, f.get("blocked")), reverse=True)
+    merged["unscanned"] = merged["unscanned"][:50]
+    return merged
+
+
 def cmd_audit(args):
     registry = require_registry(args)
     token = require_token()
@@ -710,15 +741,7 @@ def cmd_audit(args):
         )
 
         try:
-            result = api(
-                registry,
-                "/api/cli/audit",
-                "POST",
-                {"ecosystem": ecosystem, "packages": packages, "scan_unknown": not args.offline},
-                token=token,
-                timeout=180,
-                insecure=args.insecure,
-            )
+            result = audit_request(registry, token, ecosystem, packages, args)
         except ApiError as exc:
             if exc.status == 401:
                 die("not logged in. Run: minireg login")

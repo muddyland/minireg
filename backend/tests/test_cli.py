@@ -4,6 +4,7 @@ Also covers the CLI's own lockfile parsers, which are pure functions in the
 shipped script.
 """
 
+import argparse
 import base64
 import importlib.util
 import json
@@ -1252,3 +1253,63 @@ class TestLockfileDiscovery:
         backend = pathlib.Path(__file__).resolve().parents[1]
         found = {path.name for path, _eco, _pkgs in cli.discover(backend)}
         assert "requirements.lock" in found
+
+
+class TestAuditChunking:
+    """Large lockfiles are audited in pieces.
+
+    The server scans at most `MAX_ON_DEMAND_SCAN` previously-unseen versions
+    per request, so sending a whole big lockfile in one call left the tail of
+    it permanently unscanned. A 520-package frontend came back with 20
+    "could not be checked" on every run, which fails a strict CI gate for a
+    reason nobody can act on.
+    """
+
+    def test_chunk_size_matches_the_servers_scan_cap(self):
+        from app.api.cli import MAX_ON_DEMAND_SCAN
+
+        assert cli.AUDIT_CHUNK <= MAX_ON_DEMAND_SCAN, (
+            "a chunk larger than the server will scan on demand leaves part "
+            "of it unscanned"
+        )
+
+    def test_a_large_lockfile_is_split_across_requests(self, monkeypatch):
+        sent = []
+
+        def fake_api(registry, path, method="GET", body=None, **kwargs):
+            sent.append(len(body["packages"]))
+            return {
+                "ecosystem": body["ecosystem"],
+                "checked": len(body["packages"]),
+                "findings": [],
+                "unscanned": [],
+                "unscanned_total": 0,
+            }
+
+        monkeypatch.setattr(cli, "api", fake_api)
+        packages = [{"name": f"p{i}", "version": "1.0.0"} for i in range(1200)]
+        args = argparse.Namespace(offline=False, insecure=False)
+
+        merged = cli.audit_request("http://reg", "tok", "npm", packages, args)
+        assert sent == [500, 500, 200]
+        assert merged["checked"] == 1200
+
+    def test_results_are_merged_not_overwritten(self, monkeypatch):
+        batches = [
+            {"checked": 500, "findings": [{"name": "a", "max_cvss": 9.1, "blocked": False}],
+             "unscanned": [{"name": "u1"}], "unscanned_total": 1},
+            {"checked": 20, "findings": [{"name": "b", "max_cvss": 4.0, "blocked": False}],
+             "unscanned": [], "unscanned_total": 0},
+        ]
+
+        def fake_api(*_a, **_k):
+            return batches.pop(0)
+
+        monkeypatch.setattr(cli, "api", fake_api)
+        packages = [{"name": f"p{i}", "version": "1.0.0"} for i in range(520)]
+        args = argparse.Namespace(offline=False, insecure=False)
+
+        merged = cli.audit_request("http://reg", "tok", "npm", packages, args)
+        assert [f["name"] for f in merged["findings"]] == ["a", "b"]  # worst first
+        assert merged["unscanned_total"] == 1
+        assert merged["checked"] == 520
