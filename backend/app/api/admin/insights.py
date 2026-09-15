@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 import orjson
@@ -16,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer, selectinload
 
 from ...core.deps import Identity, client_ip, require_admin
-from ...core.naming import order_version_rows
+from ...core.naming import normalize_name_for, normalize_version_for, order_version_rows
 from ...db import get_session, session_scope
 from ...models import (
     AuditLog,
@@ -401,6 +402,85 @@ async def audit_actions(session: AsyncSession = Depends(get_session)) -> dict:
     return {"actions": [{"action": a, "count": c} for a, c in rows]}
 
 
+#: Requests resolved per score lookup. A page may ask for a thousand rows, and
+#: SQLite caps how many bind parameters one statement may carry, so the lookup
+#: is chunked instead of sent as one enormous IN list.
+SCORE_LOOKUP_CHUNK = 200
+
+
+async def _scores_for_requests(
+    session: AsyncSession, rows: Sequence[DownloadLog]
+) -> dict[tuple[str, str, str], tuple[float | None, bool]]:
+    """Worst CVSS for each exact (ecosystem, package, version) a row names.
+
+    Scored per requested version rather than per package, because the question
+    this page answers is whether *that* download carried a known
+    vulnerability. A row naming no version -- a metadata lookup is a request
+    for the package, not for any one release -- gets no score at all instead
+    of borrowing the worst score in the package's history.
+
+    Matched by normalized name and version instead of joined: the log
+    deliberately carries no foreign keys, since it is append-only and outlives
+    the packages it mentions. Values are (worst score, whether the version has
+    been scanned), so a release known to be clean can be told apart from one
+    nothing has looked at yet.
+    """
+    wanted = {
+        (
+            str(r.ecosystem),
+            normalize_name_for(r.ecosystem, r.package_name),
+            normalize_version_for(r.ecosystem, r.version),
+        )
+        for r in rows
+        if r.version
+    }
+    if not wanted:
+        return {}
+
+    found: dict[tuple[str, str, str], tuple[float | None, bool]] = {}
+    ordered = sorted(wanted)
+    for start in range(0, len(ordered), SCORE_LOOKUP_CHUNK):
+        chunk = set(ordered[start : start + SCORE_LOOKUP_CHUNK])
+        result = await session.execute(
+            # Columns, not entities: the package row carries the whole cached
+            # packument, which is the last thing this page needs to load.
+            select(
+                Package.ecosystem,
+                Package.normalized_name,
+                PackageVersion.normalized_version,
+                PackageVersion.max_cvss,
+                PackageVersion.scanned_at,
+            )
+            .join(PackageVersion, PackageVersion.package_id == Package.id)
+            .where(
+                Package.normalized_name.in_({name for _, name, _ in chunk}),
+                PackageVersion.normalized_version.in_({version for *_, version in chunk}),
+            )
+        )
+        for ecosystem, name, version, score, scanned_at in result:
+            # Two independent IN lists match a superset -- one package's name
+            # paired with another's version -- so the exact triples asked for
+            # are picked back out here.
+            key = (str(ecosystem), name, version)
+            if key in chunk:
+                found[key] = (score, scanned_at is not None)
+    return found
+
+
+def _score_fields(
+    row: DownloadLog, scores: dict[tuple[str, str, str], tuple[float | None, bool]]
+) -> dict:
+    if not row.version:
+        return {"max_cvss": None, "scanned": False}
+    key = (
+        str(row.ecosystem),
+        normalize_name_for(row.ecosystem, row.package_name),
+        normalize_version_for(row.ecosystem, row.version),
+    )
+    score, scanned = scores.get(key, (None, False))
+    return {"max_cvss": score, "scanned": scanned}
+
+
 @router.get("/downloads")
 async def list_downloads(
     limit: int = Query(default=100, ge=1, le=1000),
@@ -432,6 +512,8 @@ async def list_downloads(
         )
     ).scalars().all()
 
+    scores = await _scores_for_requests(session, rows)
+
     return {
         "total": total,
         "entries": [
@@ -450,6 +532,7 @@ async def list_downloads(
                 "cache_hit": r.cache_hit,
                 "status": r.status,
                 "duration_ms": r.duration_ms,
+                **_score_fields(r, scores),
             }
             for r in rows
         ],
@@ -475,7 +558,9 @@ STREAM_HEARTBEAT_SECONDS = 15.0
 STREAM_MAX_SECONDS = 3600.0
 
 
-def _download_row(row: DownloadLog) -> dict:
+def _download_row(
+    row: DownloadLog, scores: dict[tuple[str, str, str], tuple[float | None, bool]]
+) -> dict:
     return {
         "id": row.id,
         "ts": row.ts.isoformat() if row.ts else None,
@@ -491,6 +576,7 @@ def _download_row(row: DownloadLog) -> dict:
         "cache_hit": row.cache_hit,
         "status": row.status,
         "duration_ms": row.duration_ms,
+        **_score_fields(row, scores),
     }
 
 
@@ -574,10 +660,13 @@ async def stream_downloads(
                             .limit(STREAM_BATCH)
                         )
                     ).scalars().all()
+                    # Resolved here, while the poll's session is still open:
+                    # the rows are detached as soon as this block exits.
+                    scores = await _scores_for_requests(session, rows)
 
                 if rows:
                     cursor = rows[-1].id
-                    payload = orjson.dumps([_download_row(r) for r in rows]).decode()
+                    payload = orjson.dumps([_download_row(r, scores) for r in rows]).decode()
                     yield f"event: downloads\ndata: {payload}\n\n"
                     last_sent = time.monotonic()
                 elif time.monotonic() - last_sent > STREAM_HEARTBEAT_SECONDS:

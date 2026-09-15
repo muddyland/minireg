@@ -247,6 +247,13 @@ Eight tails may be open at once; beyond that the endpoint answers `429`. Each
 one polls rather than holding a database connection open, so a page left open
 costs a query a second, not a connection.
 
+Rows from either carry `max_cvss` and `scanned` for the exact version that was
+requested: `max_cvss` is the worst score known to affect that release, and
+`scanned` says whether it has been scanned at all, so a release known to be
+clean is distinguishable from one nothing has looked at. A request naming no
+version -- a metadata lookup -- gets `null` and `false`, rather than the
+package's worst score across its history.
+
 **Metrics** — `GET /api/metrics`. Request counts by status class, and counters
 for the failures that are otherwise silent: CVE scans that timed out and were
 served unscanned, and OSV batches that failed.

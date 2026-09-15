@@ -225,3 +225,137 @@ class TestConnectionUse:
         source = inspect.getsource(insights.stream_downloads)
         assert "session_scope()" in source, "the tail should open its own short sessions"
         assert "Depends(get_session)" not in source
+
+
+async def seed_version(
+    ecosystem: str,
+    name: str,
+    version: str,
+    *,
+    max_cvss: float | None = None,
+    scanned: bool = True,
+):
+    """A cached version with a scan verdict, for the score lookup to find."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from app.core.naming import normalize_name_for, normalize_version_for
+    from app.models import Ecosystem, Package, PackageVersion
+
+    normalized = normalize_name_for(ecosystem, name)
+    async with db_module.session_scope() as session:
+        package = (
+            await session.execute(
+                select(Package).where(
+                    Package.ecosystem == Ecosystem(ecosystem),
+                Package.normalized_name == normalized,
+                )
+            )
+        ).scalar_one_or_none()
+        if package is None:
+            package = Package(
+                ecosystem=Ecosystem(ecosystem), name=name, normalized_name=normalized
+            )
+            session.add(package)
+            await session.flush()
+        session.add(
+            PackageVersion(
+                package_id=package.id,
+                version=version,
+                normalized_version=normalize_version_for(ecosystem, version),
+                max_cvss=max_cvss,
+                scanned_at=datetime.now(UTC) if scanned else None,
+            )
+        )
+
+
+async def one_entry(client, **params):
+    response = await client.get("/api/admin/downloads", params=params)
+    assert response.status_code == 200
+    (entry,) = response.json()["entries"]
+    return entry
+
+
+class TestRequestScores:
+    """The CVSS a request carried.
+
+    Scored against the exact version the client asked for, which is the whole
+    point: the packages table reports a package's worst score across every
+    version it has ever cached, and that number says nothing about any one
+    download.
+    """
+
+    async def test_scores_the_version_that_was_requested(self, client):
+        await seed_version("pypi", "idna", "3.6", max_cvss=7.5)
+        await seed_version("pypi", "idna", "3.18")
+        await record(ecosystem="pypi", package_name="idna", version="3.6", kind="file")
+
+        assert (await one_entry(client))["max_cvss"] == 7.5
+
+    async def test_a_clean_version_of_a_vulnerable_package_scores_nothing(self, client):
+        """The fix for what the packages table gets wrong: 3.18 is not
+        vulnerable just because 3.6 was."""
+        await seed_version("pypi", "idna", "3.6", max_cvss=7.5)
+        await seed_version("pypi", "idna", "3.18")
+        await record(ecosystem="pypi", package_name="idna", version="3.18", kind="file")
+
+        entry = await one_entry(client)
+        assert entry["max_cvss"] is None
+        assert entry["scanned"] is True
+
+    async def test_an_unscanned_version_is_not_reported_as_clean(self, client):
+        await seed_version("pypi", "idna", "3.18", scanned=False)
+        await record(ecosystem="pypi", package_name="idna", version="3.18", kind="file")
+
+        entry = await one_entry(client)
+        assert entry["max_cvss"] is None
+        assert entry["scanned"] is False
+
+    async def test_a_metadata_lookup_carries_no_score(self, client):
+        """A metadata request names no release, so lending it the package's
+        worst score would claim a vulnerability nobody downloaded."""
+        await seed_version("pypi", "idna", "3.6", max_cvss=7.5)
+        await record(ecosystem="pypi", package_name="idna", version=None, kind="metadata")
+
+        entry = await one_entry(client)
+        assert entry["max_cvss"] is None
+        assert entry["scanned"] is False
+
+    async def test_matches_through_name_and_version_normalization(self, client):
+        """The log stores what the client asked for; the tables store the
+        normalized form. `Jinja_2`/`2.11.0-RC1` has to find `jinja-2`/
+        `2.11.0rc1`, or every pip client spelling its own way goes unscored."""
+        await seed_version("pypi", "jinja-2", "2.11.0rc1", max_cvss=9.8)
+        await record(
+            ecosystem="pypi", package_name="Jinja_2", version="2.11.0-RC1", kind="file"
+        )
+
+        assert (await one_entry(client))["max_cvss"] == 9.8
+
+    async def test_does_not_borrow_another_packages_score(self, client):
+        """The lookup narrows by name and by version separately, so a version
+        string shared with a vulnerable package must not bleed across."""
+        await seed_version("npm", "vulnerable-pkg", "1.0.0", max_cvss=9.1)
+        await seed_version("npm", "innocent-pkg", "1.0.0")
+        await record(ecosystem="npm", package_name="innocent-pkg", version="1.0.0", kind="file")
+
+        assert (await one_entry(client))["max_cvss"] is None
+
+    async def test_an_unknown_package_scores_nothing(self, client):
+        await record(ecosystem="npm", package_name="never-cached", version="1.0.0", kind="file")
+
+        entry = await one_entry(client)
+        assert entry["max_cvss"] is None
+        assert entry["scanned"] is False
+
+    async def test_the_live_tail_scores_rows_too(self, client):
+        """Whatever the table shows, a row arriving live has to show as well,
+        or the same request changes meaning on a page refresh."""
+        await seed_version("pypi", "idna", "3.6", max_cvss=7.5)
+        await record(ecosystem="pypi", package_name="idna", version="3.6", kind="file")
+
+        body = await read_stream(client, "/api/admin/downloads/stream?since_id=0")
+        (row,) = parse_events(body)
+        assert row["max_cvss"] == 7.5
+        assert row["scanned"] is True

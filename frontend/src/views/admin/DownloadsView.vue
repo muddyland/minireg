@@ -9,7 +9,13 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import api from '@/api/client'
-import { ecosystemBadge, formatBytes, formatDateTime, relativeTime } from '@/utils/format'
+import {
+  ecosystemBadge,
+  formatBytes,
+  formatDateTime,
+  relativeTime,
+  severityClass,
+} from '@/utils/format'
 
 const entries = ref([])
 const total = ref(0)
@@ -39,6 +45,17 @@ const liveLabel = computed(
       error: 'Live disconnected',
     })[liveState.value],
 )
+
+/** Why a request shows no score. A dash means four different things here,
+ *  and which one it is decides whether an operator should care. */
+function cvssTitle(entry) {
+  if (!entry.version) return 'Metadata lookup — no single version was requested'
+  if (entry.max_cvss !== null && entry.max_cvss !== undefined) {
+    return `Worst known CVSS affecting ${entry.package_name} ${entry.version}`
+  }
+  if (entry.scanned) return `No known vulnerabilities in ${entry.package_name} ${entry.version}`
+  return 'This version has not been scanned'
+}
 
 function queryParams() {
   return {
@@ -202,6 +219,7 @@ onBeforeUnmount(stopStream)
               <th>When</th>
               <th>Package</th>
               <th>Version</th>
+              <th>CVSS</th>
               <th>Type</th>
               <th>User</th>
               <th>IP</th>
@@ -222,6 +240,17 @@ onBeforeUnmount(stopStream)
                 {{ entry.package_name }}
               </td>
               <td class="mono small">{{ entry.version || '—' }}</td>
+              <td :title="cvssTitle(entry)">
+                <span
+                  v-if="entry.max_cvss !== null && entry.max_cvss !== undefined"
+                  class="sev"
+                  :class="severityClass(entry.max_cvss)"
+                >
+                  {{ entry.max_cvss.toFixed(1) }}
+                </span>
+                <span v-else-if="entry.version && entry.scanned" class="faint">ok</span>
+                <span v-else class="faint">—</span>
+              </td>
               <td><span class="badge">{{ entry.kind }}</span></td>
               <td class="small">{{ entry.username || 'anonymous' }}</td>
               <td class="mono faint small">{{ entry.ip || '—' }}</td>
