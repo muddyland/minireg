@@ -300,3 +300,9 @@ project against itself.
 - **The PyPI index lists only known projects.** Use **Upstreams → Index** to
   populate search from an upstream.
 - **`yanked` is PyPI-only** — npm has no equivalent concept.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).

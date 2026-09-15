@@ -2,6 +2,7 @@
 name = "minireg"
 version = "1.0.0"
 description = "Caching npm + PyPI + cargo package registry with tiered upstreams, OIDC, and CVE policy"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
@@ -40,7 +41,7 @@ testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
