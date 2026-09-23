@@ -165,11 +165,9 @@ docker compose exec postgres psql -U minireg -d minireg -c \
 
 ### SSO signs in but nobody is an admin
 
-The groups scope mapping is missing from the Authentik provider. Without it,
-group membership never reaches the registry and `OIDC_ADMIN_GROUP` matches
-nothing.
-
-Check what actually arrived — the OIDC login audit entry records the groups:
+Either no groups reached the registry, or they arrived under names that do not
+look like the one configured. Check what actually arrived first — the OIDC
+login audit entry records the groups:
 
 ```bash
 curl -s -H "authorization: Bearer $TOKEN" \
@@ -177,13 +175,30 @@ curl -s -H "authorization: Bearer $TOKEN" \
   jq '.entries[0].detail'
 ```
 
-An empty `groups` array confirms it. Add a groups scope mapping to the provider
-and include it in the application's scopes.
+An **empty `groups` array** means the provider is not sending them. On Kanidm
+the `groups` scope is missing from `OIDC_SCOPES` or from the client's scope
+map; on Authentik the provider has no groups scope mapping, or the application
+does not include it.
+
+**Groups present but still nobody is an admin** means the names do not match.
+Kanidm sends SPNs (`minireg-admins@idm.example.com`) and group UUIDs, so an
+`OIDC_ADMIN_GROUP` of `minireg-admins` matches the SPN, but one written for a
+*different* realm matches nothing — a configured SPN is compared whole.
+Matching is exact either way: `admins` never matches `not-admins`.
+
+### SSO fails with HTTP 401 at the token endpoint
+
+This reads like a wrong client secret and usually is not. Some providers
+(Kanidm) accept only HTTP Basic at the token endpoint, and answer a
+body-posted secret with the same 401 as a bad one. minireg reads
+`token_endpoint_auth_methods_supported` from the discovery document and uses
+Basic unless the provider says otherwise, so the error message names the method
+it used — check that line before rotating anything.
 
 ### SSO redirect fails
 
 The redirect URI must be exactly
-`{PUBLIC_URL}/api/auth/oidc/callback` and registered in Authentik verbatim,
+`{PUBLIC_URL}/api/auth/oidc/callback` and registered at the provider verbatim,
 including scheme and any port.
 
 ### CLI login never completes

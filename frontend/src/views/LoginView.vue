@@ -102,7 +102,7 @@ onMounted(() => auth.loadOidcStatus())
             <div class="divider"><span>or</span></div>
             <button class="btn btn-block control-lg" @click="ssoLogin">
               <BrandMark :size="16" :tile="false" />
-              Sign in with SSO
+              {{ auth.oidc.label || 'Sign in with SSO' }}
             </button>
           </template>
         </div>

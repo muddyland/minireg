@@ -93,14 +93,27 @@ class Settings(BaseSettings):
     bootstrap_admin_password: str | None = None
     bootstrap_admin_email: str = "admin@localhost"
 
-    # --- OIDC (Authentik) ---------------------------------------------------
+    # --- OIDC ---------------------------------------------------------------
+    # Provider-agnostic: past the issuer and the client credentials, the
+    # endpoints, the signing keys and the client-authentication method all come
+    # from the discovery document. Tested with Kanidm and Authentik.
     oidc_enabled: bool = False
-    oidc_issuer: str | None = None  # e.g. https://authentik.example.com/application/o/minireg/
+    # Kanidm:    https://idm.example.com/oauth2/openid/minireg
+    # Authentik: https://authentik.example.com/application/o/minireg/
+    oidc_issuer: str | None = None
     oidc_client_id: str | None = None
     oidc_client_secret: str | None = None
-    oidc_scopes: str = "openid profile email"
-    # Authentik ships groups in the `groups` claim when the scope is mapped.
+    # The provider's name on the sign-in button ("Sign in with Kanidm").
+    # Cosmetic; nothing matches on it.
+    oidc_display_name: str = "SSO"
+    # `groups` is requested because Kanidm emits the groups claim only for that
+    # scope, and OIDC_ADMIN_GROUP is useless without it. Authentik gets groups
+    # from a scope mapping instead, so the extra scope plays no part there.
+    # Drop it for a provider that rejects scopes it does not recognise.
+    oidc_scopes: str = "openid profile email groups"
     oidc_groups_claim: str = "groups"
+    # Kanidm names groups by SPN ("minireg-admins@idm.example.com"); a bare
+    # name here matches that too. See services/oidc.py.
     oidc_admin_group: str = "minireg-admins"
     oidc_user_group: str | None = None  # if set, membership is required to log in
     oidc_auto_create_users: bool = True

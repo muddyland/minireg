@@ -386,10 +386,15 @@ async def revoke_token(
 # --------------------------------------------------------------------------- #
 @router.get("/oidc/status")
 async def oidc_status() -> dict:
+    name = (settings.oidc_display_name or "").strip() or "SSO"
     return {
         "enabled": settings.oidc_enabled,
         "issuer": settings.oidc_issuer if settings.oidc_enabled else None,
         "login_url": "/api/auth/oidc/login" if settings.oidc_enabled else None,
+        # The button's text is composed here rather than in the SPA, so a blank
+        # display name can never render a button reading "Sign in with".
+        "display_name": name,
+        "label": f"Sign in with {name}",
     }
 
 

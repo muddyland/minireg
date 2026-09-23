@@ -5,7 +5,7 @@ import api from '@/api/client'
 export const useAuthStore = defineStore('auth', () => {
   const user = ref(null)
   const scopes = ref([])
-  const oidc = ref({ enabled: false, login_url: null })
+  const oidc = ref({ enabled: false, login_url: null, display_name: 'SSO', label: 'Sign in with SSO' })
   // `null` means "we have not checked yet", which is different from "logged
   // out" -- the router must wait rather than bounce the user to /login.
   const ready = ref(false)
@@ -34,7 +34,7 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       oidc.value = await api.oidcStatus()
     } catch {
-      oidc.value = { enabled: false, login_url: null }
+      oidc.value = { enabled: false, login_url: null, display_name: 'SSO', label: 'Sign in with SSO' }
     }
   }
 

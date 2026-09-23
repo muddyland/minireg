@@ -258,33 +258,87 @@ manually if you want the link.
 
 An account with no password is SSO-only.
 
-### OIDC / Authentik
+### OIDC
+
+Any compliant provider — tested with [Kanidm](https://kanidm.com/) and
+[Authentik](https://goauthentik.io/). Past the issuer and the client
+credentials nothing is provider-specific: the endpoints, the signing keys and
+the client-authentication method are read from the discovery document.
 
 ```env
 OIDC_ENABLED=true
-OIDC_ISSUER=https://authentik.example.com/application/o/minireg/
+OIDC_ISSUER=https://idm.example.com/oauth2/openid/minireg
 OIDC_CLIENT_ID=...
 OIDC_CLIENT_SECRET=...
+OIDC_DISPLAY_NAME=Kanidm       # sign-in button: "Sign in with Kanidm"
+OIDC_SCOPES=openid profile email groups
 OIDC_ADMIN_GROUP=minireg-admins
-OIDC_USER_GROUP=              # blank = anyone the IdP authenticates
+OIDC_USER_GROUP=               # blank = anyone the IdP authenticates
 OIDC_AUTO_CREATE_USERS=true
 OIDC_GROUPS_CLAIM=groups
 OIDC_USERNAME_CLAIM=preferred_username
 ```
 
-In Authentik, create an **OAuth2/OpenID Provider**:
+The issuer is per-application at both providers, spelled differently — Kanidm's
+has no trailing slash, Authentik's does. Copy it from the provider rather than
+composing it by hand.
+
+#### Getting group membership through
+
+This is the step people miss, and it fails silently: without groups,
+`OIDC_ADMIN_GROUP` matches nothing and nobody is promoted. What is needed
+differs by provider:
+
+| | |
+|---|---|
+| **Kanidm** | The `groups` scope must be requested — it is in the default `OIDC_SCOPES` — and the group must be in the client's scope map. |
+| **Authentik** | A **groups scope mapping** on the provider, included in the application's scopes. The scope named `groups` plays no part; drop it from `OIDC_SCOPES` if your provider rejects scopes it does not recognise. |
+
+minireg reads groups from both the ID token and the userinfo endpoint, since
+Authentik's placement varies by configuration.
+
+**Group names.** `OIDC_ADMIN_GROUP` and `OIDC_USER_GROUP` are matched against
+each entry of the claim exactly — never as a substring, so `admins` does not
+match `not-admins`. Kanidm names groups by SPN, so both forms work:
+
+| Configured value | Matches |
+|---|---|
+| `minireg-admins` | `minireg-admins`, `minireg-admins@idm.example.com` |
+| `minireg-admins@idm.example.com` | that SPN only — not the same name in another realm |
+
+<details>
+<summary>Kanidm client</summary>
+
+```sh
+kanidm system oauth2 create minireg "minireg" https://registry.example.com
+kanidm system oauth2 add-redirect-url minireg \
+    https://registry.example.com/api/auth/oidc/callback
+kanidm system oauth2 update-scope-map minireg minireg-admins \
+    openid profile email groups
+# Hand out "alice" rather than "alice@idm.example.com" as the username.
+kanidm system oauth2 prefer-short-username minireg
+kanidm system oauth2 show-basic-secret minireg
+```
+
+Decide `prefer-short-username` **before** anyone signs in: accounts are keyed
+on the subject, so changing it later makes a second account rather than
+renaming the first.
+
+</details>
+
+<details>
+<summary>Authentik provider</summary>
+
+Create an **OAuth2/OpenID Provider**:
 
 - **Redirect URI**: `https://registry.example.com/api/auth/oidc/callback`
 - **Signing key**: any configured certificate
 - **Scopes**: `openid`, `profile`, `email`, **plus a groups scope mapping**
 
-That last one is the step people miss. Without a groups scope mapping, group
-membership never reaches the registry, `OIDC_ADMIN_GROUP` matches nothing, and
-nobody is promoted to admin. minireg reads groups from both the ID token and
-the userinfo endpoint, since Authentik's placement varies by configuration.
+The issuer ends in a slash. Copy it from the provider's *OpenID Configuration
+Issuer* field.
 
-The issuer is per-application and ends in a slash. Copy it from the provider's
-*OpenID Configuration Issuer* field.
+</details>
 
 Group membership is re-applied on **every** sign-in, so removing someone from
 the admin group demotes them the next time they log in — you do not have to

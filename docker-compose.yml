@@ -140,11 +140,19 @@ services:
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@localhost}
 
-      # -- OIDC / Authentik ---------------------------------------------------
+      # -- OIDC ---------------------------------------------------------------
       OIDC_ENABLED: ${OIDC_ENABLED:-false}
       OIDC_ISSUER: ${OIDC_ISSUER:-}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      # Provider name on the sign-in button, e.g. "Sign in with Kanidm".
+      OIDC_DISPLAY_NAME: ${OIDC_DISPLAY_NAME:-SSO}
+      # `groups` is what makes OIDC_ADMIN_GROUP work on Kanidm; Authentik
+      # ignores the extra scope. These three were settable in config.py but
+      # not reachable here, so production was stuck on their defaults.
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email groups}
+      OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-groups}
+      OIDC_USERNAME_CLAIM: ${OIDC_USERNAME_CLAIM:-preferred_username}
       OIDC_ADMIN_GROUP: ${OIDC_ADMIN_GROUP:-minireg-admins}
       OIDC_USER_GROUP: ${OIDC_USER_GROUP:-}
       OIDC_AUTO_CREATE_USERS: ${OIDC_AUTO_CREATE_USERS:-true}

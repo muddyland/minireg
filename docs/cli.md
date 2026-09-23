@@ -57,7 +57,7 @@ This is an OAuth device-authorization flow (RFC 8628). It means:
 
 - **No password is typed into the terminal**, and the CLI never sees one.
 - **SSO works with no extra plumbing** — approval happens under whatever
-  session you already have in the browser, including Authentik.
+  session you already have in the browser, including an SSO one.
 - **No callback port** is opened on your machine, so it works over SSH and
   inside containers.
 
