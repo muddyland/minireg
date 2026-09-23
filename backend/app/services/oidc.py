@@ -29,6 +29,7 @@ Where providers differ, and what this module does about it:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -40,9 +41,10 @@ from typing import Any
 
 import jwt
 from jwt import PyJWKClient
+from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError
 
 from ..config import settings
-from ..upstreams.base import get_http_client
+from ..upstreams.base import get_http_client, user_agent
 
 log = logging.getLogger(__name__)
 
@@ -148,9 +150,29 @@ async def get_discovery() -> dict:
 
 
 def _jwk_client(jwks_uri: str) -> PyJWKClient:
+    """PyJWT's JWKS client, told who it is and given a sane timeout.
+
+    This is the one outbound request minireg does not make through its own
+    httpx pool: PyJWT fetches the key set with `urllib.request.urlopen`, which
+    identifies itself as `Python-urllib/<version>` and is on the default block
+    list of essentially every bot filter. A provider behind one answers the
+    JWKS fetch with 403 while the discovery fetch beside it -- same host, same
+    TLS, made through our pooled client -- succeeds, and the failure surfaces
+    as "id_token validation failed", which points at the token rather than at
+    the network.
+
+    So it gets the same agent string as everything else. The timeout is ours
+    too: PyJWT's default is 30 seconds, which is a long time to hold a login.
+    """
     client = _jwk_clients.get(jwks_uri)
     if client is None:
-        client = PyJWKClient(jwks_uri, cache_keys=True, lifespan=3600)
+        client = PyJWKClient(
+            jwks_uri,
+            cache_keys=True,
+            lifespan=3600,
+            headers={"user-agent": user_agent()},
+            timeout=10.0,
+        )
         _jwk_clients[jwks_uri] = client
     return client
 
@@ -252,8 +274,38 @@ async def verify_id_token(id_token: str, nonce: str) -> dict:
     if not jwks_uri:
         raise OidcError("discovery document has no jwks_uri")
 
+    # Fetching the keys and judging the token are separate failures, and they
+    # are reported separately. PyJWKClientError subclasses PyJWTError, so one
+    # `except` around both turned "Cloudflare answered the key fetch with 403"
+    # into "id_token validation failed" -- which names the token, sends you to
+    # read the provider's client config, and says nothing about the request
+    # that actually failed or the URL it went to.
     try:
-        signing_key = _jwk_client(jwks_uri).get_signing_key_from_jwt(id_token)
+        # PyJWT's JWKS fetch is a blocking urlopen, and this is an async
+        # handler on a single worker: called inline, a slow or hanging
+        # provider stalls every other request in the process, not just this
+        # login. The lookup also re-fetches once when it does not recognise
+        # the token's `kid`, which is how a provider's key rotation is picked
+        # up mid-cache -- so the blocking call is not only the cached path.
+        signing_key = await asyncio.to_thread(
+            _jwk_client(jwks_uri).get_signing_key_from_jwt, id_token
+        )
+    except PyJWKClientConnectionError as exc:
+        raise OidcError(
+            f"could not fetch the provider's signing keys from {jwks_uri}: {exc}"
+        ) from exc
+    except PyJWKClientError as exc:
+        # Reached the endpoint, but it held no key this token could have been
+        # signed with -- a stale cache, or a token from a different provider.
+        raise OidcError(f"no signing key for this id_token at {jwks_uri}: {exc}") from exc
+    except jwt.PyJWTError as exc:
+        # Selecting a key reads the token's header, so a malformed token fails
+        # here rather than at decode. Still a bad token, and still a 401: this
+        # arm exists so splitting the two blocks above cannot turn it into an
+        # unhandled 500.
+        raise OidcError(f"id_token validation failed: {exc}") from exc
+
+    try:
         claims = jwt.decode(
             id_token,
             signing_key.key,

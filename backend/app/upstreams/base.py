@@ -137,6 +137,17 @@ def _retry_after_seconds(value: str | None) -> float | None:
     return max(0.0, (parsed - datetime.now(UTC)).total_seconds())
 
 
+def user_agent() -> str:
+    """The agent string every outbound request identifies itself with.
+
+    Shared rather than composed per call site: a bot filter in front of an
+    upstream -- or in front of an identity provider -- decides on this string,
+    so a second caller with its own default is a caller that gets blocked
+    while the others work. See services/oidc.py, which hands it to PyJWT.
+    """
+    return f"{settings.app_name}/1.0 (+{settings.public_url})"
+
+
 def _build_client(verify: bool) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         verify=verify,
@@ -150,7 +161,7 @@ def _build_client(verify: bool) -> httpx.AsyncClient:
         ),
         follow_redirects=True,
         http2=True,
-        headers={"user-agent": f"{settings.app_name}/1.0 (+{settings.public_url})"},
+        headers={"user-agent": user_agent()},
     )
 
 
@@ -189,7 +200,7 @@ def get_http_client() -> httpx.AsyncClient:
             ),
             follow_redirects=True,
             http2=True,
-            headers={"user-agent": f"{settings.app_name}/1.0 (+{settings.public_url})"},
+            headers={"user-agent": user_agent()},
         )
     return _client
 

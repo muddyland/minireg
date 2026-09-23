@@ -13,6 +13,10 @@ worth pinning:
   secret, so the natural response is to rotate one that was always right.
 - **PKCE and the nonce** are already sent and already checked; they are here so
   a refactor cannot quietly drop them.
+- **The JWKS fetch's user-agent.** PyJWT fetches the key set with urllib,
+  outside our httpx pool, and a bot filter in front of the provider answers
+  `Python-urllib/...` with a 403 -- which surfaces as "id_token validation
+  failed" and reads like a problem with the token.
 """
 
 import base64
@@ -268,3 +272,97 @@ async def test_authorization_url_carries_pkce_and_the_configured_scopes(discover
 def test_the_default_scopes_ask_for_groups():
     """Without it Kanidm sends no groups claim, and OIDC_ADMIN_GROUP is dead."""
     assert "groups" in type(settings)().oidc_scopes.split()
+
+
+# --------------------------------------------------------------------------- #
+# The JWKS fetch: the one request that does not go through our httpx pool
+# --------------------------------------------------------------------------- #
+def test_jwks_client_identifies_itself_like_everything_else(configured):
+    """A bot filter in front of the provider decides on this string.
+
+    PyJWT's default is `Python-urllib/<version>`, which Cloudflare and friends
+    block by default. The discovery fetch beside it -- same host, same TLS --
+    goes through our pooled httpx client and is let through, so the failure
+    looks like a bad token rather than a blocked request.
+    """
+    from app.upstreams.base import user_agent
+
+    client = oidc._jwk_client("https://idm.example.com/keys.jwk")
+    assert client.headers["user-agent"] == user_agent()
+    assert "urllib" not in client.headers["user-agent"]
+    # PyJWT's own default is 30s, which is a long time to hold a login open.
+    assert client.timeout == 10.0
+
+
+def test_jwks_clients_are_reused_per_uri(configured):
+    """The key cache lives on the client; a fresh one per login would refetch."""
+    first = oidc._jwk_client("https://idm.example.com/keys.jwk")
+    assert oidc._jwk_client("https://idm.example.com/keys.jwk") is first
+    assert oidc._jwk_client("https://other.example.com/keys.jwk") is not first
+
+
+async def test_id_token_verification_does_not_block_the_event_loop(
+    discovery, monkeypatch
+):
+    """The JWKS fetch is a blocking urlopen; inline it stalls every request.
+
+    Asserted by recording which thread the lookup runs on: it is the loop's
+    own only if nobody handed it to a worker.
+    """
+    import threading
+
+    import jwt as pyjwt
+
+    loop_thread = threading.get_ident()
+    ran_on: list[int] = []
+
+    class _BlockingClient:
+        def get_signing_key_from_jwt(self, token):
+            ran_on.append(threading.get_ident())
+            # Stop here: the fetch is the whole point, not what follows it.
+            raise pyjwt.PyJWTError("no key")
+
+    monkeypatch.setattr(oidc, "_jwk_client", lambda uri: _BlockingClient())
+    with pytest.raises(oidc.OidcError):
+        await oidc.verify_id_token("a.b.c", "the-nonce")
+
+    assert ran_on and ran_on[0] != loop_thread
+
+
+async def test_a_blocked_key_fetch_is_not_reported_as_a_bad_token(
+    discovery, monkeypatch
+):
+    """The failure that started this: Cloudflare answered the JWKS fetch with
+    403, and it surfaced as "id_token validation failed" -- which names the
+    token and says nothing about the URL that was refused."""
+    from jwt.exceptions import PyJWKClientConnectionError
+
+    class _Blocked:
+        def get_signing_key_from_jwt(self, token):
+            raise PyJWKClientConnectionError(
+                'Fail to fetch data from the url, err: "HTTP Error 403: Forbidden"'
+            )
+
+    monkeypatch.setattr(oidc, "_jwk_client", lambda uri: _Blocked())
+    with pytest.raises(oidc.OidcError) as exc:
+        await oidc.verify_id_token("a.b.c", "the-nonce")
+
+    message = str(exc.value)
+    assert "signing keys" in message
+    assert DISCOVERY["jwks_uri"] in message
+    assert "id_token validation failed" not in message
+
+
+async def test_a_malformed_token_is_still_a_clean_failure(discovery, monkeypatch):
+    """Key selection reads the token header, so a malformed token fails in the
+    fetch block rather than at decode. It must stay an OidcError -- a 401 --
+    and not escape as an unhandled 500."""
+    import jwt as pyjwt
+
+    class _BadToken:
+        def get_signing_key_from_jwt(self, token):
+            raise pyjwt.DecodeError("Not enough segments")
+
+    monkeypatch.setattr(oidc, "_jwk_client", lambda uri: _BadToken())
+    with pytest.raises(oidc.OidcError, match="id_token validation failed"):
+        await oidc.verify_id_token("not-a-jwt", "the-nonce")
