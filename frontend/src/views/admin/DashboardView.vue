@@ -1,7 +1,8 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { ecosystemBadge, formatBytes, formatNumber, relativeTime } from '@/utils/format'
+import { formatBytes, formatNumber, relativeTime } from '@/utils/format'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const days = ref(30)
 const overview = ref(null)
@@ -188,9 +189,7 @@ onMounted(load)
           <div v-else class="bars">
             <div v-for="pkg in top" :key="`${pkg.ecosystem}:${pkg.name}`" class="bar-row">
               <div class="truncate small" :title="pkg.name">
-                <span class="badge" :class="ecosystemBadge(pkg.ecosystem)">
-                  {{ pkg.ecosystem }}
-                </span>
+                <EcosystemBadge :ecosystem="pkg.ecosystem" />
                 {{ pkg.name }}
               </div>
               <div class="bar-track">

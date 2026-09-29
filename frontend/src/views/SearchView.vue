@@ -1,12 +1,28 @@
 <script setup>
 import { onMounted, ref } from 'vue'
-import { ecosystemBadge } from '@/utils/format'
+import { useRoute } from 'vue-router'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
+import EcosystemIcon from '@/components/EcosystemIcon.vue'
+
+const ECOSYSTEM_FILTERS = [
+  { value: '', label: 'All' },
+  { value: 'npm', label: 'npm' },
+  { value: 'pypi', label: 'PyPI' },
+  { value: 'cargo', label: 'cargo' },
+]
 
 const auth = useAuthStore()
-const query = ref('')
-const ecosystem = ref('')
+const route = useRoute()
+const query = ref(route.query.q || '')
+const ecosystem = ref(ECOSYSTEM_FILTERS.some((f) => f.value === route.query.ecosystem) ? route.query.ecosystem : '')
+
+function pickEcosystem(value) {
+  if (ecosystem.value === value) return
+  ecosystem.value = value
+  run()
+}
 const includeUpstream = ref(false)
 const results = ref([])
 const total = ref(0)
@@ -54,14 +70,23 @@ onMounted(run)
           placeholder="Package name or description…"
           style="flex: 1; min-width: 220px"
         />
-        <select v-model="ecosystem" style="width: auto">
-          <option value="">All ecosystems</option>
-          <option value="npm">npm</option>
-          <option value="pypi">PyPI</option>
-          <option value="cargo">cargo</option>
-        </select>
         <button class="btn btn-primary" type="submit" :disabled="loading">Search</button>
       </form>
+      <div class="eco-filter" role="radiogroup" aria-label="Ecosystem">
+        <button
+          v-for="option in ECOSYSTEM_FILTERS"
+          :key="option.value"
+          type="button"
+          role="radio"
+          class="eco-chip"
+          :class="[option.value && `eco-${option.value}`, { active: ecosystem === option.value }]"
+          :aria-checked="ecosystem === option.value"
+          @click="pickEcosystem(option.value)"
+        >
+          <EcosystemIcon v-if="option.value" :ecosystem="option.value" :size="14" />
+          {{ option.label }}
+        </button>
+      </div>
       <label class="check small dim" style="margin-top: 0.65rem">
         <input v-model="includeUpstream" type="checkbox" @change="run" />
         Also search configured upstreams (slower; requires an ecosystem filter)
@@ -88,9 +113,7 @@ onMounted(run)
               {{ pkg.name }}
             </router-link>
             <div class="row-tight" style="margin-top: 0.3rem">
-              <span class="badge" :class="ecosystemBadge(pkg.ecosystem)">
-                {{ pkg.ecosystem }}
-              </span>
+              <EcosystemBadge :ecosystem="pkg.ecosystem" />
               <span v-if="pkg.latest_version" class="badge">{{ pkg.latest_version }}</span>
               <span v-if="pkg.is_local" class="badge badge-accent">local</span>
               <span v-if="pkg.source === 'upstream'" class="badge">upstream</span>

@@ -1,7 +1,8 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { ecosystemBadge, relativeTime } from '@/utils/format'
+import { relativeTime } from '@/utils/format'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const upstreams = ref([])
 const loading = ref(true)
@@ -211,7 +212,7 @@ onMounted(load)
     <div v-for="eco in ECOSYSTEMS" :key="eco" class="card mb">
       <div class="card-head">
         <h3>
-          <span class="badge" :class="ecosystemBadge(eco)">{{ eco }}</span>
+          <EcosystemBadge :ecosystem="eco" />
           upstreams
         </h3>
         <span class="faint small">{{ byEcosystem[eco].length }} configured</span>

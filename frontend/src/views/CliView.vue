@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const config = ref(null)
 const copied = ref(null)
@@ -132,13 +133,14 @@ minireg audit --fail-on high      # exit 2 on high or critical
 minireg audit --json              # machine readable</pre>
 
         <h4 class="small mt">Lockfiles it understands</h4>
-        <div class="row-tight">
-          <span class="badge badge-npm">package-lock.json</span>
-          <span class="badge badge-npm">npm-shrinkwrap.json</span>
-          <span class="badge badge-pypi">poetry.lock</span>
-          <span class="badge badge-pypi">uv.lock</span>
-          <span class="badge badge-pypi">Pipfile.lock</span>
-          <span class="badge badge-pypi">requirements.txt</span>
+        <div class="row-tight" style="flex-wrap: wrap">
+          <EcosystemBadge ecosystem="npm" label="package-lock.json" />
+          <EcosystemBadge ecosystem="npm" label="npm-shrinkwrap.json" />
+          <EcosystemBadge ecosystem="pypi" label="poetry.lock" />
+          <EcosystemBadge ecosystem="pypi" label="uv.lock" />
+          <EcosystemBadge ecosystem="pypi" label="Pipfile.lock" />
+          <EcosystemBadge ecosystem="pypi" label="requirements.txt" />
+          <EcosystemBadge ecosystem="cargo" label="Cargo.lock" />
         </div>
         <p class="field-hint">
           Only pinned versions can be audited — a range like <code>&gt;=4.0</code> has no single

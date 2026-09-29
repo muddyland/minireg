@@ -1,7 +1,8 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { ecosystemBadge, formatDate, severityClass } from '@/utils/format'
+import { formatDate, severityClass } from '@/utils/format'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const vulns = ref([])
 const total = ref(0)
@@ -171,9 +172,7 @@ onMounted(load)
                 <div class="faint small">{{ vuln.severity || '' }}</div>
               </td>
               <td>
-                <span class="badge" :class="ecosystemBadge(vuln.ecosystem)">
-                  {{ vuln.ecosystem }}
-                </span>
+                <EcosystemBadge :ecosystem="vuln.ecosystem" />
               </td>
               <td class="small truncate" style="max-width: 380px" :title="vuln.summary">
                 {{ vuln.summary || '—' }}
@@ -216,9 +215,7 @@ onMounted(load)
             <tbody>
               <tr v-for="entry in detail.affected" :key="entry.link_id">
                 <td>
-                  <span class="badge" :class="ecosystemBadge(entry.ecosystem)">
-                    {{ entry.ecosystem }}
-                  </span>
+                  <EcosystemBadge :ecosystem="entry.ecosystem" />
                   {{ entry.package }}
                 </td>
                 <td class="mono">{{ entry.version }}</td>

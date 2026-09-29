@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import BrandMark from '@/components/BrandMark.vue'
+import EcosystemIcon from '@/components/EcosystemIcon.vue'
 import NavIcon from '@/components/NavIcon.vue'
 import { useAuthStore } from '@/stores/auth'
 
@@ -31,16 +32,24 @@ onMounted(() => auth.loadOidcStatus())
 
   <div v-else-if="auth.ready" class="app-shell">
     <aside class="sidebar">
-      <div class="brand">
+      <router-link class="brand" :to="{ name: 'home' }">
         <BrandMark :size="30" />
         <div>
           <div class="brand-name">minireg</div>
-          <div class="faint" style="font-size: 0.7rem">npm + pypi + cargo registry</div>
+          <div class="brand-ecos">
+            <EcosystemIcon ecosystem="npm" class="eco-npm" :size="11" />
+            <EcosystemIcon ecosystem="pypi" class="eco-pypi" :size="11" />
+            <EcosystemIcon ecosystem="cargo" class="eco-cargo" :size="11" />
+            <span class="faint">npm · PyPI · cargo</span>
+          </div>
         </div>
-      </div>
+      </router-link>
 
       <nav class="nav">
         <div class="nav-section">Browse</div>
+        <router-link class="nav-link" :to="{ name: 'home' }">
+          <NavIcon name="home" /> Home
+        </router-link>
         <router-link class="nav-link" :to="{ name: 'search' }">
           <NavIcon name="search" /> Search
         </router-link>

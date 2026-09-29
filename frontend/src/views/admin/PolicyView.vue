@@ -1,7 +1,8 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import api from '@/api/client'
-import { ecosystemBadge, formatDate } from '@/utils/format'
+import { formatDate } from '@/utils/format'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const rules = ref([])
 const settings = ref(null)
@@ -282,9 +283,7 @@ onMounted(load)
               <tr v-for="rule in blockRules" :key="rule.id" :style="rule.enabled ? '' : 'opacity:.5'">
                 <td class="mono">{{ rule.pattern }}</td>
                 <td>
-                  <span class="badge" :class="rule.ecosystem ? ecosystemBadge(rule.ecosystem) : ''">
-                    {{ rule.ecosystem || 'all' }}
-                  </span>
+                  <EcosystemBadge :ecosystem="rule.ecosystem" />
                 </td>
                 <td class="mono small">
                   {{ rule.version_spec || 'all' }}

@@ -1,6 +1,8 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import api from '@/api/client'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
+import EcosystemIcon from '@/components/EcosystemIcon.vue'
 
 const config = ref(null)
 const tab = ref('npm')
@@ -37,9 +39,15 @@ onMounted(async () => {
 
   <template v-else>
     <div class="tabs">
-      <button class="tab" :class="{ active: tab === 'npm' }" @click="tab = 'npm'">npm / yarn / pnpm</button>
-      <button class="tab" :class="{ active: tab === 'pip' }" @click="tab = 'pip'">pip / uv / poetry</button>
-      <button v-if="config.cargo" class="tab" :class="{ active: tab === 'cargo' }" @click="tab = 'cargo'">cargo</button>
+      <button class="tab" :class="{ active: tab === 'npm' }" @click="tab = 'npm'">
+        <EcosystemIcon ecosystem="npm" class="tab-icon eco-npm" /> npm / yarn / pnpm
+      </button>
+      <button class="tab" :class="{ active: tab === 'pip' }" @click="tab = 'pip'">
+        <EcosystemIcon ecosystem="pypi" class="tab-icon eco-pypi" /> pip / uv / poetry
+      </button>
+      <button v-if="config.cargo" class="tab" :class="{ active: tab === 'cargo' }" @click="tab = 'cargo'">
+        <EcosystemIcon ecosystem="cargo" class="tab-icon eco-cargo" /> cargo
+      </button>
       <button class="tab" :class="{ active: tab === 'publish' }" @click="tab = 'publish'">Publishing</button>
     </div>
 
@@ -47,7 +55,7 @@ onMounted(async () => {
       <div class="card mb">
         <div class="card-head">
           <h3>Configure npm</h3>
-          <span class="badge badge-npm">npm</span>
+          <EcosystemBadge ecosystem="npm" />
         </div>
         <div class="card-body">
           <p class="dim small mb">Run these once per machine:</p>
@@ -80,7 +88,7 @@ onMounted(async () => {
       <div class="card mb">
         <div class="card-head">
           <h3>Configure pip</h3>
-          <span class="badge badge-pypi">PyPI</span>
+          <EcosystemBadge ecosystem="pypi" />
         </div>
         <div class="card-body">
           <div class="copy-block mb">
@@ -119,7 +127,7 @@ onMounted(async () => {
       <div class="card mb">
         <div class="card-head">
           <h3>Configure cargo</h3>
-          <span class="badge badge-cargo">cargo</span>
+          <EcosystemBadge ecosystem="cargo" />
         </div>
         <div class="card-body">
           <p class="dim small mb">
@@ -202,7 +210,7 @@ npm publish --registry {{ config.npm.registry }}</pre>
       <div v-if="config.cargo" class="card mt">
         <div class="card-head">
           <h3>Publish a crate</h3>
-          <span class="badge badge-cargo">cargo</span>
+          <EcosystemBadge ecosystem="cargo" />
         </div>
         <div class="card-body">
           <p class="field-hint" style="margin: 0">

@@ -125,6 +125,10 @@ pre {
   gap: 0.55rem;
 }
 .brand-name { font-weight: 650; letter-spacing: -0.01em; }
+a.brand { color: var(--text); }
+a.brand:hover { text-decoration: none; }
+.brand-ecos { display: flex; align-items: center; gap: 0.3rem; font-size: 0.7rem; margin-top: 0.1rem; }
+.brand-ecos .faint { margin-left: 0.15rem; }
 
 .nav { padding: 0.5rem 0.55rem; flex: 1; }
 .nav-section {
@@ -357,6 +361,32 @@ input[type='checkbox'] {
 .badge-pypi { background: color-mix(in srgb, var(--pypi) 14%, transparent); color: var(--pypi); border-color: transparent; }
 .badge-cargo { background: color-mix(in srgb, var(--cargo) 14%, transparent); color: var(--cargo); border-color: transparent; }
 
+/* Ecosystem colour on anything that carries a brand mark (icons inherit
+   currentColor). */
+.eco-npm { color: var(--npm); }
+.eco-pypi { color: var(--pypi); }
+.eco-cargo { color: var(--cargo); }
+
+/* Ecosystem filter chips (search). Monochrome until picked, then they take
+   the ecosystem colour, so the active filter reads at a glance. */
+.eco-filter { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.7rem; }
+.eco-chip {
+  display: inline-flex; align-items: center; gap: 0.38rem;
+  height: 28px; padding: 0 0.7rem;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface); color: var(--text-dim);
+  font: inherit; font-size: 0.82rem; font-weight: 550;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.eco-chip .eco-icon { opacity: 0.75; }
+.eco-chip:hover { border-color: var(--border-strong); color: var(--text); }
+.eco-chip.active { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+.eco-chip.active .eco-icon { opacity: 1; }
+.eco-chip.eco-npm.active { color: var(--npm); background: color-mix(in srgb, var(--npm) 14%, transparent); }
+.eco-chip.eco-pypi.active { color: var(--pypi); background: color-mix(in srgb, var(--pypi) 14%, transparent); }
+.eco-chip.eco-cargo.active { color: var(--cargo); background: color-mix(in srgb, var(--cargo) 14%, transparent); }
+
 .sev { font-variant-numeric: tabular-nums; font-weight: 650; }
 .sev-critical { color: var(--critical); }
 .sev-high { color: var(--danger); }
@@ -442,7 +472,9 @@ input[type='checkbox'] {
   padding: 0.5rem 0.8rem; border: none; background: none; cursor: pointer;
   color: var(--text-dim); font: inherit; font-weight: 550; font-size: 0.88rem;
   border-bottom: 2px solid transparent; margin-bottom: -1px;
+  display: inline-flex; align-items: center; gap: 0.4rem;
 }
+.tab-icon { flex: none; }
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
 
