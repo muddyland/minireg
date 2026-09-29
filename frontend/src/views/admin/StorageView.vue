@@ -1,7 +1,8 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { ecosystemBadge, formatBytes, formatNumber, percent } from '@/utils/format'
+import { formatBytes, formatNumber, percent } from '@/utils/format'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const stats = ref(null)
 const loading = ref(true)
@@ -125,9 +126,7 @@ onMounted(load)
           <div v-else class="bars">
             <div v-for="row in stats.by_ecosystem" :key="row.ecosystem" class="bar-row">
               <span class="small">
-                <span class="badge" :class="ecosystemBadge(row.ecosystem)">
-                  {{ row.ecosystem }}
-                </span>
+                <EcosystemBadge :ecosystem="row.ecosystem" />
                 {{ formatNumber(row.files) }} files
               </span>
               <div class="bar-track">

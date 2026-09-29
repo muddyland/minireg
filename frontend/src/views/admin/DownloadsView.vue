@@ -10,12 +10,12 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import api from '@/api/client'
 import {
-  ecosystemBadge,
   formatBytes,
   formatDateTime,
   relativeTime,
   severityClass,
 } from '@/utils/format'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const entries = ref([])
 const total = ref(0)
@@ -234,9 +234,7 @@ onBeforeUnmount(stopStream)
                 {{ relativeTime(entry.ts) }}
               </td>
               <td>
-                <span class="badge" :class="ecosystemBadge(entry.ecosystem)">
-                  {{ entry.ecosystem }}
-                </span>
+                <EcosystemBadge :ecosystem="entry.ecosystem" />
                 {{ entry.package_name }}
               </td>
               <td class="mono small">{{ entry.version || '—' }}</td>

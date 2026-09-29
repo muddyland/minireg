@@ -20,7 +20,7 @@ async function submit() {
   busy.value = true
   try {
     await auth.login(username.value, password.value)
-    router.push(route.query.next || { name: 'search' })
+    router.push(route.query.next || { name: 'home' })
   } catch (err) {
     error.value = err.detail || 'Sign-in failed.'
   } finally {
@@ -29,7 +29,7 @@ async function submit() {
 }
 
 function ssoLogin() {
-  const next = route.query.next || '/search'
+  const next = route.query.next || '/'
   window.location.href = `/api/auth/oidc/login?next=${encodeURIComponent(next)}`
 }
 

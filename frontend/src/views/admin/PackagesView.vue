@@ -1,7 +1,8 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { ecosystemBadge, formatBytes, formatDate, formatNumber, severityClass } from '@/utils/format'
+import { formatBytes, formatDate, formatNumber, severityClass } from '@/utils/format'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const packages = ref([])
 const total = ref(0)
@@ -103,9 +104,7 @@ onMounted(load)
           <tbody>
             <tr v-for="pkg in packages" :key="pkg.id">
               <td>
-                <span class="badge" :class="ecosystemBadge(pkg.ecosystem)">
-                  {{ pkg.ecosystem }}
-                </span>
+                <EcosystemBadge :ecosystem="pkg.ecosystem" />
                 <strong>{{ pkg.name }}</strong>
                 <div v-if="pkg.description" class="faint small truncate" style="max-width: 320px">
                   {{ pkg.description }}
@@ -151,9 +150,7 @@ onMounted(load)
         <div>
           <h3 style="margin: 0">{{ detail.package.name }}</h3>
           <div class="row-tight" style="margin-top: 0.25rem">
-            <span class="badge" :class="ecosystemBadge(detail.package.ecosystem)">
-              {{ detail.package.ecosystem }}
-            </span>
+            <EcosystemBadge :ecosystem="detail.package.ecosystem" />
             <span v-if="detail.package.is_local" class="badge badge-accent">published here</span>
             <span class="faint small">{{ formatNumber(detail.package.download_count) }} downloads</span>
           </div>

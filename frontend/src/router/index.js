@@ -3,7 +3,7 @@ import { useAuthStore } from '@/stores/auth'
 
 const routes = [
   { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue'), meta: { public: true } },
-  { path: '/', redirect: '/search' },
+  { path: '/', name: 'home', component: () => import('@/views/HomeView.vue') },
 
   { path: '/search', name: 'search', component: () => import('@/views/SearchView.vue') },
   {
@@ -29,7 +29,7 @@ const routes = [
   { path: '/admin/downloads', name: 'downloads', component: () => import('@/views/admin/DownloadsView.vue'), meta: { admin: true } },
   { path: '/admin/audit', name: 'audit', component: () => import('@/views/admin/AuditView.vue'), meta: { admin: true } },
 
-  { path: '/:pathMatch(.*)*', redirect: '/search' },
+  { path: '/:pathMatch(.*)*', redirect: '/' },
 ]
 
 const router = createRouter({
@@ -48,13 +48,13 @@ router.beforeEach(async (to) => {
   if (!auth.ready) await auth.loadSession()
 
   if (to.meta.public) {
-    return auth.isAuthenticated && to.name === 'login' ? { name: 'search' } : true
+    return auth.isAuthenticated && to.name === 'login' ? { name: 'home' } : true
   }
   if (!auth.isAuthenticated) {
     return { name: 'login', query: { next: to.fullPath } }
   }
   if (to.meta.admin && !auth.isAdmin) {
-    return { name: 'search' }
+    return { name: 'home' }
   }
   return true
 })

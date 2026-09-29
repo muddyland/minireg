@@ -3,7 +3,8 @@ import { onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 import api from '@/api/client'
-import { ecosystemBadge, formatBytes, formatDate, severityClass } from '@/utils/format'
+import { formatBytes, formatDate, severityClass } from '@/utils/format'
+import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const route = useRoute()
 const pkg = ref(null)
@@ -38,9 +39,7 @@ watch(() => [route.params.ecosystem, route.params.name], load)
         </div>
         <h1 style="margin-bottom: 0.3rem">{{ pkg.name }}</h1>
         <div class="row-tight">
-          <span class="badge" :class="ecosystemBadge(pkg.ecosystem)">
-            {{ pkg.ecosystem }}
-          </span>
+          <EcosystemBadge :ecosystem="pkg.ecosystem" />
           <span v-if="pkg.latest_version" class="badge">{{ pkg.latest_version }}</span>
           <span v-if="pkg.is_local" class="badge badge-accent">published here</span>
           <span v-if="pkg.license" class="badge">{{ pkg.license }}</span>
