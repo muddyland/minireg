@@ -175,7 +175,7 @@ onMounted(async () => {
 
   <div v-if="configError" class="alert alert-error">{{ configError }}</div>
   <div v-else-if="!config" class="empty">Loading…</div>
-  <div v-else class="grid grid-3 grid-top mb">
+  <div v-else class="grid grid-3 mb eco-grid">
     <div v-for="eco in ecosystems" :key="eco.key" class="card eco-card" :class="`eco-card-${eco.key}`">
       <div class="card-head">
         <div class="row-tight">
@@ -188,7 +188,7 @@ onMounted(async () => {
           </div>
         </div>
       </div>
-      <div class="card-body">
+      <div class="card-body eco-card-body">
         <div class="copy-block">
           <pre>{{ eco.snippet }}</pre>
           <button class="btn btn-sm" @click="copy(eco.snippet, eco.key)">
@@ -196,7 +196,7 @@ onMounted(async () => {
           </button>
         </div>
         <p class="field-hint">{{ eco.note }}</p>
-        <router-link :to="docRoute(eco.doc)" class="small">Read more</router-link>
+        <router-link :to="docRoute(eco.doc)" class="small eco-card-more">Read more</router-link>
       </div>
     </div>
   </div>
@@ -299,14 +299,22 @@ onMounted(async () => {
   margin-right: 0.35rem;
   background: color-mix(in srgb, currentColor 13%, transparent);
 }
-.eco-card { border-top: 3px solid var(--border); }
+.eco-card { border-top: 3px solid var(--border); display: flex; flex-direction: column; }
+/* The three setup cards share a row height (the cargo snippet is the
+   tallest), and "Read more" sits on one line across them. */
+.eco-grid { align-items: stretch; }
+.eco-card-body { flex: 1; display: flex; flex-direction: column; }
+.eco-card-more { margin-top: auto; padding-top: 0.6rem; }
 .eco-card-npm { border-top-color: var(--npm); }
 .eco-card-pypi { border-top-color: var(--pypi); }
 .eco-card-cargo { border-top-color: var(--cargo); }
 .eco-card pre { white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 4.5rem; }
 
-.home-lower { grid-template-columns: minmax(0, 1.6fr) minmax(260px, 1fr); align-items: start; }
-.stack { display: grid; gap: 1rem; }
+.home-lower { grid-template-columns: minmax(0, 1.6fr) minmax(260px, 1fr); align-items: stretch; }
+/* The right column ends level with Quick reference: its last card takes up
+   the difference. */
+.stack { display: flex; flex-direction: column; gap: 1rem; }
+.stack > .card:last-child { flex: 1; }
 
 .qref-row { padding: 0.8rem 1rem; border-bottom: 1px solid var(--border); }
 .qref-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.35rem; }
