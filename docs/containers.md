@@ -148,7 +148,7 @@ parsed, and text from them is shown as text, never as HTML.
 Run the worker with the shipped compose file:
 
 ```sh
-# 1. Admin -> API tokens: create a token with only the `scanner` scope.
+# 1. As an admin: API tokens -> "Scanner token" (Account section of the menu).
 # 2. Put it in .env:
 MINIREG_SCANNER_TOKEN=mrg_...
 # 3. Start it:
