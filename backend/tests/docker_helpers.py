@@ -8,6 +8,7 @@ tests can assert how much upstream quota a scenario costs.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -310,6 +311,21 @@ async def docker_env(tmp_path, monkeypatch):
     await db_module.dispose_engine()
     set_store(None)  # type: ignore[arg-type]
     set_oci_store(None)
+
+
+async def settle_fills(store=None, timeout: float = 30) -> None:
+    """Wait for background blob fills to finish.
+
+    A client gets its last byte before the fill task has verified, renamed
+    and recorded the blob. Tests that then look at the store or the database
+    used to sleep 50 ms for that, which a loaded CI runner outlasts.
+    """
+    from app.docker.store import get_oci_store
+
+    store = store or get_oci_store()
+    tasks = [f.task for f in list(store._fills.values()) if f.task is not None]
+    if tasks:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout)
 
 
 async def make_user(
