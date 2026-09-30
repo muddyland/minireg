@@ -15,6 +15,7 @@ from tests.docker_helpers import (
     Image,
     bearer,
     dumps,
+    settle_fills,
     sha,
 )
 
@@ -184,7 +185,7 @@ class TestGcAndEviction:
             await client.get(f"/v2/img{i}/manifests/1", headers=headers)
             await client.get(f"/v2/img{i}/blobs/{sha(img.layers[0])}", headers=headers)
             images.append(img)
-        await asyncio.sleep(0.05)
+        await settle_fills()
         old = datetime.now(UTC) - timedelta(days=2)
         async with db.session_scope() as s:
             # img0 is the least recently pulled; everything is past the grace.
@@ -257,7 +258,7 @@ class TestGcAndEviction:
             await client.get(f"/v2/{name}/manifests/1", headers=h)
             for b in img.layers:
                 await client.get(f"/v2/{name}/blobs/{sha(b)}", headers=h)
-        await asyncio.sleep(0.05)
+        await settle_fills()
         old = datetime.now(UTC) - timedelta(days=2)
         async with db.session_scope() as s:
             m = (await s.execute(select(DockerManifest).where(DockerManifest.digest == base.digest))).scalar_one()
@@ -296,7 +297,7 @@ class TestStoreFill:
         gate.set()
         rest = b"".join([c async for c in chunks])
         assert first + rest == b"".join(payload)
-        await asyncio.sleep(0.05)
+        await settle_fills(store)
         assert store.exists(digest)
 
     async def test_one_upstream_open_for_simultaneous_arrivals(self, tmp_path):
@@ -424,7 +425,7 @@ class TestStoreFill:
         with pytest.raises(FillFailed):
             async for _ in chunks:
                 pass
-        await asyncio.sleep(0.05)
+        await settle_fills(store)
         assert not list((tmp_path / "oci" / "partial").iterdir())
         assert not store.exists(sha(b"y" * 200))
 
