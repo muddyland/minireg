@@ -131,7 +131,10 @@ onMounted(load)
           <template v-if="scannerSeen.length">
             {{ scannerSeen.length }} worker{{ scannerSeen.length > 1 ? 's' : '' }}, last seen {{ relativeTime(scannerSeen[0][1]) }}
           </template>
-          <span v-else class="sev sev-high">no scanner has checked in</span>
+          <template v-else>
+            <span class="sev sev-high">no scanner has checked in</span> ·
+            <router-link :to="{ name: 'tokens', query: { preset: 'scanner' } }">set one up</router-link>
+          </template>
         </div>
       </div>
       <div class="card stat">
@@ -239,8 +242,17 @@ onMounted(load)
 
     <div class="grid grid-2 mb policy-grid">
       <div class="card">
-        <div class="card-head"><h3>Scanning</h3></div>
+        <div class="card-head">
+          <h3>Scanning</h3>
+          <router-link class="btn btn-sm" :to="{ name: 'tokens', query: { preset: 'scanner' } }">
+            New scanner token
+          </router-link>
+        </div>
         <div class="card-body">
+          <p class="field-hint" style="margin-top: 0">
+            Scans run in a separate worker (<code>docker compose --profile scanner up -d</code>) that signs in
+            with its own scanner token. Revoke that token on API tokens to cut a worker off.
+          </p>
           <label class="check"><input v-model="policy.scanning_enabled" type="checkbox" /> Scanning enabled</label>
           <label class="check"><input v-model="policy.scan_on_pull" type="checkbox" /> Scan upstream images when first pulled</label>
           <label class="check"><input v-model="policy.ignore_unfixed" type="checkbox" /> Ignore findings with no fixed version</label>

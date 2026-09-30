@@ -1,29 +1,52 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
 import api from '@/api/client'
+import CodeBlock from '@/components/CodeBlock.vue'
 import { useAuthStore } from '@/stores/auth'
 import { formatDate, relativeTime } from '@/utils/format'
 
 const auth = useAuthStore()
+const route = useRoute()
 const tokens = ref([])
 const loading = ref(true)
 const error = ref(null)
 
 const showCreate = ref(false)
-const form = ref({ name: '', scopes: ['read'], expires_in_days: null })
+const blankForm = () => ({ name: '', scopes: ['read'], expires_in_days: null, prefixes: '' })
+const form = ref(blankForm())
 const issued = ref(null)
 const copied = ref(false)
 
+// Scopes that must stand alone: a scanner token reads every image, held ones
+// included, so it should carry nothing else and live only in the worker.
+const EXCLUSIVE = new Set(['scanner'])
+
 const availableScopes = computed(() => {
-  const scopes = [{ value: 'read', label: 'read', hint: 'Install and download packages' }]
+  const scopes = [{ value: 'read', label: 'read', hint: 'Install packages and pull images' }]
   if (auth.canPublish) {
     scopes.push({ value: 'publish', label: 'publish', hint: 'Publish new package versions' })
+    scopes.push({ value: 'docker:push', label: 'docker:push', hint: 'Push container images under local/' })
   }
   if (auth.isAdmin) {
     scopes.push({ value: 'admin', label: 'admin', hint: 'Full administrative API access' })
+    scopes.push({
+      value: 'scanner',
+      label: 'scanner',
+      hint: 'For the Trivy scanner worker only. Reads every image, including held ones, and reports results',
+    })
   }
   return scopes
 })
+
+const wantsPush = computed(() => form.value.scopes.includes('docker:push'))
+const isScanner = computed(() => form.value.scopes.includes('scanner'))
+
+// Preset for the scanner worker, reached from the Image policy page.
+function scannerPreset() {
+  form.value = { ...blankForm(), name: 'scanner', scopes: ['scanner'] }
+  showCreate.value = true
+}
 
 async function load() {
   loading.value = true
@@ -37,7 +60,11 @@ async function load() {
 }
 
 function toggleScope(scope) {
-  const set = new Set(form.value.scopes)
+  if (EXCLUSIVE.has(scope)) {
+    form.value.scopes = form.value.scopes.includes(scope) ? ['read'] : [scope]
+    return
+  }
+  const set = new Set(form.value.scopes.filter((s) => !EXCLUSIVE.has(s)))
   set.has(scope) ? set.delete(scope) : set.add(scope)
   form.value.scopes = [...set]
 }
@@ -45,13 +72,18 @@ function toggleScope(scope) {
 async function create() {
   error.value = null
   try {
-    issued.value = await api.createToken({
+    const prefixes = wantsPush.value
+      ? form.value.prefixes.split(/[\s,]+/).map((p) => p.trim()).filter(Boolean)
+      : []
+    const created = await api.createToken({
       name: form.value.name,
       scopes: form.value.scopes,
       expires_in_days: form.value.expires_in_days || null,
+      docker_repo_prefixes: prefixes,
     })
+    issued.value = { ...created, scanner: isScanner.value }
     showCreate.value = false
-    form.value = { name: '', scopes: ['read'], expires_in_days: null }
+    form.value = blankForm()
     await load()
   } catch (err) {
     error.value = err.detail || 'Could not create the token.'
@@ -70,16 +102,24 @@ async function copyToken() {
   setTimeout(() => (copied.value = false), 1600)
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  if (route.query.preset === 'scanner' && auth.isAdmin) scannerPreset()
+})
 </script>
 
 <template>
   <div class="page-head">
     <div>
       <h1>API tokens</h1>
-      <p class="page-sub">Tokens authenticate npm, pip, and twine. They are shown once, at creation.</p>
+      <p class="page-sub">
+        Tokens authenticate npm, pip, twine and <code>docker login</code>. They are shown once, at creation.
+      </p>
     </div>
-    <button class="btn btn-primary" @click="showCreate = true">New token</button>
+    <div class="head-actions">
+      <button v-if="auth.isAdmin" class="btn" @click="scannerPreset">Scanner token</button>
+      <button class="btn btn-primary" @click="showCreate = true">New token</button>
+    </div>
   </div>
 
   <div v-if="error" class="alert alert-error">{{ error }}</div>
@@ -97,6 +137,19 @@ onMounted(load)
         <pre style="word-break: break-all; white-space: pre-wrap">{{ issued.token }}</pre>
         <button class="btn btn-sm" @click="copyToken">{{ copied ? 'Copied' : 'Copy' }}</button>
       </div>
+      <template v-if="issued.scanner">
+        <p class="small dim" style="margin: 1rem 0 0.5rem">
+          Put it in the <code>.env</code> next to <code>docker-compose.yml</code> and start the worker:
+        </p>
+        <CodeBlock
+          caption="shell"
+          :code="'# in .env\nMINIREG_SCANNER_TOKEN=<the token above>\n\ndocker compose --profile scanner up -d'"
+        />
+        <p class="small dim" style="margin: 0.5rem 0 0">
+          It shows as checked in on
+          <router-link :to="{ name: 'image-policy' }">Policy &amp; scanning</router-link> within a few seconds.
+        </p>
+      </template>
     </div>
   </div>
 
@@ -130,6 +183,9 @@ onMounted(load)
                 <span v-for="scope in token.scopes" :key="scope" class="badge" style="margin-right: 3px">
                   {{ scope }}
                 </span>
+                <div v-if="token.docker_repo_prefixes?.length" class="faint small">
+                  push: {{ token.docker_repo_prefixes.join(', ') }}
+                </div>
               </td>
               <td class="dim small nowrap">{{ formatDate(token.created_at) }}</td>
               <td class="dim small nowrap">
@@ -173,6 +229,17 @@ onMounted(load)
             />
             <span><strong>{{ scope.label }}</strong> <span class="faint small">— {{ scope.hint }}</span></span>
           </label>
+          <p v-if="isScanner" class="field-hint">
+            A scanner token carries no other scope. Give it to the worker and nothing else.
+          </p>
+        </div>
+
+        <div v-if="wantsPush" class="field">
+          <label for="tprefix">Push only to (optional)</label>
+          <input id="tprefix" v-model="form.prefixes" placeholder="local/team-a/, local/ci/" />
+          <p class="field-hint">
+            Repository prefixes under <code>local/</code>, comma-separated. Empty means anywhere you may push.
+          </p>
         </div>
 
         <div class="field">
@@ -189,3 +256,7 @@ onMounted(load)
     </div>
   </div>
 </template>
+
+<style scoped>
+.head-actions { display: flex; gap: 0.5rem; }
+</style>

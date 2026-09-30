@@ -793,6 +793,16 @@ class TestTokenManagement:
         )
         assert response.status_code == 403
 
+    async def test_non_admin_cannot_mint_scanner_token(self, app_client):
+        # A scanner token reads every image, held ones included.
+        await app_client.post(
+            "/api/auth/login", json={"username": "publisher", "password": "publisher-password-1"}
+        )
+        response = await app_client.post(
+            "/api/auth/tokens", json={"name": "scanner", "scopes": ["scanner"]}
+        )
+        assert response.status_code == 403
+
     async def test_reader_cannot_mint_publish_token(self, app_client):
         await app_client.post(
             "/api/auth/login", json={"username": "reader", "password": "reader-password-12345"}

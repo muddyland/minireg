@@ -481,3 +481,31 @@ class TestScannerConfig:
         cfg = (await client.get("/api/docker/scanner/config", headers=headers)).json()
         assert cfg["db_repository"] == "minireg:8000/ghcr/aquasecurity/trivy-db:2"
         assert cfg["registry"] == "http://minireg:8000"
+
+
+class TestScannerToken:
+    """Minting the worker's token from the API tokens page."""
+
+    async def mint(self, client, token, scopes):
+        return await client.post(
+            "/api/auth/tokens",
+            json={"name": "scanner", "scopes": scopes},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    async def test_admin_mints_a_working_scanner_token(self, docker_env):
+        client, _ = docker_env
+        root = await make_user(username="root", scopes=("admin",), is_admin=True)
+        resp = await self.mint(client, root, ["scanner"])
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["scopes"] == ["scanner"]
+        sh = {"Authorization": f"Bearer {resp.json()['token']}"}
+        assert (await client.get("/api/docker/scanner/config", headers=sh)).status_code == 200
+
+    async def test_scanner_scope_stands_alone(self, docker_env):
+        client, _ = docker_env
+        root = await make_user(username="root", scopes=("admin",), is_admin=True)
+        for extra in (["admin"], ["read"], ["docker:push"]):
+            resp = await self.mint(client, root, ["scanner", *extra])
+            assert resp.status_code == 400, extra
+            assert "cannot carry other scopes" in resp.json()["detail"]

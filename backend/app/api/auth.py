@@ -336,6 +336,13 @@ async def create_token(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="only admins can mint scanner tokens"
         )
+    # ...and it stands alone. The worker unpacks untrusted layers; a leaked
+    # scanner token must not also be an admin or publish credential.
+    if "scanner" in requested and len(requested) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="a scanner token cannot carry other scopes",
+        )
     prefixes = _docker_prefixes(payload.docker_repo_prefixes)
     if prefixes and "docker:push" not in requested:
         raise HTTPException(

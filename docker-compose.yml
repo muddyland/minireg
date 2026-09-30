@@ -241,7 +241,7 @@ services:
     networks: [minireg]
 
   # Trivy worker for container images. Opt in with `--profile scanner` once
-  # an admin has created an API token with the `scanner` scope and put it in
+  # an admin has created a token (API tokens -> Scanner token) and put it in
   # .env as MINIREG_SCANNER_TOKEN. It unpacks untrusted image layers, so it
   # gets nothing worth stealing: no database, no upstream credentials, a
   # scan-only token, a read-only root and hard limits.
