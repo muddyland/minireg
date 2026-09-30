@@ -14,6 +14,7 @@ from tests.docker_helpers import (
     Image,
     bearer,
     index_of,
+    settle_fills,
     sha,
 )
 
@@ -123,15 +124,24 @@ class TestManifests:
         assert resp.headers["docker-content-digest"] == new.digest
         assert resp.headers["x-minireg-cache"] == "fetched"
 
-    async def test_concurrent_revalidations_collapse(self, docker_env, monkeypatch):
-        from app.config import settings
+    async def test_concurrent_revalidations_collapse(self, docker_env):
+        from datetime import UTC, datetime, timedelta
+
+        from sqlalchemy import update
+
+        from app import db
+        from app.models import DockerTag
 
         client, fake = docker_env
         fake.add_image("library/python", "3.12", Image.build("py"))
         headers = await anon(client, "python")
         await client.get("/v2/python/manifests/3.12", headers=headers)
-        monkeypatch.setattr(settings, "docker_tag_ttl_seconds", 1)
-        await asyncio.sleep(1.1)
+        # Make the tag stale by moving its check into the past, not by
+        # shrinking the TTL and sleeping: with a 1 s TTL, twenty requests
+        # queued behind the lock on a slow CI runner outlasted it, and the
+        # tag was (correctly) revalidated a second time.
+        async with db.session_scope() as s:
+            await s.execute(update(DockerTag).values(checked_at=datetime.now(UTC) - timedelta(days=1)))
         results = await asyncio.gather(
             *(client.get("/v2/python/manifests/3.12", headers=headers) for _ in range(20))
         )
@@ -536,7 +546,7 @@ class TestUsage:
         headers = await anon(client, "alpine")
         await client.get("/v2/alpine/manifests/3.20", headers=headers)
         await client.get(f"/v2/alpine/blobs/{sha(img.layers[0])}", headers=headers)
-        await asyncio.sleep(0.05)
+        await settle_fills()
         from app import db
 
         async with db.session_scope() as s:
