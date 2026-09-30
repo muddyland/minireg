@@ -32,6 +32,7 @@ PREFERRED_ORDER = [
     "cli",
     "configuration",
     "policy",
+    "containers",
     "operations",
     "troubleshooting",
     "api",

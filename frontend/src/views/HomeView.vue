@@ -18,6 +18,7 @@ const auth = useAuthStore()
 const router = useRouter()
 
 const config = ref(null)
+const dockerConfig = ref(null)
 const configError = ref(null)
 const query = ref('')
 const copied = ref(null)
@@ -53,6 +54,18 @@ const ecosystems = computed(() => {
       doc: { slug: 'usage', hash: '#rust-cargo' },
     })
   }
+  const d = dockerConfig.value
+  if (d) {
+    cards.push({
+      key: 'docker',
+      name: 'Containers',
+      clients: 'Docker Hub, GHCR, Quay',
+      snippet: d.examples.hub,
+      note: 'Or set it as the daemon’s registry-mirror.',
+      doc: { slug: 'containers', hash: '#pulling' },
+      setup: 'docker',
+    })
+  }
   return cards
 })
 
@@ -79,6 +92,15 @@ const quickRef = computed(() => [
     command: `npm publish --registry ${config.value?.npm.registry || `${origin.value}/npm/`}`,
     doc: { slug: 'usage', hash: '#npm' },
   },
+  ...(dockerConfig.value
+    ? [
+        {
+          title: 'Push an image you built',
+          command: dockerConfig.value.examples.push.slice(1).join('\n'),
+          doc: { slug: 'containers', hash: '#pushing' },
+        },
+      ]
+    : []),
   {
     title: 'Publish a Python package',
     command: `twine upload --repository-url ${config.value?.twine.repository_url || `${origin.value}/pypi/legacy/`} \\\n  -u __token__ -p "$MINIREG_TOKEN" dist/*`,
@@ -90,6 +112,7 @@ const docLinks = [
   { slug: 'usage', title: 'Using the registry', summary: 'Every client, CI, Docker builds' },
   { slug: 'cli', title: 'The CLI', summary: 'Install, sign in, configure, audit' },
   { slug: 'policy', title: 'Package policy', summary: 'Why a version is blocked' },
+  { slug: 'containers', title: 'Container images', summary: 'Pull, mirror, push, scanning' },
   { slug: 'troubleshooting', title: 'Troubleshooting', summary: 'When something does not resolve' },
 ]
 
@@ -117,6 +140,11 @@ onMounted(async () => {
   } catch (err) {
     configError.value = err.detail || 'Could not load the client configuration.'
   }
+  try {
+    dockerConfig.value = await api.dockerClientConfig()
+  } catch {
+    dockerConfig.value = null
+  }
 })
 </script>
 
@@ -128,11 +156,12 @@ onMounted(async () => {
           <BrandMark :size="22" />
           <span>minireg</span>
         </div>
-        <h1 class="hero-title">One registry for npm, PyPI and cargo.</h1>
+        <h1 class="hero-title">One registry for packages and container images.</h1>
         <p class="hero-lead">
-          minireg sits between your package managers and the public registries. It caches every
-          package it serves, checks each version against known vulnerabilities, blocks what policy
-          says to block, and hosts your own npm and Python packages alongside the public ones.
+          minireg sits between your package managers, your container runtime and the public
+          registries. It caches everything it serves, checks it against known vulnerabilities,
+          blocks what policy says to block, and hosts your own packages and images alongside the
+          public ones.
         </p>
         <form class="row hero-search" @submit.prevent="search">
           <input v-model="query" type="search" placeholder="Search packages…" aria-label="Search packages" />
@@ -145,7 +174,7 @@ onMounted(async () => {
           <router-link :to="{ name: 'help' }" class="btn btn-sm">
             <NavIcon name="help" :size="15" /> Documentation
           </router-link>
-          <router-link v-if="auth.isAdmin" :to="{ name: 'dashboard' }" class="btn btn-sm btn-ghost">
+          <router-link v-if="auth.isAdmin" :to="{ name: 'dashboard' }" class="btn btn-sm">
             <NavIcon name="dashboard" :size="15" /> Dashboard
           </router-link>
         </div>
@@ -161,8 +190,12 @@ onMounted(async () => {
           <div><strong>Checked.</strong> Every version is scanned for known CVEs; policy can refuse the risky ones.</div>
         </li>
         <li>
+          <NavIcon name="container" :size="18" />
+          <div><strong>Images too.</strong> Docker Hub, GHCR and Quay pulls are cached and scanned with Trivy.</div>
+        </li>
+        <li>
           <NavIcon name="package" :size="18" />
-          <div><strong>Yours too.</strong> <code>npm publish</code> and <code>twine upload</code> work here.</div>
+          <div><strong>Yours too.</strong> <code>npm publish</code>, <code>twine upload</code> and <code>docker push</code> work here.</div>
         </li>
       </ul>
     </div>
@@ -175,7 +208,7 @@ onMounted(async () => {
 
   <div v-if="configError" class="alert alert-error">{{ configError }}</div>
   <div v-else-if="!config" class="empty">Loading…</div>
-  <div v-else class="grid grid-3 mb eco-grid">
+  <div v-else class="grid mb eco-grid">
     <div v-for="eco in ecosystems" :key="eco.key" class="card eco-card" :class="`eco-card-${eco.key}`">
       <div class="card-head">
         <div class="row-tight">
@@ -196,7 +229,12 @@ onMounted(async () => {
           </button>
         </div>
         <p class="field-hint">{{ eco.note }}</p>
-        <router-link :to="docRoute(eco.doc)" class="small eco-card-more">Read more</router-link>
+        <div class="eco-card-more small">
+          <router-link :to="docRoute(eco.doc)">Read more</router-link>
+          <router-link :to="{ name: 'setup', query: { tab: eco.setup || (eco.key === 'pypi' ? 'pip' : eco.key) } }" class="faint">
+            Setup →
+          </router-link>
+        </div>
       </div>
     </div>
   </div>
@@ -208,6 +246,7 @@ onMounted(async () => {
         <router-link :to="{ name: 'cli' }" class="small">CLI tool →</router-link>
       </div>
       <div class="card-body tight">
+        <div class="qref-grid">
         <div v-for="(item, index) in quickRef" :key="item.title" class="qref-row">
           <div class="qref-head">
             <span class="qref-title">{{ item.title }}</span>
@@ -219,6 +258,7 @@ onMounted(async () => {
               {{ copied === `q${index}` ? 'Copied' : 'Copy' }}
             </button>
           </div>
+        </div>
         </div>
         <p class="field-hint qref-foot">
           Publishing and the CLI need an API token from
@@ -267,22 +307,26 @@ onMounted(async () => {
 <style scoped>
 .hero-body {
   display: grid;
-  grid-template-columns: minmax(0, 1.6fr) minmax(240px, 1fr);
+  grid-template-columns: minmax(0, 1.25fr) minmax(280px, 1fr);
   gap: 2rem;
   padding: 1.6rem 1.6rem;
   align-items: center;
 }
 .hero-kicker { font-weight: 650; color: var(--text-dim); gap: 0.45rem; margin-bottom: 0.5rem; }
 .hero-title { font-size: 1.65rem; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 0.6rem; }
-.hero-lead { color: var(--text-dim); margin: 0 0 1.1rem; max-width: 62ch; }
-.hero-search { flex-wrap: nowrap; max-width: 520px; }
-.hero-search input { flex: 1; min-width: 0; height: var(--control-h-lg); }
-.hero-search .btn { height: var(--control-h-lg); }
+.hero-lead { color: var(--text-dim); margin: 0 0 1.1rem; max-width: 72ch; }
+.hero-search { flex-wrap: nowrap; max-width: 640px; align-items: stretch; }
+/* Same height by construction: the row stretches both to the taller one. */
+.hero-search input { flex: 1; min-width: 0; height: auto; min-height: var(--control-h-lg); }
+.hero-search .btn { height: auto; min-height: var(--control-h-lg); }
 .hero-links { margin-top: 0.8rem; flex-wrap: wrap; gap: 0.4rem; }
 .hero-links .btn { display: inline-flex; align-items: center; gap: 0.4rem; }
 .hero-links a:hover { text-decoration: none; }
 
-.hero-points { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.9rem; }
+.hero-points { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.9rem 1.4rem; }
+@media (min-width: 1500px) {
+  .hero-points { grid-template-columns: 1fr 1fr; }
+}
 .hero-points li { display: flex; gap: 0.7rem; align-items: flex-start; color: var(--text-dim); font-size: 0.9rem; }
 .hero-points li :deep(.nav-icon) { color: var(--accent); margin-top: 0.1rem; }
 .hero-points strong { color: var(--text); }
@@ -304,13 +348,28 @@ onMounted(async () => {
    tallest), and "Read more" sits on one line across them. */
 .eco-grid { align-items: stretch; }
 .eco-card-body { flex: 1; display: flex; flex-direction: column; }
-.eco-card-more { margin-top: auto; padding-top: 0.6rem; }
+.eco-card-more { margin-top: auto; padding-top: 0.6rem; display: flex; justify-content: space-between; }
 .eco-card-npm { border-top-color: var(--npm); }
 .eco-card-pypi { border-top-color: var(--pypi); }
 .eco-card-cargo { border-top-color: var(--cargo); }
-.eco-card pre { white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 4.5rem; }
+.eco-card-docker { border-top-color: var(--docker); }
+/* Four cards: one row when they fit, else two by two -- never three plus an
+   orphan, which is what auto-fit produced at laptop widths. */
+.eco-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 1500px) {
+  .eco-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .eco-grid { grid-template-columns: 1fr; }
+}
+.eco-card pre { white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 5.2rem; }
 
-.home-lower { grid-template-columns: minmax(0, 1.6fr) minmax(260px, 1fr); align-items: stretch; }
+.home-lower { grid-template-columns: minmax(0, 1.6fr) minmax(300px, 1fr); align-items: stretch; }
+@media (min-width: 1700px) {
+  /* Line the lower row up with the four setup cards above: 2 + 2. */
+  .home-lower { grid-template-columns: 1fr 1fr; }
+}
+
 /* The right column ends level with Quick reference: its last card takes up
    the difference. */
 .stack { display: flex; flex-direction: column; gap: 1rem; }
@@ -319,7 +378,7 @@ onMounted(async () => {
 .qref-row { padding: 0.8rem 1rem; border-bottom: 1px solid var(--border); }
 .qref-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.35rem; }
 .qref-title { font-weight: 600; font-size: 0.88rem; }
-.qref-row pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 4.5rem; }
+.qref-row pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 5.2rem; }
 .qref-foot { padding: 0.7rem 1rem; margin: 0; }
 
 .doc-link {

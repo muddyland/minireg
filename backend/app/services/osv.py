@@ -37,13 +37,10 @@ log = logging.getLogger(__name__)
 
 
 def _bump(counter: str) -> None:
-    """Record a fail-open. Imported lazily to avoid a cycle with main."""
-    try:
-        from ..main import bump
+    """Record a fail-open."""
+    from ..core.metrics import bump
 
-        bump(counter)
-    except Exception:  # pragma: no cover - metrics must never break a scan
-        pass
+    bump(counter)
 
 OSV_ECOSYSTEM = {
     Ecosystem.npm: "npm",

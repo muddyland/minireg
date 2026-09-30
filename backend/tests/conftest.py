@@ -24,6 +24,9 @@ os.environ.setdefault(
 os.environ.setdefault("UPSTREAM_ALLOW_PRIVATE_ADDRESSES", "true")
 
 from app.models import DistTag, Ecosystem, Package, PackageFile, PackageVersion
+
+# Container registry fixtures (docker_env and friends).
+pytest_plugins = ["tests.docker_helpers"]
 from app.services.storage import BlobStore, set_store
 
 

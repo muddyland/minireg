@@ -8,7 +8,6 @@ import logging
 import os
 import secrets
 import time
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +22,7 @@ from sqlalchemy.orm import defer
 from .api import auth as auth_api
 from .api import cargo as cargo_api
 from .api import cli as cli_api
+from .api import docker_api, docker_v2
 from .api import help as help_api
 from .api import npm as npm_api
 from .api import pypi as pypi_api
@@ -31,6 +31,7 @@ from .api.admin import router as admin_router
 from .config import settings
 from .core.cache import close_redis, init_redis
 from .core.deps import Identity, require_admin, resolve_identity
+from .core.metrics import COUNTERS
 from .core.security import hash_password
 from .db import create_schema, dispose_engine, init_engine, session_scope
 from .models import User
@@ -148,6 +149,12 @@ async def _prune_task() -> None:
                 cleared,
             )
     get_store().cleanup_tmp()
+
+
+async def _docker_task() -> None:
+    from .docker.housekeeping import run_housekeeping
+
+    await run_housekeeping()
 
 
 async def _cve_refresh_task() -> None:
@@ -271,6 +278,7 @@ async def housekeeping_loop() -> None:
                 if acquired:
                     for name, task in (
                         ("prune", _prune_task),
+                        ("docker", _docker_task),
                         ("cve-refresh", _cve_refresh_task),
                     ):
                         try:
@@ -295,6 +303,9 @@ async def lifespan(app: FastAPI):
     await create_schema()
     await init_redis()
     get_store().ensure_dirs()
+    from .docker.store import get_oci_store
+
+    get_oci_store().ensure_dirs()
     await bootstrap_admin()
     await get_recorder().start()
 
@@ -308,6 +319,9 @@ async def lifespan(app: FastAPI):
             await task
         await get_recorder().stop()
         await close_http_client()
+        from .docker.upstream import close_clients
+
+        await close_clients()
         await close_redis()
         await dispose_engine()
 
@@ -340,13 +354,14 @@ _UPLOAD_METHODS = {"PUT", "POST"}
 _SMALL_BODY_LIMIT = 2 * 1024 * 1024
 
 
-#: Counters an operator can scrape. Deliberately tiny: the point is to make
-#: the silent failure modes visible, not to reimplement Prometheus.
-METRICS: dict[str, int] = defaultdict(int)
+#: Counters an operator can scrape. Kept as a name here for compatibility;
+#: the store itself lives in core.metrics so other modules need not import
+#: the application to count something.
+METRICS = COUNTERS
 
 
 def bump(name: str, amount: int = 1) -> None:
-    METRICS[name] += amount
+    COUNTERS[name] += amount
 
 
 @app.middleware("http")
@@ -411,8 +426,18 @@ async def limit_body_size(request: Request, call_next):
         if raw_length and raw_length.isdigit():
             length = int(raw_length)
             path = request.url.path
-            is_upload = path.startswith(("/npm/", "/pypi/"))
-            limit = settings.max_publish_bytes if is_upload else _SMALL_BODY_LIMIT
+            if path.startswith("/v2/"):
+                # Layer uploads. Manifests have their own, much smaller cap,
+                # enforced by the handler while it reads.
+                limit = settings.docker_max_blob_bytes
+            elif path.startswith("/api/docker/scanner/"):
+                from .docker.scanning import MAX_REPORT_BYTES
+
+                limit = MAX_REPORT_BYTES
+            elif path.startswith(("/npm/", "/pypi/")):
+                limit = settings.max_publish_bytes
+            else:
+                limit = _SMALL_BODY_LIMIT
             if length > limit:
                 return JSONResponse(
                     {
@@ -472,6 +497,43 @@ async def health() -> JSONResponse:
         payload["status"] = "degraded"
         return JSONResponse(payload, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     return JSONResponse(payload)
+
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics(
+    request: Request, identity: Identity = Depends(resolve_identity)
+):
+    """Prometheus exposition.
+
+    Authorised by METRICS_TOKEN as a bearer, or an admin session. Upstream
+    rate-limit gauges and scan queue depth are the reasons this exists: an
+    upstream quiet-throttling the cache is otherwise invisible until pulls
+    start failing.
+    """
+    import hmac
+
+    from fastapi.responses import PlainTextResponse
+
+    from .core.metrics import gauge, prometheus_text
+
+    header = request.headers.get("authorization") or ""
+    token = settings.metrics_token
+    presented = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    token_ok = bool(token) and hmac.compare_digest(presented.encode(), token.encode())
+    if not token_ok and not (identity.is_admin and identity.has_scope("admin")):
+        return JSONResponse({"detail": "metrics require METRICS_TOKEN or an admin"}, status_code=401)
+    try:
+        from .docker import registry as docker_registry
+        from .docker import scanning as docker_scanning
+
+        async with session_scope() as session:
+            for state, count in (await docker_scanning.queue_depth(session)).items():
+                gauge("docker_scan_jobs", count, status=state)
+            for key, value in (await docker_registry.usage(session)).items():
+                gauge(f"docker_storage_{key}", value)
+    except Exception as exc:  # metrics must not fail on a busy database
+        log.warning("metrics gauges unavailable: %s", exc)
+    return PlainTextResponse(prometheus_text(), media_type="text/plain; version=0.0.4")
 
 
 @app.get("/api/metrics", tags=["meta"])
@@ -552,9 +614,15 @@ app.include_router(cli_api.router)
 app.include_router(help_api.router)
 app.include_router(search_api.router)
 app.include_router(admin_router)
+app.include_router(docker_api.router)
 app.include_router(npm_api.router, prefix="/npm")
 app.include_router(pypi_api.router, prefix="/pypi")
 app.include_router(cargo_api.router, prefix="/cargo")
+# Container images. Clients cannot use a path prefix, so the distribution API
+# lives at /v2 on the root of the host -- and it must be registered before the
+# SPA catch-all below, which would otherwise answer /v2/ with index.html and a
+# 200 that Docker reads as "a registry that needs no credentials".
+app.include_router(docker_v2.router)
 
 
 if STATIC_DIR.is_dir():

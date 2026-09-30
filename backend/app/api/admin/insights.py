@@ -16,6 +16,7 @@ from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer, selectinload
 
+from ...config import settings
 from ...core.deps import Identity, client_ip, require_admin
 from ...core.naming import normalize_name_for, normalize_version_for, order_version_rows
 from ...db import get_session, session_scope
@@ -312,7 +313,19 @@ async def storage_stats(session: AsyncSession = Depends(get_session)) -> dict:
     ).all()
 
     physical = int(blob_rows[1] or 0)
+    images = None
+    if settings.docker_enabled:
+        # Container layers live in their own tree with their own budget and
+        # eviction, so they are reported separately rather than folded into
+        # the package figures.
+        from ...docker.policy import load_policy
+        from ...docker.registry import usage as docker_usage
+
+        image_usage = await docker_usage(session)
+        policy = await load_policy(session)
+        images = {**image_usage, "budget_bytes": policy.budget()}
     return {
+        "images": images,
         "disk": {
             "total": usage["disk_total"],
             "used": usage["disk_used"],

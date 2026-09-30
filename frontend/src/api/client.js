@@ -94,7 +94,8 @@ export const api = {
   createUpstream: (payload) => request('/api/admin/upstreams', { method: 'POST', body: payload }),
   updateUpstream: (id, payload) =>
     request(`/api/admin/upstreams/${id}`, { method: 'PATCH', body: payload }),
-  deleteUpstream: (id) => request(`/api/admin/upstreams/${id}`, { method: 'DELETE' }),
+  deleteUpstream: (id, params) =>
+    request(`/api/admin/upstreams/${id}${qs(params || {})}`, { method: 'DELETE' }),
   testUpstream: (id) => request(`/api/admin/upstreams/${id}/test`, { method: 'POST' }),
   indexUpstream: (id) => request(`/api/admin/upstreams/${id}/index`, { method: 'POST' }),
 
@@ -144,6 +145,33 @@ export const api = {
   garbageCollect: () => request('/api/admin/cache/gc', { method: 'POST' }),
 
   health: () => request('/api/health/detailed'),
+
+  // -- container images -----------------------------------------------------
+  dockerImages: (params) => request(`/api/docker/images${qs(params)}`),
+  dockerRepository: (name) => request(`/api/docker/repository${qs({ name })}`),
+  dockerManifest: (digest) => request(`/api/docker/manifest/${encodeURIComponent(digest)}`),
+  dockerFindings: (digest, params) =>
+    request(`/api/docker/manifest/${encodeURIComponent(digest)}/findings${qs(params)}`),
+  dockerSbomUrl: (digest) => `/api/docker/manifest/${encodeURIComponent(digest)}/sbom`,
+  dockerVulnerabilities: (params) => request(`/api/docker/vulnerabilities${qs(params)}`),
+  dockerClientConfig: () => request('/api/docker/client-config'),
+  dockerUpdateRepository: (name, payload) =>
+    request(`/api/docker/repository${qs({ name })}`, { method: 'PATCH', body: payload }),
+  dockerRefreshTag: (name, tag) =>
+    request(`/api/docker/repository/refresh${qs({ name })}`, { method: 'POST', body: { tag } }),
+  dockerPurgeRepository: (name) =>
+    request(`/api/docker/repository${qs({ name })}`, { method: 'DELETE' }),
+  dockerRescan: (digest, full = false) =>
+    request(`/api/docker/manifest/${encodeURIComponent(digest)}/rescan${qs({ full: full || undefined })}`, {
+      method: 'POST',
+    }),
+  dockerPolicy: () => request('/api/docker/policy'),
+  dockerUpdatePolicy: (payload) => request('/api/docker/policy', { method: 'PUT', body: payload }),
+  dockerStats: () => request('/api/docker/stats'),
+  dockerPresets: () => request('/api/docker/presets'),
+  dockerAddPreset: (name, payload) =>
+    request(`/api/docker/presets/${encodeURIComponent(name)}`, { method: 'POST', body: payload }),
+  dockerIndexUpstream: (id) => request(`/api/docker/upstreams/${id}/index`, { method: 'POST' }),
 
   // -- documentation shipped with this build --------------------------------
   helpPages: () => request('/api/help/pages'),
