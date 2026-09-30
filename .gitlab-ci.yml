@@ -54,7 +54,7 @@ lint:backend:
   script:
     # The CLI is shipped to users verbatim from /api/cli/download, so it is
     # linted alongside the server rather than treated as a loose script.
-    - ruff check backend/app backend/tests cli
+    - ruff check backend/app backend/tests cli scanner
 
 # No frontend lint job: the project is plain JavaScript with no linter or type
 # checker configured, so `build:frontend` below is the real compile-time check.

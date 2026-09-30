@@ -13,6 +13,19 @@ const theme = ref(document.documentElement.getAttribute('data-theme') || 'light'
 
 const isLogin = computed(() => route.name === 'login')
 
+// Which sidebar section the current page belongs to, so its header is
+// highlighted -- including detail pages that have no nav entry of their own
+// (a package page is under Packages, an image page under Containers).
+const SECTIONS = {
+  packages: ['search', 'package', 'admin-packages', 'upstreams', 'policy', 'security', 'downloads'],
+  containers: ['images', 'image', 'docker-upstreams', 'image-policy'],
+  account: ['tokens', 'cli', 'cli-login', 'account'],
+  system: ['storage', 'users', 'audit'],
+}
+const section = computed(
+  () => Object.keys(SECTIONS).find((key) => SECTIONS[key].includes(route.name)) || null,
+)
+
 function toggleTheme() {
   theme.value = theme.value === 'dark' ? 'light' : 'dark'
   document.documentElement.setAttribute('data-theme', theme.value)
@@ -40,22 +53,58 @@ onMounted(() => auth.loadOidcStatus())
             <EcosystemIcon ecosystem="npm" class="eco-npm" :size="11" />
             <EcosystemIcon ecosystem="pypi" class="eco-pypi" :size="11" />
             <EcosystemIcon ecosystem="cargo" class="eco-cargo" :size="11" />
-            <span class="faint">npm · PyPI · cargo</span>
+            <EcosystemIcon ecosystem="docker" class="eco-docker" :size="11" />
           </div>
         </div>
       </router-link>
 
       <nav class="nav">
-        <div class="nav-section">Browse</div>
         <router-link class="nav-link" :to="{ name: 'home' }">
           <NavIcon name="home" /> Home
         </router-link>
-        <router-link class="nav-link" :to="{ name: 'search' }">
-          <NavIcon name="search" /> Search
+        <router-link v-if="auth.isAdmin" class="nav-link" :to="{ name: 'dashboard' }">
+          <NavIcon name="dashboard" /> Dashboard
         </router-link>
         <router-link class="nav-link" :to="{ name: 'setup' }">
           <NavIcon name="setup" /> Client setup
         </router-link>
+
+        <div class="nav-section" :class="{ current: section === 'packages' }">Packages</div>
+        <router-link class="nav-link" :class="{ 'router-link-active': route.name === 'package' }" :to="{ name: 'search' }">
+          <NavIcon name="search" /> Search
+        </router-link>
+        <template v-if="auth.isAdmin">
+          <router-link class="nav-link" :to="{ name: 'admin-packages' }">
+            <NavIcon name="package" /> Manage packages
+          </router-link>
+          <router-link class="nav-link" :to="{ name: 'upstreams' }">
+            <NavIcon name="upstreams" /> Upstreams
+          </router-link>
+          <router-link class="nav-link" :to="{ name: 'policy' }">
+            <NavIcon name="shield" /> Policy
+          </router-link>
+          <router-link class="nav-link" :to="{ name: 'security' }">
+            <NavIcon name="alert" /> Vulnerabilities
+          </router-link>
+          <router-link class="nav-link" :to="{ name: 'downloads' }">
+            <NavIcon name="downloads" /> Requests
+          </router-link>
+        </template>
+
+        <div class="nav-section" :class="{ current: section === 'containers' }">Containers</div>
+        <router-link class="nav-link" :class="{ 'router-link-active': route.name === 'image' }" :to="{ name: 'images' }">
+          <NavIcon name="container" /> Images
+        </router-link>
+        <template v-if="auth.isAdmin">
+          <router-link class="nav-link" :to="{ name: 'docker-upstreams' }">
+            <NavIcon name="registry" /> Registries
+          </router-link>
+          <router-link class="nav-link" :to="{ name: 'image-policy' }">
+            <NavIcon name="shield" /> Policy &amp; scanning
+          </router-link>
+        </template>
+
+        <div class="nav-section" :class="{ current: section === 'account' }">Account</div>
         <router-link class="nav-link" :to="{ name: 'tokens' }">
           <NavIcon name="key" /> API tokens
         </router-link>
@@ -64,30 +113,12 @@ onMounted(() => auth.loadOidcStatus())
         </router-link>
 
         <template v-if="auth.isAdmin">
-          <div class="nav-section">Administration</div>
-          <router-link class="nav-link" :to="{ name: 'dashboard' }">
-            <NavIcon name="dashboard" /> Dashboard
-          </router-link>
-          <router-link class="nav-link" :to="{ name: 'upstreams' }">
-            <NavIcon name="upstreams" /> Upstreams
-          </router-link>
-          <router-link class="nav-link" :to="{ name: 'policy' }">
-            <NavIcon name="shield" /> Package policy
-          </router-link>
-          <router-link class="nav-link" :to="{ name: 'security' }">
-            <NavIcon name="alert" /> Vulnerabilities
-          </router-link>
-          <router-link class="nav-link" :to="{ name: 'admin-packages' }">
-            <NavIcon name="package" /> Packages
-          </router-link>
+          <div class="nav-section" :class="{ current: section === 'system' }">System</div>
           <router-link class="nav-link" :to="{ name: 'storage' }">
             <NavIcon name="storage" /> Storage
           </router-link>
           <router-link class="nav-link" :to="{ name: 'users' }">
             <NavIcon name="users" /> Users
-          </router-link>
-          <router-link class="nav-link" :to="{ name: 'downloads' }">
-            <NavIcon name="downloads" /> Package requests
           </router-link>
           <router-link class="nav-link" :to="{ name: 'audit' }">
             <NavIcon name="audit" /> Audit log

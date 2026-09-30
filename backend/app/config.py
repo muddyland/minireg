@@ -187,6 +187,57 @@ class Settings(BaseSettings):
     download_log_retention_days: int = 365
     audit_log_retention_days: int = 730
 
+    # --- Container images (OCI distribution at /v2) --------------------------
+    docker_enabled: bool = True
+    # The first path segment reserved for images pushed here. Never routed to
+    # an upstream, never creatable as an upstream name.
+    docker_local_namespace: str = "local"
+    # Optional second hostname whose every /v2 path goes straight to Docker
+    # Hub. The daemon's `registry-mirrors` cannot carry a path prefix, so on
+    # the main host a Hub namespace that happens to share an upstream's name
+    # would be shadowed; a dedicated mirror host has no upstream names at all.
+    docker_mirror_hostname: str | None = None
+    # Origin at which in-cluster clients (the scanner sidecar) reach /v2
+    # directly, e.g. http://minireg:8000. A token challenge answered on that
+    # host points back at it, so those clients never need a route out through
+    # the public proxy. Anything not listed still gets PUBLIC_URL.
+    docker_internal_url: str | None = None
+    # How long a cached tag is trusted before it is revalidated with a HEAD.
+    # A HEAD does not use up Docker Hub's pull quota; the GET that follows a
+    # changed digest does.
+    docker_tag_ttl_seconds: int = 600
+    # Upstream "manifest unknown" answers are remembered this long, so a typo
+    # in a CI job does not cost an upstream request on every retry.
+    docker_negative_cache_ttl_seconds: int = 60
+    # Manifests are JSON documents a client parses whole; nothing legitimate
+    # comes close to this. Indexes are capped by entry count as well.
+    docker_max_manifest_bytes: int = 4 * 1024 * 1024
+    docker_max_index_entries: int = 256
+    # Layers are far bigger than packages, so they get their own ceiling.
+    docker_max_blob_bytes: int = 16 * 1024 * 1024 * 1024
+    # Wall-clock budget for one upstream layer download.
+    docker_blob_download_timeout_seconds: float = 3600.0
+    # Redirect hops followed on a layer fetch (registries hand off to a CDN).
+    docker_max_redirects: int = 3
+    # Default disk budget for cached images, in bytes. 0 = unlimited. The
+    # admin UI can change it at runtime; this is only the starting value.
+    docker_storage_budget_bytes: int = 200 * 1024 * 1024 * 1024
+    # Bearer tokens issued by /v2/token.
+    docker_token_ttl_seconds: int = 300
+    # Upstream quota at or below which the upstream is flagged in the UI and
+    # a warning is logged.
+    docker_ratelimit_warn_remaining: int = 20
+    # Where the scanner fetches the Trivy vulnerability database. Empty means
+    # through this registry's own ghcr upstream, so the 1.4 GB database is not
+    # pulled from ghcr.io once per worker.
+    docker_trivy_db_repository: str = ""
+    # CISA Known Exploited Vulnerabilities catalogue, refreshed daily.
+    kev_feed_url: str = (
+        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+    )
+    # Bearer token Prometheus presents to /metrics. Empty = admin session only.
+    metrics_token: str | None = None
+
     @field_validator("public_url")
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:

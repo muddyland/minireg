@@ -24,6 +24,7 @@
   --npm: #a8710a;
   --pypi: #3775a9;
   --cargo: #b1401a;
+  --docker: #1d63ed;
 
   --border-strong: #c2c8d2;
 
@@ -63,6 +64,7 @@
   --npm: #e0aa38;
   --pypi: #6ea8dc;
   --cargo: #ef8a5f;
+  --docker: #5b93f5;
   --border-strong: #474d58;
 
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.3);
@@ -91,6 +93,18 @@ h2 { font-size: 1.15rem; }
 h3 { font-size: 1rem; }
 
 code, pre, .mono { font-family: var(--mono); font-size: 0.86em; }
+/* Inline code reads as code: a quiet chip, not just smaller grey text. */
+:not(pre) > code {
+  font-size: 0.84em;
+  padding: 0.08em 0.35em;
+  border-radius: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+/* Inside tables and badges a chip is noise. */
+td > code, .badge code, .rail-value, .code-block-caption code { background: none; border: none; padding: 0; }
 
 pre {
   background: var(--surface-2);
@@ -139,6 +153,9 @@ a.brand:hover { text-decoration: none; }
   padding: 0.85rem 0.6rem 0.3rem;
   font-weight: 600;
 }
+/* The section holding the current page reads a step stronger, so detail
+   pages with no nav entry of their own still say where they belong. */
+.nav-section.current { color: var(--accent); }
 .nav-link {
   display: flex; align-items: center; gap: 0.6rem;
   padding: 0.44rem 0.6rem;
@@ -182,13 +199,16 @@ a.brand:hover { text-decoration: none; }
   position: sticky; top: 0; z-index: 20;
 }
 
-.content { padding: 1.35rem; flex: 1; max-width: 1400px; width: 100%; }
+/* No max-width: on a wide screen a cap left an empty strip down the right of
+   every page. Pages fill the main column; prose keeps its own measure
+   (.markdown, .page-sub), and grids add columns rather than stretching. */
+.content { padding: 1.35rem 1.6rem; flex: 1; width: 100%; min-width: 0; }
 
 .page-head {
   display: flex; align-items: flex-start; justify-content: space-between;
   gap: 1rem; margin-bottom: 1.1rem; flex-wrap: wrap;
 }
-.page-sub { color: var(--text-dim); font-size: 0.88rem; margin: 0; }
+.page-sub { color: var(--text-dim); font-size: 0.88rem; margin: 0; max-width: 90ch; }
 
 /* ---------- cards ---------- */
 .card {
@@ -360,12 +380,14 @@ input[type='checkbox'] {
 .badge-npm { background: color-mix(in srgb, var(--npm) 14%, transparent); color: var(--npm); border-color: transparent; }
 .badge-pypi { background: color-mix(in srgb, var(--pypi) 14%, transparent); color: var(--pypi); border-color: transparent; }
 .badge-cargo { background: color-mix(in srgb, var(--cargo) 14%, transparent); color: var(--cargo); border-color: transparent; }
+.badge-docker { background: color-mix(in srgb, var(--docker) 14%, transparent); color: var(--docker); border-color: transparent; }
 
 /* Ecosystem colour on anything that carries a brand mark (icons inherit
    currentColor). */
 .eco-npm { color: var(--npm); }
 .eco-pypi { color: var(--pypi); }
 .eco-cargo { color: var(--cargo); }
+.eco-docker { color: var(--docker); }
 
 /* Ecosystem filter chips (search). Monochrome until picked, then they take
    the ecosystem colour, so the active filter reads at a glance. */

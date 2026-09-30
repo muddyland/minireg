@@ -107,6 +107,7 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "name_patterns", "JSONB"),
     ("upstreams", "require_digest", "BOOLEAN NOT NULL DEFAULT TRUE"),
     ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
+    ("api_tokens", "docker_repo_prefixes", "JSONB"),
 ]
 
 

@@ -14,6 +14,9 @@ const purgeOptions = ref({ ecosystem: '', older_than_days: 30, unused_only: true
 const diskUsed = computed(() =>
   stats.value ? percent(stats.value.disk.used, stats.value.disk.total) : 0,
 )
+const imagePct = computed(() =>
+  stats.value?.images?.budget_bytes ? percent(stats.value.images.total_bytes, stats.value.images.budget_bytes) : 0,
+)
 const dedupeRatio = computed(() => {
   if (!stats.value?.blobs.logical_bytes) return 0
   return percent(stats.value.blobs.deduplicated_bytes, stats.value.blobs.logical_bytes)
@@ -68,8 +71,8 @@ onMounted(load)
     <div>
       <h1>Storage</h1>
       <p class="page-sub">
-        Artifacts are content-addressed, so identical files across packages and ecosystems are
-        stored once.
+        Package artifacts and container layers share the volume but are cached, counted and
+        evicted separately. Both are content-addressed, so identical files are stored once.
       </p>
     </div>
     <button class="btn" :disabled="busy" @click="gc">Run garbage collection</button>
@@ -81,7 +84,7 @@ onMounted(load)
   <template v-else-if="stats">
     <div class="grid grid-4 mb">
       <div class="card stat">
-        <div class="stat-label">Cached artifacts</div>
+        <div class="stat-label">Package artifacts</div>
         <div class="stat-value">{{ formatNumber(stats.blobs.count) }}</div>
         <div class="stat-meta">{{ formatNumber(stats.blobs.total_accesses) }} total reads</div>
       </div>
@@ -99,6 +102,43 @@ onMounted(load)
         <div class="stat-label">Disk free</div>
         <div class="stat-value">{{ formatBytes(stats.disk.free) }}</div>
         <div class="stat-meta">of {{ formatBytes(stats.disk.total) }} total</div>
+      </div>
+    </div>
+
+    <div v-if="stats.images" class="card mb">
+      <div class="card-head">
+        <h3><EcosystemBadge ecosystem="docker" label="container images" /></h3>
+        <router-link class="small" :to="{ name: 'image-policy' }">Budget &amp; eviction →</router-link>
+      </div>
+      <div class="card-body">
+        <div class="row" style="justify-content: space-between; margin-bottom: 0.4rem">
+          <span class="small dim">
+            {{ formatBytes(stats.images.total_bytes) }} of
+            {{ stats.images.budget_bytes ? formatBytes(stats.images.budget_bytes) + ' budget' : 'no budget (never evicted)' }}
+          </span>
+          <span v-if="stats.images.budget_bytes" class="small dim">{{ imagePct }}%</span>
+        </div>
+        <div v-if="stats.images.budget_bytes" class="meter">
+          <div class="meter-fill" :class="imagePct > 90 ? 'danger' : imagePct > 75 ? 'warn' : ''" :style="{ width: `${imagePct}%` }" />
+        </div>
+        <div class="grid grid-4 mt image-stats">
+          <div>
+            <div class="faint small">Repositories</div>
+            <div>{{ formatNumber(stats.images.repository_count) }}</div>
+          </div>
+          <div>
+            <div class="faint small">Layers</div>
+            <div>{{ formatNumber(stats.images.blob_count) }} · {{ formatBytes(stats.images.blob_bytes) }}</div>
+          </div>
+          <div>
+            <div class="faint small">Pushed here (never evicted)</div>
+            <div>{{ formatBytes(stats.images.local_blob_bytes) }}</div>
+          </div>
+          <div>
+            <div class="faint small">Manifests</div>
+            <div>{{ formatNumber(stats.images.manifest_count) }} · {{ formatBytes(stats.images.manifest_bytes) }}</div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -121,7 +161,7 @@ onMounted(load)
             The storage volume is nearly full. Purge unused artifacts or grow the volume.
           </p>
 
-          <h4 class="small mt">By ecosystem</h4>
+          <h4 class="small mt">Package artifacts by ecosystem</h4>
           <div v-if="!stats.by_ecosystem.length" class="faint small">Nothing cached yet.</div>
           <div v-else class="bars">
             <div v-for="row in stats.by_ecosystem" :key="row.ecosystem" class="bar-row">
@@ -145,7 +185,7 @@ onMounted(load)
       </div>
 
       <div class="card">
-        <div class="card-head"><h3>Cache eviction</h3></div>
+        <div class="card-head"><h3>Package cache eviction</h3></div>
         <div class="card-body">
           <p class="dim small mb">
             Evicted artifacts are re-downloaded from their upstream on the next request. Files
@@ -156,7 +196,7 @@ onMounted(load)
           <div class="field">
             <label>Ecosystem</label>
             <select v-model="purgeOptions.ecosystem">
-              <option value="">Both</option>
+              <option value="">All ecosystems</option>
               <option value="npm">npm only</option>
               <option value="pypi">PyPI only</option>
               <option value="cargo">cargo only</option>
@@ -194,3 +234,9 @@ onMounted(load)
     </div>
   </template>
 </template>
+
+<style scoped>
+.image-stats {
+  gap: 0.6rem 1rem;
+}
+</style>

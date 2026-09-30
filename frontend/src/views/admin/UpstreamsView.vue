@@ -209,6 +209,10 @@ onMounted(load)
   <div v-if="loading" class="empty">Loading…</div>
 
   <template v-else>
+    <div class="alert alert-info small">
+      Container registries (Docker Hub, GHCR, Quay…) are configured on
+      <router-link :to="{ name: 'docker-upstreams' }">Container upstreams</router-link>.
+    </div>
     <div v-for="eco in ECOSYSTEMS" :key="eco" class="card mb">
       <div class="card-head">
         <h3>

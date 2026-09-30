@@ -113,6 +113,21 @@ internal package, whatever the tier order and whatever the internal upstream
 is doing at the time. **Require digest** refuses to cache an artifact the
 upstream published no hash for.
 
+### Container images
+
+Full guide: [Container images](containers.md).
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DOCKER_ENABLED` | `true` | Serves the OCI distribution API at `/v2/`. |
+| `DOCKER_LOCAL_NAMESPACE` | `local` | First path segment for images pushed here. Never routed upstream. |
+| `DOCKER_MIRROR_HOSTNAME` | unset | Second hostname on which every name is a Docker Hub name, for dockerd's `registry-mirrors`. |
+| `DOCKER_INTERNAL_URL` | unset (`http://minireg:8000` in compose) | Extra origin accepted for token challenges, so the scanner sidecar stays on the internal network. |
+| `DOCKER_TAG_TTL_SECONDS` | `600` | How long a cached tag is trusted before a HEAD revalidates it. HEADs don't count against Docker Hub's pull limit. |
+| `DOCKER_NEGATIVE_CACHE_TTL_SECONDS` | `60` | How long an upstream "manifest unknown" is remembered. |
+| `DOCKER_MAX_BLOB_BYTES` | `17179869184` | Largest layer fetched or pushed. |
+| `DOCKER_STORAGE_BUDGET_BYTES` | `214748364800` | Starting disk budget for cached images; adjustable on the Image policy page. `0` is unlimited. |
+
 ### Limits
 
 | Variable | Default | Notes |

@@ -73,12 +73,31 @@ export function percent(value, total) {
 // `eco === 'npm' ? 'badge-npm' : 'badge-pypi'` ternary repeated across eight
 // views, which silently mislabelled every ecosystem that was not npm the
 // moment a third one existed.
-const ECOSYSTEMS = ['npm', 'pypi', 'cargo']
+const ECOSYSTEMS = ['npm', 'pypi', 'cargo', 'docker']
 
 export function ecosystemBadge(ecosystem) {
   return ECOSYSTEMS.includes(ecosystem) ? `badge-${ecosystem}` : 'badge'
 }
 
 export function ecosystemLabel(ecosystem) {
-  return ecosystem === 'pypi' ? 'PyPI' : ecosystem
+  if (ecosystem === 'pypi') return 'PyPI'
+  if (ecosystem === 'docker') return 'Docker'
+  return ecosystem
+}
+
+/** Trivy's qualitative severities, worst first. */
+export const SEVERITIES = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN']
+
+export function trivySeverityClass(severity) {
+  const s = (severity || '').toUpperCase()
+  if (s === 'CRITICAL') return 'sev-critical'
+  if (s === 'HIGH') return 'sev-high'
+  if (s === 'MEDIUM') return 'sev-medium'
+  return 'sev-low'
+}
+
+export function shortDigest(digest) {
+  if (!digest) return '—'
+  const [algo, hex] = digest.split(':')
+  return hex ? `${algo}:${hex.slice(0, 12)}` : digest
 }

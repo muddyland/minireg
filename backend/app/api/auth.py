@@ -33,7 +33,7 @@ from ..services import audit, oidc
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-VALID_SCOPES = {"read", "publish", "admin"}
+VALID_SCOPES = {"read", "publish", "admin", "docker:push", "scanner"}
 #: Short-lived cookie tying an OIDC flow to the browser that began it.
 OIDC_BIND_COOKIE = "minireg_oidc_bind"
 
@@ -66,6 +66,9 @@ class TokenCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     scopes: list[str] = Field(default_factory=lambda: ["read"])
     expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+    #: For a docker:push token, the repositories it may push to, e.g.
+    #: ["local/ci/"]. Empty = any repository the owner may push to.
+    docker_repo_prefixes: list[str] = Field(default_factory=list, max_length=20)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -273,6 +276,7 @@ async def list_tokens(
                 "name": t.name,
                 "prefix": t.prefix,
                 "scopes": t.scopes,
+                "docker_repo_prefixes": t.docker_repo_prefixes or [],
                 "created_at": t.created_at,
                 "expires_at": t.expires_at,
                 "last_used_at": t.last_used_at,
@@ -281,6 +285,23 @@ async def list_tokens(
             for t in rows
         ]
     }
+
+
+def _docker_prefixes(values: list[str]) -> list[str]:
+    """Normalise push prefixes: each must sit under the local namespace."""
+    local = settings.docker_local_namespace
+    out = []
+    for raw in values:
+        value = raw.strip().lower()
+        if not value:
+            continue
+        if not value.startswith(f"{local}/") or ".." in value or len(value) > 200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"repository prefixes must start with '{local}/'",
+            )
+        out.append(value)
+    return sorted(set(out))
 
 
 @router.post("/tokens", status_code=status.HTTP_201_CREATED)
@@ -304,10 +325,22 @@ async def create_token(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="only admins can mint admin tokens"
         )
-    if "publish" in requested and not (user.can_publish or user.is_admin):
+    if requested & {"publish", "docker:push"} and not (user.can_publish or user.is_admin):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="this account is not permitted to publish",
+        )
+    # The scanner scope reads every image, quarantined ones included, and
+    # reports scan results. It belongs to the scanner worker's own token.
+    if "scanner" in requested and not user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="only admins can mint scanner tokens"
+        )
+    prefixes = _docker_prefixes(payload.docker_repo_prefixes)
+    if prefixes and "docker:push" not in requested:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="repository prefixes only apply to a docker:push token",
         )
 
     full_token, prefix, token_hash = generate_token()
@@ -323,6 +356,7 @@ async def create_token(
         token_hash=token_hash,
         scopes=sorted(requested),
         expires_at=expires_at,
+        docker_repo_prefixes=prefixes,
     )
     session.add(row)
     await session.flush()
@@ -335,7 +369,11 @@ async def create_token(
         target_type="token",
         target_id=str(row.id),
         ip=client_ip(request),
-        detail={"name": payload.name, "scopes": sorted(requested)},
+        detail={
+            "name": payload.name,
+            "scopes": sorted(requested),
+            "docker_repo_prefixes": prefixes,
+        },
     )
     await session.commit()
 
@@ -343,6 +381,7 @@ async def create_token(
         "id": row.id,
         "name": row.name,
         "scopes": row.scopes,
+        "docker_repo_prefixes": row.docker_repo_prefixes or [],
         "expires_at": row.expires_at,
         # Shown exactly once; only the hash is stored.
         "token": full_token,

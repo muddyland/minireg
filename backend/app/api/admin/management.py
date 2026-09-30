@@ -296,6 +296,9 @@ class UpstreamCreate(BaseModel):
     allow_publish: bool = False
     index_packages: bool = False
     web_url_template: str | None = None
+    #: Docker upstreams: blob_hosts (CDN hosts layer downloads may redirect
+    #: to), registry_url (GitLab container registry host), default.
+    extra: dict = Field(default_factory=dict)
 
 
 class UpstreamUpdate(BaseModel):
@@ -317,6 +320,7 @@ class UpstreamUpdate(BaseModel):
     allow_publish: bool | None = None
     index_packages: bool | None = None
     web_url_template: str | None = None
+    extra: dict | None = None
 
 
 def upstream_payload(upstream: Upstream) -> dict:
@@ -349,7 +353,23 @@ def upstream_payload(upstream: Upstream) -> dict:
         "last_indexed_at": upstream.last_indexed_at,
         "consecutive_failures": upstream.consecutive_failures,
         "created_at": upstream.created_at,
+        "extra": _public_extra(upstream),
+        "ratelimit": _ratelimit(upstream),
     }
+
+
+def _public_extra(upstream: Upstream) -> dict:
+    extra = upstream.extra or {}
+    keys = ("blob_hosts", "auth_hosts", "registry_url", "default", "preset", "library_prefix")
+    return {k: extra[k] for k in keys if k in extra}
+
+
+def _ratelimit(upstream: Upstream) -> dict | None:
+    if upstream.ecosystem != Ecosystem.docker:
+        return None
+    from ...docker.upstream import RATELIMITS
+
+    return RATELIMITS.get(upstream.name)
 
 
 #: Which provider kinds can back each ecosystem. GitLab publishes npm and
@@ -358,6 +378,7 @@ _KINDS_FOR_ECOSYSTEM = {
     Ecosystem.npm: {UpstreamKind.npm, UpstreamKind.gitlab_npm},
     Ecosystem.pypi: {UpstreamKind.pypi, UpstreamKind.gitlab_pypi},
     Ecosystem.cargo: {UpstreamKind.cargo},
+    Ecosystem.docker: {UpstreamKind.oci, UpstreamKind.gitlab_oci},
 }
 
 
@@ -367,6 +388,54 @@ def _validate_kind(ecosystem: Ecosystem, kind: UpstreamKind) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"kind '{kind.value}' is not valid for ecosystem '{ecosystem.value}'",
         )
+
+
+def _validate_docker_upstream(name: str, url: str, extra: dict, kind: UpstreamKind) -> dict:
+    """A Docker upstream's name is a routing decision, not a label.
+
+    It becomes the first path segment of every image it serves, so a name
+    that collides with the local namespace, `library`, or a preset pointing
+    somewhere else would silently redirect pulls. Refused outright.
+    """
+    from urllib.parse import urlsplit
+
+    from ...docker.naming import upstream_name_problem
+
+    problem = upstream_name_problem(name, url)
+    if problem:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=problem)
+    allowed_keys = {"blob_hosts", "auth_hosts", "registry_url", "default", "preset", "library_prefix"}
+    cleaned = {k: v for k, v in dict(extra or {}).items() if k in allowed_keys}
+    for key in ("blob_hosts", "auth_hosts"):
+        hosts = cleaned.get(key) or []
+        if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
+            raise HTTPException(status_code=400, detail=f"{key} must be a list of host names")
+        cleaned[key] = sorted({h.strip().lower() for h in hosts if h.strip()})[:32]
+        for host in cleaned[key]:
+            # A wildcard that matches everything turns the allowlist off.
+            if host in ("*", "*.*") or (host.startswith("*.") and host.count(".") < 2):
+                raise HTTPException(status_code=400, detail=f"host pattern '{host}' is too broad")
+            if not all(part and (part == "*" or part.replace("-", "").replace("*", "").isalnum()) for part in host.split(".")):
+                raise HTTPException(status_code=400, detail=f"'{host}' is not a host name")
+    if not cleaned.get("auth_hosts"):
+        cleaned.pop("auth_hosts", None)
+    if "library_prefix" in cleaned:
+        cleaned["library_prefix"] = bool(cleaned["library_prefix"])
+    if kind == UpstreamKind.gitlab_oci:
+        registry_url = str(cleaned.get("registry_url") or "").strip()
+        parts = urlsplit(registry_url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise HTTPException(
+                status_code=400,
+                detail="a GitLab container registry needs its registry URL, "
+                "e.g. https://registry.gitlab.example.com",
+            )
+        if parts.scheme == "http" and not settings.upstream_allow_plaintext_http:
+            raise HTTPException(status_code=400, detail="refusing a plaintext http:// registry URL")
+        cleaned["registry_url"] = registry_url.rstrip("/")
+    if cleaned.get("default"):
+        cleaned["default"] = True
+    return cleaned
 
 
 @router.get("/upstreams")
@@ -389,6 +458,12 @@ async def create_upstream(
     _validate_kind(payload.ecosystem, payload.kind)
     data = payload.model_dump(exclude={"credential"})
     data["url"] = _validated_upstream_url(data["url"])
+    if payload.ecosystem == Ecosystem.docker:
+        data["extra"] = _validate_docker_upstream(payload.name, data["url"], payload.extra, payload.kind)
+        if data["extra"].get("default"):
+            await _clear_default(session)
+    else:
+        data["extra"] = {}
     upstream = Upstream(**data, credential_enc=encrypt_credential(payload.credential))
     session.add(upstream)
     try:
@@ -435,6 +510,31 @@ async def update_upstream(
     updates = payload.model_dump(exclude_unset=True, exclude={"credential"})
     if updates.get("url"):
         updates["url"] = _validated_upstream_url(updates["url"])
+    if upstream.ecosystem == Ecosystem.docker:
+        if updates.get("name") and updates["name"] != upstream.name:
+            # The name is the first path segment of every image it serves and
+            # part of each cached repository's canonical name. Renaming would
+            # break every client reference and orphan the cache.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="a container upstream cannot be renamed: its name is the image path prefix. "
+                "Add a new upstream under the new name instead.",
+            )
+        # Validate only when routing-relevant fields change: switching an
+        # upstream off must work even if it was created before a rule it
+        # would now fail existed.
+        if "extra" in updates or "url" in updates:
+            merged_extra = {**(upstream.extra or {}), **(updates.get("extra") or {})}
+            updates["extra"] = _validate_docker_upstream(
+                upstream.name,
+                updates.get("url") or upstream.url,
+                merged_extra,
+                upstream.kind,
+            )
+            if updates["extra"].get("default") and not (upstream.extra or {}).get("default"):
+                await _clear_default(session)
+    else:
+        updates.pop("extra", None)
     for field, value in updates.items():
         if value is not None and getattr(upstream, field) != value:
             changes[field] = value
@@ -464,10 +564,53 @@ async def update_upstream(
     return upstream_payload(upstream)
 
 
+async def _docker_upstream_cache(session: AsyncSession, upstream: Upstream, *, purge: bool) -> int:
+    """Cached repositories of a Docker upstream that is being deleted.
+
+    The foreign keys are ON DELETE SET NULL, and a manifest with no upstream
+    is how a pushed image is recognised: deleting an upstream out from under
+    its cache would turn every cached image into an apparently local one --
+    judged by the push rules and exempt from eviction. So the cache goes
+    first, explicitly, or the delete is refused.
+    """
+    from sqlalchemy import delete as sa_delete
+
+    from ...models import DockerRepoBlob, DockerRepoManifest, DockerRepository, DockerTag
+
+    repo_ids = (
+        await session.execute(select(DockerRepository.id).where(DockerRepository.upstream_id == upstream.id))
+    ).scalars().all()
+    if repo_ids and not purge:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"'{upstream.name}' has {len(repo_ids)} cached repositories. Disable it instead, "
+                "or delete with purge=true to drop its cache as well."
+            ),
+        )
+    for table in (DockerTag, DockerRepoManifest, DockerRepoBlob):
+        await session.execute(sa_delete(table).where(table.repository_id.in_(repo_ids)))
+    await session.execute(sa_delete(DockerRepository).where(DockerRepository.id.in_(repo_ids)))
+    # Manifests and blobs now in no repository cannot be pulled (every read
+    # goes through a repository link) and are collected by the next GC.
+    return len(repo_ids)
+
+
+async def _clear_default(session: AsyncSession) -> None:
+    """Only one Docker upstream answers un-prefixed names."""
+    rows = (
+        await session.execute(select(Upstream).where(Upstream.ecosystem == Ecosystem.docker))
+    ).scalars().all()
+    for row in rows:
+        if (row.extra or {}).get("default"):
+            row.extra = {k: v for k, v in row.extra.items() if k != "default"}
+
+
 @router.delete("/upstreams/{upstream_id}")
 async def delete_upstream(
     upstream_id: int,
     request: Request,
+    purge: bool = False,
     session: AsyncSession = Depends(get_session),
     identity: Identity = Depends(require_admin),
 ) -> dict:
@@ -475,6 +618,9 @@ async def delete_upstream(
     if upstream is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="upstream not found")
     name = upstream.name
+    purged = 0
+    if upstream.ecosystem == Ecosystem.docker:
+        purged = await _docker_upstream_cache(session, upstream, purge=purge)
     await session.delete(upstream)
 
     await audit.record_audit(
@@ -485,10 +631,10 @@ async def delete_upstream(
         target_type="upstream",
         target_id=str(upstream_id),
         ip=client_ip(request),
-        detail={"name": name},
+        detail={"name": name, "purged_repositories": purged} if purged else {"name": name},
     )
     await session.commit()
-    return {"ok": True}
+    return {"ok": True, "purged_repositories": purged}
 
 
 @router.post("/upstreams/{upstream_id}/test")
@@ -499,8 +645,13 @@ async def test_upstream(
     if upstream is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="upstream not found")
 
-    provider = build_provider(upstream)
-    healthy, error = await provider.health_check()
+    if upstream.ecosystem == Ecosystem.docker:
+        from ...docker.upstream import RegistryClient
+
+        healthy, error = await RegistryClient(upstream).ping()
+    else:
+        provider = build_provider(upstream)
+        healthy, error = await provider.health_check()
     upstream.healthy = healthy
     upstream.last_error = error
     upstream.last_check_at = datetime.now(UTC)

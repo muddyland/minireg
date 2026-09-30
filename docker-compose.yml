@@ -188,6 +188,16 @@ services:
       UPSTREAM_ALLOW_PRIVATE_ADDRESSES: ${UPSTREAM_ALLOW_PRIVATE_ADDRESSES:-false}
       UPSTREAM_ALLOW_PLAINTEXT_HTTP: ${UPSTREAM_ALLOW_PLAINTEXT_HTTP:-false}
 
+      # -- container images (see docs/containers.md) --------------------------
+      DOCKER_ENABLED: ${DOCKER_ENABLED:-true}
+      # Optional second hostname on which every image name is a Docker Hub
+      # name, for dockerd's registry-mirrors setting.
+      DOCKER_MIRROR_HOSTNAME: ${DOCKER_MIRROR_HOSTNAME:-}
+      # How the scanner reaches /v2 inside the compose network.
+      DOCKER_INTERNAL_URL: ${DOCKER_INTERNAL_URL:-http://minireg:8000}
+      DOCKER_TAG_TTL_SECONDS: ${DOCKER_TAG_TTL_SECONDS:-600}
+      DOCKER_STORAGE_BUDGET_BYTES: ${DOCKER_STORAGE_BUDGET_BYTES:-214748364800}
+
       # -- limits -------------------------------------------------------------
       MAX_PUBLISH_BYTES: ${MAX_PUBLISH_BYTES:-268435456}
       MAX_METADATA_BYTES: ${MAX_METADATA_BYTES:-100663296}
@@ -230,10 +240,51 @@ services:
       start_period: 25s
     networks: [minireg]
 
+  # Trivy worker for container images. Opt in with `--profile scanner` once
+  # an admin has created an API token with the `scanner` scope and put it in
+  # .env as MINIREG_SCANNER_TOKEN. It unpacks untrusted image layers, so it
+  # gets nothing worth stealing: no database, no upstream credentials, a
+  # scan-only token, a read-only root and hard limits.
+  scanner:
+    build:
+      context: .
+      dockerfile: scanner/Dockerfile
+    image: minireg-scanner:1.0.0
+    profiles: [scanner]
+    restart: unless-stopped
+    depends_on:
+      minireg:
+        condition: service_healthy
+    environment:
+      MINIREG_URL: http://minireg:8000
+      # The worker exits with a clear error if this is empty.
+      MINIREG_SCANNER_TOKEN: ${MINIREG_SCANNER_TOKEN:-}
+      SCANNER_NAME: ${SCANNER_NAME:-scanner-1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # Vulnerability DB and layer cache; survives restarts so the DB is not
+      # downloaded again on every deploy.
+      - trivy-cache:/cache
+    read_only: true
+    tmpfs:
+      - /tmp:size=4g
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${SCANNER_MEM_LIMIT:-2g}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks: [minireg]
+
 volumes:
   postgres-data:
   redis-data:
   package-storage:
+  trivy-cache:
 
 networks:
   minireg:

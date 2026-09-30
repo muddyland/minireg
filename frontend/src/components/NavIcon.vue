@@ -47,6 +47,21 @@ const PATHS = {
   ],
   audit: ['M6 3h9l3.5 3.5V21H6V3z', 'M14.6 3v4h4', 'M9 12h6', 'M9 16h6'],
   account: ['M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z', 'M4.5 20.5a7.5 7.5 0 0 1 15 0'],
+  container: [
+    'M3.5 8.5h17v11h-17z',
+    'M7.5 8.5v11',
+    'M12 8.5v11',
+    'M16.5 8.5v11',
+    'M7 8.5V5h10v3.5',
+  ],
+  // A registry: stacked layers behind a link, distinct from the package
+  // upstreams' download arrow so the two sections do not look identical.
+  registry: [
+    'M4 6.5h16v4H4z',
+    'M4 13.5h16v4H4z',
+    'M7.5 8.5h.01',
+    'M7.5 15.5h.01',
+  ],
   terminal: ['M3.5 4.5h17v15h-17z', 'M7 9.5l3 2.5-3 2.5', 'M13 15h4'],
   eye: ['M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z', 'M12 14.6a2.6 2.6 0 1 0 0-5.2 2.6 2.6 0 0 0 0 5.2z'],
   'eye-off': [

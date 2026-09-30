@@ -83,6 +83,9 @@ class Ecosystem(enum.StrEnum):
     npm = "npm"
     pypi = "pypi"
     cargo = "cargo"
+    # Container images. Only upstream rows and download-log rows carry it:
+    # images have their own tables below and never become a Package.
+    docker = "docker"
 
 
 class UpstreamKind(enum.StrEnum):
@@ -91,6 +94,11 @@ class UpstreamKind(enum.StrEnum):
     cargo = "cargo"
     gitlab_npm = "gitlab_npm"
     gitlab_pypi = "gitlab_pypi"
+    # Any OCI distribution registry (Docker Hub, ghcr.io, quay.io, ...).
+    oci = "oci"
+    # A GitLab container registry: its own registry host, token auth through
+    # the GitLab instance, repository listing through the GitLab API.
+    gitlab_oci = "gitlab_oci"
 
 
 class RuleAction(enum.StrEnum):
@@ -158,6 +166,11 @@ class ApiToken(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Repository prefixes under local/ that a `docker:push` token may write,
+    # e.g. ["local/ci/"]. Empty means any repository the owner may push to.
+    # A CI token ends up base64'd in ~/.docker/config.json on every runner, so
+    # narrowing it is worth the extra field.
+    docker_repo_prefixes: Mapped[list] = mapped_column(JSONType, default=list)
 
     user: Mapped[User] = relationship(back_populates="tokens")
 
@@ -655,3 +668,312 @@ class DownloadLog(Base):
         Index("ix_dl_user_ts", "user_id", "ts"),
         CheckConstraint("kind in ('file','metadata')", name="ck_dl_kind"),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Container images
+# --------------------------------------------------------------------------- #
+# A separate model from packages. An image is addressed by digest, a tag is a
+# movable pointer, and one manifest digest can live in many repositories
+# (``alpine`` and ``python`` both carry the same base layers). Layer bytes live
+# in their own content-addressed store under STORAGE_PATH/oci, so nothing the
+# package blob GC does can reach them.
+class DockerRepository(Base):
+    __tablename__ = "docker_repositories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Canonical name: "<upstream>/<remote>" or "<local namespace>/<rest>".
+    name: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    upstream_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upstreams.id", ondelete="SET NULL"), index=True
+    )
+    remote_name: Mapped[str | None] = mapped_column(String(512))
+    is_local: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # First pusher. Only the owner (or an admin) may push further tags or
+    # delete. NULL for a cached upstream repository.
+    owner_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    # Exempt from LRU eviction.
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Every pull from this repository is refused with the reason below.
+    quarantined: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    quarantine_reason: Mapped[str | None] = mapped_column(Text)
+    # Watched tags are revalidated, pre-fetched and rescanned on a schedule,
+    # so a CI fleet finds them warm and current. ["3.12-slim", "latest"].
+    watched_tags: Mapped[list] = mapped_column(JSONType, default=list)
+    # Present only for repositories discovered by listing an upstream (GitLab)
+    # and never pulled; keeps them out of storage figures.
+    indexed_only: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    pull_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    created_at: Mapped[datetime] = _now_col()
+    last_pulled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DockerManifest(Base):
+    """One manifest or index, stored byte-exact.
+
+    The digest is the sha256 of these exact bytes, so the bytes live in the
+    OCI blob store under that digest and are never re-serialised.
+    """
+
+    __tablename__ = "docker_manifests"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    digest: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
+    media_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    is_index: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # image | index | attestation | artifact | signature
+    kind: Mapped[str] = mapped_column(String(16), default="image", nullable=False)
+    artifact_type: Mapped[str | None] = mapped_column(String(255))
+    config_digest: Mapped[str | None] = mapped_column(String(80))
+    config_media_type: Mapped[str | None] = mapped_column(String(128))
+    # "linux/amd64", "linux/arm64/v8"; from the index entry that named it, or
+    # from the config once it is known.
+    platform: Mapped[str | None] = mapped_column(String(64))
+    # Config + every layer. The figure the pull-time hold is gated on.
+    total_size: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    layer_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # OCI 1.1 `subject`: this manifest refers to another (a signature, SBOM).
+    subject_digest: Mapped[str | None] = mapped_column(String(80), index=True)
+    annotations: Mapped[dict] = mapped_column(JSONType, default=dict)
+    # Upstream the bytes were fetched from; NULL when pushed here.
+    upstream_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upstreams.id", ondelete="SET NULL")
+    )
+    pushed_by_user_id: Mapped[int | None] = mapped_column(Integer)
+
+    # -- scanning, denormalised for list pages and the per-pull policy check.
+    # unscanned | queued | scanning | scanned | failed | not_applicable
+    scan_status: Mapped[str] = mapped_column(String(16), default="unscanned", nullable=False)
+    scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    latest_scan_id: Mapped[int | None] = mapped_column(BigInteger)
+    severity_counts: Mapped[dict] = mapped_column(JSONType, default=dict)
+    max_cvss: Mapped[float | None] = mapped_column(Float)
+    fixable_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    kev_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Stored CycloneDX SBOM (a blob in the OCI store). Rescans run against it
+    # instead of pulling the image again.
+    sbom_digest: Mapped[str | None] = mapped_column(String(80))
+    # Set when a pushed image fails the push policy: pulls are refused.
+    policy_block_reason: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = _now_col()
+    last_accessed_at: Mapped[datetime] = _now_col(index=True)
+
+
+class DockerManifestRef(Base):
+    """What a manifest points at: layers and config (blobs) or, for an index,
+    child manifests. Drives blob GC and "does this push reference blobs that
+    exist" checks."""
+
+    __tablename__ = "docker_manifest_refs"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    manifest_id: Mapped[int] = mapped_column(
+        ForeignKey("docker_manifests.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    # blob | config | manifest
+    ref_type: Mapped[str] = mapped_column(String(8), nullable=False)
+    digest: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    media_type: Mapped[str | None] = mapped_column(String(128))
+    size: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    platform: Mapped[str | None] = mapped_column(String(64))
+    annotations: Mapped[dict] = mapped_column(JSONType, default=dict)
+
+
+class DockerRepoManifest(Base):
+    """A manifest is present in a repository. The LRU unit for eviction."""
+
+    __tablename__ = "docker_repo_manifests"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    repository_id: Mapped[int] = mapped_column(
+        ForeignKey("docker_repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    manifest_id: Mapped[int] = mapped_column(
+        ForeignKey("docker_manifests.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    created_at: Mapped[datetime] = _now_col()
+    last_pulled_at: Mapped[datetime] = _now_col(index=True)
+    pull_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("repository_id", "manifest_id", name="uq_docker_repo_manifest"),
+    )
+
+
+class DockerTag(Base):
+    __tablename__ = "docker_tags"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    repository_id: Mapped[int] = mapped_column(
+        ForeignKey("docker_repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    tag: Mapped[str] = mapped_column(String(128), nullable=False)
+    manifest_id: Mapped[int] = mapped_column(
+        ForeignKey("docker_manifests.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    # When the upstream last confirmed this tag still points at this digest.
+    checked_at: Mapped[datetime] = _now_col()
+    updated_at: Mapped[datetime] = _updated_col()
+    pushed_by_user_id: Mapped[int | None] = mapped_column(Integer)
+
+    __table_args__ = (UniqueConstraint("repository_id", "tag", name="uq_docker_repo_tag"),)
+
+
+class DockerBlob(Base):
+    """A layer or config blob in the OCI store."""
+
+    __tablename__ = "docker_blobs"
+
+    digest: Mapped[str] = mapped_column(String(80), primary_key=True)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    media_type: Mapped[str | None] = mapped_column(String(128))
+    upstream_id: Mapped[int | None] = mapped_column(Integer)
+    # True when the bytes arrived by push. Pushed blobs are never evicted:
+    # they exist nowhere else.
+    is_local: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = _now_col()
+    last_accessed_at: Mapped[datetime] = _now_col(index=True)
+
+
+class DockerRepoBlob(Base):
+    """A blob uploaded or mounted into a local repository.
+
+    Pull-through repositories do not need this -- their blobs are reachable
+    through their manifests -- but a push uploads blobs before the manifest
+    that references them exists, and the manifest PUT must be able to tell
+    that they arrived in *this* repository.
+    """
+
+    __tablename__ = "docker_repo_blobs"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    repository_id: Mapped[int] = mapped_column(
+        ForeignKey("docker_repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    digest: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    created_at: Mapped[datetime] = _now_col()
+
+    __table_args__ = (UniqueConstraint("repository_id", "digest", name="uq_docker_repo_blob"),)
+
+
+class DockerUpload(Base):
+    """An in-progress blob upload session (push)."""
+
+    __tablename__ = "docker_uploads"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    repository_id: Mapped[int] = mapped_column(
+        ForeignKey("docker_repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[int | None] = mapped_column(Integer)
+    size: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    created_at: Mapped[datetime] = _now_col()
+    updated_at: Mapped[datetime] = _updated_col(index=True)
+
+
+class DockerScanJob(Base):
+    """Queue for the scanner worker.
+
+    Claimed with SELECT ... FOR UPDATE SKIP LOCKED on Postgres, so any number
+    of workers can drain it. A claim carries a lease; a worker that dies stops
+    renewing it and the job goes back to the queue.
+    """
+
+    __tablename__ = "docker_scan_jobs"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    manifest_id: Mapped[int] = mapped_column(
+        ForeignKey("docker_manifests.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    # Repository the worker pulls through (any repository holding the digest).
+    repository: Mapped[str] = mapped_column(String(512), nullable=False)
+    # image: pull and scan the image, produce an SBOM. sbom: rescan a stored
+    # SBOM against the current database -- no layer traffic at all.
+    mode: Mapped[str] = mapped_column(String(8), default="image", nullable=False)
+    # pull | push | schedule | manual | watch
+    reason: Mapped[str] = mapped_column(String(16), default="pull", nullable=False)
+    # Lower runs first. Pull-time and push-time scans jump the queue.
+    priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
+    # queued | running | done | failed
+    status: Mapped[str] = mapped_column(String(8), default="queued", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    worker: Mapped[str | None] = mapped_column(String(128))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _now_col()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("ix_docker_scan_job_queue", "status", "priority", "id"),)
+
+
+class DockerScan(Base):
+    """One completed scan of one image manifest."""
+
+    __tablename__ = "docker_scans"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    manifest_id: Mapped[int] = mapped_column(
+        ForeignKey("docker_manifests.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    mode: Mapped[str] = mapped_column(String(8), default="image", nullable=False)
+    trivy_version: Mapped[str | None] = mapped_column(String(32))
+    db_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    os_family: Mapped[str | None] = mapped_column(String(64))
+    os_name: Mapped[str | None] = mapped_column(String(64))
+    severity_counts: Mapped[dict] = mapped_column(JSONType, default=dict)
+    finding_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_cvss: Mapped[float | None] = mapped_column(Float)
+    # Raw Trivy JSON, kept in the OCI store for the last N scans per digest.
+    report_digest: Mapped[str | None] = mapped_column(String(80))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = _now_col(index=True)
+
+
+class DockerFinding(Base):
+    """A vulnerability in the latest scan of an image manifest.
+
+    Only the latest scan's findings are kept as rows; older scans keep their
+    counts and raw report.
+    """
+
+    __tablename__ = "docker_findings"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    manifest_id: Mapped[int] = mapped_column(
+        ForeignKey("docker_manifests.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    scan_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    vuln_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    pkg_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    pkg_type: Mapped[str | None] = mapped_column(String(32))
+    installed_version: Mapped[str | None] = mapped_column(String(128))
+    fixed_version: Mapped[str | None] = mapped_column(String(255))
+    severity: Mapped[str] = mapped_column(String(10), nullable=False)
+    cvss: Mapped[float | None] = mapped_column(Float)
+    title: Mapped[str | None] = mapped_column(Text)
+    url: Mapped[str | None] = mapped_column(String(512))
+    layer_digest: Mapped[str | None] = mapped_column(String(80))
+    kev: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    __table_args__ = (Index("ix_docker_finding_sev", "manifest_id", "severity"),)
+
+
+class KevEntry(Base):
+    """CISA Known Exploited Vulnerabilities catalogue, refreshed daily."""
+
+    __tablename__ = "kev_entries"
+
+    cve_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    vendor: Mapped[str | None] = mapped_column(String(255))
+    product: Mapped[str | None] = mapped_column(String(255))
+    name: Mapped[str | None] = mapped_column(Text)
+    date_added: Mapped[str | None] = mapped_column(String(16))
+    ransomware: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
