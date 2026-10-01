@@ -55,8 +55,10 @@ class Image:
     digest: str = ""
 
     @classmethod
-    def build(cls, seed: str, layer_sizes=(1000, 3000), extra: dict | None = None) -> Image:
-        config = dumps({"architecture": "amd64", "os": "linux", "seed": seed})
+    def build(
+        cls, seed: str, layer_sizes=(1000, 3000), extra: dict | None = None, config: dict | None = None
+    ) -> Image:
+        config = dumps(config or {"architecture": "amd64", "os": "linux", "seed": seed})
         layers = [(seed.encode() + bytes([i])) * (n // (len(seed) + 1) + 1) for i, n in enumerate(layer_sizes)]
         doc = {
             "schemaVersion": 2,
