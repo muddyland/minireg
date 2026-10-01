@@ -412,7 +412,7 @@ async def _maybe_scan(session: AsyncSession, repo: DockerRepository, manifest: D
         return
     if not policy.scan_on_pull and manifest.upstream_id is not None:
         return
-    if manifest.platform and policy.platforms and manifest.platform not in policy.platforms:
+    if not policy.scans_platform(manifest.platform):
         return
     priority = scanning.PRIORITY_PUSH if manifest.upstream_id is None else scanning.PRIORITY_PULL
     await scanning.enqueue(session, manifest, repo.name, reason="pull", priority=priority)

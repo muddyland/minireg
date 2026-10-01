@@ -1,7 +1,8 @@
 # The CLI
 
-A single-file client that configures your package managers and audits a
-project's dependencies against the CVE data this registry already holds.
+A single-file client that configures your package managers and container
+runtime, and audits a project's dependencies and container images against the
+CVE data this registry already holds.
 
 It is deliberately one Python file with no third-party imports: it is fetched
 from the registry it talks to, and requiring a virtualenv before you can point
@@ -75,11 +76,21 @@ that machine out.
 
 ```bash
 minireg login --scopes read,publish
+minireg login --scopes read,docker:push   # for `docker push` after `configure docker`
 ```
 
-You choose what to actually grant on the approval screen, and a token can never
-exceed your own permissions — requesting `admin` as a non-admin silently drops
-it rather than failing.
+| Scope | Allows |
+|---|---|
+| `read` | Install packages, pull images, search, audit |
+| `publish` | Publish npm and Python packages |
+| `docker:push` | Push container images under `local/` |
+| `admin` | The administrative API |
+
+You choose what to actually grant on the approval screen, and every scope but
+`read` starts unticked there. A token can never exceed your own permissions —
+requesting `admin` as a non-admin silently drops it rather than failing. The
+scanner worker's `scanner` scope cannot be requested here at all; it is minted
+on the **API tokens** page.
 
 ### No browser available
 
@@ -123,7 +134,11 @@ registry = "sparse+https://registry.example.com/cargo/index/"
 ```
 
 Anything else in those files is left alone, and re-running replaces the block
-rather than appending a second copy. `~/.npmrc` and `pip.conf` are written mode
+rather than appending a second copy.
+
+`configure` on its own covers npm, pip and cargo. Docker is opt-in (see
+[Containers](#containers) below), because it stores a credential in Docker's
+own config, which a plain `minireg configure` in CI should not start doing. `~/.npmrc` and `pip.conf` are written mode
 `600` because they contain a token; the cargo block carries none, because
 reads are anonymous and cargo only sends credentials to an index that declares
 `auth-required`.
@@ -131,6 +146,45 @@ reads are anonymous and cargo only sends credentials to an index that declares
 The cargo block goes at the *end* of the file on first write. That matters for
 TOML in a way it does not for the other two: `[source.…]` are table headers, so
 anything placed after them would be read as part of `[source.minireg]`.
+
+### Containers
+
+```bash
+minireg configure docker                       # docker, or podman if docker is missing
+minireg configure docker --container-cli podman
+minireg configure npm,pip,docker               # several at once
+```
+
+```
+Containers  registry.example.com
+  ✓ docker login registry.example.com  (credentials stored by docker)
+
+  Pull through it:
+    docker pull registry.example.com/alpine:3.20
+    docker pull registry.example.com/ghcr/<image>:<tag>
+  Push under local/:
+    docker push registry.example.com/local/<team>/<image>:<tag>
+
+  Optional: make it Docker Hub's mirror, so plain `docker pull alpine` goes through it.
+  Not written: it needs root and a daemon restart.
+
+  /etc/docker/daemon.json
+    { "registry-mirrors": ["https://registry.example.com"] }
+```
+
+- **It runs `docker login`** against the address you gave `minireg login`,
+  with your stored token as the password. The token goes in on stdin, never on
+  the command line where `ps` would show it. Docker keeps the credential in its
+  own store (`~/.docker/config.json` or a credential helper).
+- **It does not write the daemon config.** Mirror mode needs
+  `/etc/docker/daemon.json` (or containerd's `hosts.toml`), root and a daemon
+  restart, and a mistake there stops every container on the machine. The
+  snippet is printed with your registry filled in.
+- **Pushing needs the `docker:push` scope.** With a read-only token, login
+  still succeeds (pulls work), and it tells you to sign in again with
+  `--scopes read,docker:push`.
+- On a plain-HTTP registry it warns that Docker will refuse it until the host
+  is under `insecure-registries`; the printed `daemon.json` includes that.
 
 ---
 
@@ -300,6 +354,51 @@ What it will not touch:
 Comments, environment markers, spacing, key order and indentation are all
 preserved — the edit changes version tokens and nothing else.
 
+### Container images
+
+```bash
+minireg audit --image python:3.12-slim
+minireg audit --image registry.example.com/local/team/app:1.4 --fail-on critical
+minireg audit --image app:1 --image worker:1 --platform linux/arm64
+```
+
+```
+  registry.example.com/local/team-a/app:1
+  repository : local/team-a/app  pushed here
+  digest     : sha256:8ad9e43b…
+  platforms  : linux/amd64
+  showing    : linux/amd64  sha256:3c749d83…
+  size       : 42.5 MB, 6 layer(s)
+  scan       : scanned 2026-09-30 03:33
+  findings   : 26 critical, 105 high, 102 medium, 34 low  (204 fixable)
+  verdict    : BLOCKED — linux/amd64: push policy: image has 24 fixable findings at CRITICAL or above
+
+  Findings  worst first
+    CRIT  CVE-2021-3711        openssl 1.1.1d-0+deb10u3 -> 1.1.1d-0+deb10u7
+    …
+
+  Summary: 1 image(s), blocked — the registry will refuse these pulls
+```
+
+This reports the registry's own scan and verdict, not a second opinion: the
+**verdict** line is what `docker pull` would get. Any form of the name works —
+`alpine`, `alpine:3.20`, `ghcr/org/img:1`, the full
+`registry.example.com/…` you would pass to `docker pull`, or `@sha256:…`.
+
+- **An image nobody has pulled is looked up and scanned.** The registry fetches
+  its manifests (not its layers) and queues a scan; the audit waits for it,
+  up to `--wait` seconds (default 120).
+- **Multi-platform tags** are judged on `--platform` (default `linux/amd64`;
+  `linux/arm64` matches `linux/arm64/v8`). The tag's own verdict wins if
+  another platform is blocked, because `docker pull` resolves the tag through
+  the index and is refused for it.
+- **Exit codes are the same as for lockfiles.** `2` when the registry refuses
+  the pull or a finding meets `--fail-on`; `3` when the image has not been
+  scanned (scanning off, platform not on the scan list, or `--wait` ran out).
+  Findings on the policy's accepted-risk list do not count, because the
+  registry does not count them either.
+- `--fix` does not apply: rebuild on a patched base image instead.
+
 ### Other flags
 
 ```bash
@@ -318,15 +417,23 @@ state of a new registry.
 ## Searching
 
 ```bash
-minireg search express
-minireg search requests --ecosystem pypi --limit 10   # or: npm, cargo
+minireg search express                                # packages and images
+minireg search requests --ecosystem pypi --limit 10   # or: npm, cargo, docker
 
 minireg info lodash
 minireg info requests --ecosystem pypi
+minireg info --ecosystem docker alpine:3.20
+minireg info --ecosystem docker redis:7.4-alpine --platform linux/arm64
 ```
 
 `info` shows versions, known CVEs per version, and which upstreams carry the
-package with links to their pages.
+package with links to their pages. For an image it shows the platforms, size,
+scan status, findings by severity (known-exploited first), the pull verdict
+and recent tags — the same report as `audit --image`, without the exit code.
+
+A plain `search` lists matching images after the packages. Images are found by
+the name they are cached under, so `search busybox` finds both
+`busybox` (Docker Hub) and `quay/prometheus/busybox`.
 
 ---
 
@@ -343,6 +450,13 @@ minireg configure
 minireg audit --fail-on high
 ```
 
+Gate the image a job is about to ship on the registry's verdict:
+
+```bash
+docker push "$IMAGE"
+minireg audit --image "$IMAGE" --fail-on critical
+```
+
 Environment variables always win over the config file, so the same CLI works
 for a person and a pipeline with no branching.
 
@@ -357,11 +471,12 @@ for a person and a pipeline with no branching.
 | `login` | Authenticate via the browser |
 | `logout` | Forget the stored token (does not revoke it) |
 | `whoami` | Show the current identity and scopes |
-| `configure [npm\|pip\|cargo\|all]` | Point package managers at the registry |
+| `configure [npm\|pip\|cargo\|docker\|all]` | Point package managers at the registry; `docker` logs the container client in |
 | `audit [path]` | Check dependencies for CVEs |
 | `audit --fix` | Rewrite declarations to versions that clear them |
-| `search <query>` | Search the index |
-| `info <package>` | Show a package |
+| `audit --image REF` | Check a container image's scan and pull verdict |
+| `search <query>` | Search packages and images |
+| `info <package>` | Show a package (`--ecosystem docker` for an image) |
 | `update` | Update this CLI from the registry |
 
 ### Global flags
@@ -390,6 +505,7 @@ for a person and a pipeline with no branching.
 | `~/.npmrc` | Written by `configure`, in a marked block |
 | `~/.config/pip/pip.conf` | Written by `configure`, in a marked block |
 | `~/.cargo/config.toml` | Written by `configure`, in a marked block. Honours `CARGO_HOME` |
+| `~/.docker/config.json` | Written by `docker login` when you run `configure docker`, not by minireg |
 
 ---
 
@@ -413,7 +529,7 @@ a side effect of traffic it was making anyway and says one line when it has
 fallen behind:
 
 ```
-  note: this registry ships CLI 1.2.0, you have 1.1.0 — run 'minireg update'
+  note: this registry ships CLI 1.3.0, you have 1.2.0 — run 'minireg update'
 ```
 
 That costs no extra request, and it goes to stderr — piping `--json` output

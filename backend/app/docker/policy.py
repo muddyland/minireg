@@ -116,6 +116,17 @@ class ImagePolicy:
     # -- storage ------------------------------------------------------------ #
     storage_budget_bytes: int | None = None
 
+    def scans_platform(self, platform: str | None) -> bool:
+        """Is this platform on the scan list?
+
+        A listed platform without a variant covers its variants: registries
+        publish arm64 as ``linux/arm64/v8``, and an exact comparison against
+        the default ``linux/arm64`` meant arm64 images were never scanned.
+        """
+        if not platform or not self.platforms:
+            return True
+        return any(platform == p or (p.count("/") == 1 and platform.startswith(p + "/")) for p in self.platforms)
+
     @classmethod
     def from_dict(cls, data: dict | None) -> ImagePolicy:
         p = cls()

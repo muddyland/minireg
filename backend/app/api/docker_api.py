@@ -29,7 +29,7 @@ from ..docker import housekeeping, scanning
 from ..docker import registry as reg
 from ..docker.errors import RegistryError
 from ..docker.naming import PRESETS, host_matches
-from ..docker.policy import KEY_DOCKER_POLICY, ImagePolicy, invalidate_policy, load_policy
+from ..docker.policy import KEY_DOCKER_POLICY, ImagePolicy, evaluate_pull, invalidate_policy, load_policy
 from ..docker.store import get_oci_store
 from ..docker.upstream import RATELIMITS, RegistryClient
 from ..models import (
@@ -159,11 +159,21 @@ async def list_images(
     ).scalars().all()
     if scope == "watched":
         repos = [r for r in repos if r.watched_tags]
-    names = await _upstream_names(session)
+    ups = {
+        u.id: u
+        for u in (await session.execute(select(Upstream).where(Upstream.ecosystem == Ecosystem.docker))).scalars()
+    }
+    names = {i: u.name for i, u in ups.items()}
     out = []
     for r in repos:
         summary = await _repo_summary(session, r)
-        out.append({**repo_payload(r, names), **summary})
+        out.append(
+            {
+                **repo_payload(r, names),
+                **summary,
+                "pull_reference": _pull_ref(r, ups.get(r.upstream_id) if r.upstream_id else None),
+            }
+        )
     return {"total": total, "images": out}
 
 
@@ -297,6 +307,158 @@ async def _children(session: AsyncSession, index: DockerManifest) -> list[dict]:
     return out
 
 
+def split_reference(ref: str, also_ours: str | None = None) -> tuple[str, str | None, str | None]:
+    """``[host/]name[:tag][@digest]`` -> (name, tag, digest).
+
+    The host is dropped when it is one of ours, so the exact string a user
+    passes to `docker pull` works. ``also_ours`` is the host the request came
+    in on: someone reaching the registry as ``localhost:5055`` pulls
+    ``localhost:5055/alpine``, whatever PUBLIC_URL says. Only ever stripped,
+    never routed to, so a forged Host header cannot send the lookup anywhere.
+    A tag is only looked for in the last path segment: in
+    ``localhost:5000/x`` the colon belongs to the host.
+    """
+    ref = ref.strip()
+    ours = {settings.public_url.split("://", 1)[-1].lower().rstrip("/")}
+    if settings.docker_mirror_hostname:
+        ours.add(settings.docker_mirror_hostname.lower())
+    if also_ours:
+        ours.add(also_ours.lower())
+    first, sep, rest = ref.partition("/")
+    if sep and first.lower() in ours:
+        ref = rest
+    name, _, digest = ref.partition("@")
+    head, slash, last = name.rpartition("/")
+    tag = None
+    if ":" in last:
+        last, tag = last.split(":", 1)
+        name = f"{head}{slash}{last}"
+    return name, tag or None, digest or None
+
+
+def _pick_platform(children: list[dict], wanted: str) -> dict | None:
+    """The child `docker pull --platform` would take.
+
+    Exact first; then a request without a variant matches one with it, the
+    way Docker treats linux/arm64 as linux/arm64/v8.
+    """
+    exact = next((c for c in children if c["platform"] == wanted), None)
+    if exact is not None or wanted.count("/") != 1:
+        return exact
+    return next((c for c in children if (c["platform"] or "").startswith(wanted + "/")), None)
+
+
+@router.get("/inspect")
+async def inspect_image(
+    request: Request,
+    ref: str = Query(min_length=1, max_length=512),
+    platform: str = Query(default="linux/amd64", max_length=64),
+    findings: int = Query(default=50, ge=0, le=2000),
+    session: AsyncSession = Depends(get_session),
+    identity: Identity = Depends(require_user),
+) -> dict:
+    """Resolve an image reference the way `docker pull` would, and report it.
+
+    For the CLI: one call answers "what is this image, has it been scanned,
+    and would a pull be allowed?". A reference that is not cached yet is
+    fetched from its upstream (manifests only, no layers) and queued for a
+    scan like a pull would, so `minireg audit --image` works on an image
+    nobody has pulled. A multi-platform tag is judged on ``platform``, with
+    the index's own verdict (the worst platform) taking precedence, which is
+    what Docker would get.
+    """
+    name, tag, digest = split_reference(ref, request.headers.get("host"))
+    reference = digest or tag or "latest"
+    try:
+        target = await reg.resolve_target(session, name, mirror_host=False)
+        repo = await reg.get_repo(session, target, create=not target.local)
+        if repo is None:
+            raise RegistryError("NAME_UNKNOWN", f"repository {target.canonical} not found")
+        top = (await reg.get_manifest(session, target, repo, reference, head=True)).manifest
+        image = top
+        platforms: list[str] = []
+        if top.is_index:
+            children = [c for c in await _children(session, top) if not c["attestation"]]
+            platforms = [c["platform"] for c in children if c["platform"]]
+            pick = _pick_platform(children, platform)
+            if pick is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"no {platform} image (it has: {', '.join(platforms) or 'none'})",
+                )
+            image = (await reg.get_manifest(session, target, repo, pick["digest"], head=True)).manifest
+    except RegistryError as exc:
+        status_code = exc.status if exc.status >= 400 else 400
+        raise HTTPException(status_code=status_code, detail=exc.message) from exc
+
+    policy = await load_policy(session)
+    wants_scan = (
+        image.kind == "image"
+        and image.scan_status == "unscanned"
+        and policy.scanning_enabled
+        and not repo.quarantined
+        and (policy.scan_on_pull or image.upstream_id is None)
+        and policy.scans_platform(image.platform)
+    )
+    if wants_scan:
+        priority = scanning.PRIORITY_PUSH if image.upstream_id is None else scanning.PRIORITY_PULL
+        await scanning.enqueue(session, image, repo.name, reason="cli", priority=priority)
+
+    # What `docker pull` would get: the tag's own verdict (for an index, the
+    # worst platform), then the platform image's.
+    verdict = await evaluate_pull(session, repo, top, policy)
+    if verdict.allowed and image is not top:
+        verdict = await evaluate_pull(session, repo, image, policy)
+
+    rows: list[DockerFinding] = []
+    total = 0
+    if findings and image.scan_status == "scanned":
+        conds = [DockerFinding.manifest_id == image.id]
+        total = (
+            await session.execute(select(func.count()).select_from(DockerFinding).where(and_(*conds)))
+        ).scalar_one()
+        rows = list(
+            (
+                await session.execute(
+                    select(DockerFinding).where(and_(*conds)).order_by(*FINDING_ORDER).limit(findings)
+                )
+            ).scalars()
+        )
+    tags = (
+        await session.execute(
+            select(DockerTag.tag)
+            .where(DockerTag.repository_id == repo.id)
+            .order_by(DockerTag.updated_at.desc())
+            .limit(30)
+        )
+    ).scalars().all()
+    upstream = await session.get(Upstream, repo.upstream_id) if repo.upstream_id else None
+    pull_ref = _pull_ref(repo, upstream)
+    await session.commit()
+    return {
+        "reference": ref,
+        "repository": repo.name,
+        "upstream": getattr(upstream, "name", None),
+        "local": repo.is_local,
+        "quarantined": repo.quarantined,
+        "pull_reference": pull_ref + (f"@{digest}" if digest else f":{tag or 'latest'}"),
+        "digest": top.digest,
+        "is_index": top.is_index,
+        "platforms": platforms,
+        "platform": image.platform,
+        "image": manifest_payload(image),
+        "verdict": {
+            "allowed": verdict.allowed,
+            "code": None if verdict.allowed else verdict.code,
+            "reason": verdict.reason,
+            "retry_after": verdict.retry_after,
+        },
+        "findings_total": total,
+        "findings": [finding_payload(f, policy) for f in rows],
+        "tags": list(tags),
+    }
+
+
 @router.get("/manifest/{digest}")
 async def get_manifest_detail(
     digest: str,
@@ -401,35 +563,38 @@ async def list_findings(
         like = f"%{q.strip()[:100]}%"
         conds.append(or_(DockerFinding.vuln_id.ilike(like), DockerFinding.pkg_name.ilike(like)))
     total = (await session.execute(select(func.count()).select_from(DockerFinding).where(and_(*conds)))).scalar_one()
-    order = [
-        DockerFinding.kev.desc(),
-        func.coalesce(DockerFinding.cvss, 0).desc(),
-        DockerFinding.vuln_id,
-    ]
     rows = (
-        await session.execute(select(DockerFinding).where(and_(*conds)).order_by(*order).limit(limit).offset(offset))
+        await session.execute(
+            select(DockerFinding).where(and_(*conds)).order_by(*FINDING_ORDER).limit(limit).offset(offset)
+        )
     ).scalars().all()
     policy = await load_policy(session)
+    return {"total": total, "findings": [finding_payload(f, policy) for f in rows]}
+
+
+#: Findings order everywhere: known-exploited first, then by score.
+FINDING_ORDER = (
+    DockerFinding.kev.desc(),
+    func.coalesce(DockerFinding.cvss, 0).desc(),
+    DockerFinding.vuln_id,
+)
+
+
+def finding_payload(f: DockerFinding, policy: ImagePolicy) -> dict[str, Any]:
     return {
-        "total": total,
-        "findings": [
-            {
-                "vuln_id": f.vuln_id,
-                "pkg_name": f.pkg_name,
-                "pkg_type": f.pkg_type,
-                "installed_version": f.installed_version,
-                "fixed_version": f.fixed_version,
-                "severity": f.severity,
-                "cvss": f.cvss,
-                "title": f.title,
-                "url": f.url,
-                "layer_digest": f.layer_digest,
-                "kev": f.kev,
-                "denied": f.vuln_id in policy.deny_cves,
-                "accepted": f.vuln_id in policy.allow_cves,
-            }
-            for f in rows
-        ],
+        "vuln_id": f.vuln_id,
+        "pkg_name": f.pkg_name,
+        "pkg_type": f.pkg_type,
+        "installed_version": f.installed_version,
+        "fixed_version": f.fixed_version,
+        "severity": f.severity,
+        "cvss": f.cvss,
+        "title": f.title,
+        "url": f.url,
+        "layer_digest": f.layer_digest,
+        "kev": f.kev,
+        "denied": f.vuln_id in policy.deny_cves,
+        "accepted": f.vuln_id in policy.allow_cves,
     }
 
 

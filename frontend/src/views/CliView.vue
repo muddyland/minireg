@@ -33,12 +33,25 @@ const COMMANDS = [
     summary: 'Point npm, pip and cargo at this registry, credentials included.',
   },
   {
+    command: 'minireg configure docker',
+    summary: 'Log docker (or podman) in with your token, and print the mirror config to paste.',
+  },
+  {
     command: 'minireg audit',
     summary:
       "Check this project's lockfiles — npm, Python and Cargo.lock — against known CVEs and this registry's policy.",
   },
-  { command: 'minireg search <query>', summary: 'Search the package index.' },
+  {
+    command: 'minireg audit --image <ref>',
+    summary:
+      "A container image's scan and pull verdict, with the same exit codes. Scans images nobody has pulled yet.",
+  },
+  { command: 'minireg search <query>', summary: 'Search packages and container images.' },
   { command: 'minireg info <package>', summary: 'Versions, CVEs, and upstream sources.' },
+  {
+    command: 'minireg info --ecosystem docker <image>',
+    summary: 'Platforms, findings worst-first, and whether a pull would be allowed.',
+  },
   { command: 'minireg whoami', summary: 'Show who the stored token belongs to.' },
 ]
 </script>
@@ -48,8 +61,8 @@ const COMMANDS = [
     <div>
       <h1>Command line tool</h1>
       <p class="page-sub">
-        A single-file client for this registry — configure your package managers, and audit a
-        project's dependencies against the CVE data this registry already holds.
+        A single-file client for this registry — configure your package managers and container
+        runtime, and audit dependencies and images against the CVE data this registry already holds.
       </p>
     </div>
     <a class="btn btn-primary" :href="`${base}/api/cli/download`" download="minireg">

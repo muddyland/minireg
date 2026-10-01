@@ -61,6 +61,9 @@ router = APIRouter(prefix="/api/cli", tags=["cli"])
 # approve endpoint is rate limited on top.
 USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no I/O/0/1
 USER_CODE_LEN = 8
+#: What a CLI login may ask for. `scanner` is deliberately absent: that token
+#: belongs to the scan worker and is minted on the API tokens page.
+CLI_SCOPES = ("read", "publish", "docker:push", "admin")
 DEVICE_CODE_TTL = timedelta(minutes=10)
 POLL_INTERVAL_SECONDS = 3
 
@@ -159,9 +162,7 @@ async def device_start(
         client_hostname=(payload.hostname or "")[:255] or None,
         client_platform=(payload.platform or "")[:255] or None,
         client_ip=ip,
-        requested_scopes=sorted(
-            {s for s in payload.scopes if s in ("read", "publish", "admin")} or {"read"}
-        ),
+        requested_scopes=sorted({s for s in payload.scopes if s in CLI_SCOPES} or {"read"}),
     )
     session.add(record)
     await session.commit()
@@ -337,11 +338,11 @@ async def device_approve(
     # A CLI token can never exceed the authority of the person approving it,
     # nor the authority of the credential they are approving with -- otherwise
     # a leaked read-only token could approve itself an admin CLI token.
-    granted = {s for s in payload.scopes if s in ("read", "publish", "admin")} or {"read"}
+    granted = {s for s in payload.scopes if s in CLI_SCOPES} or {"read"}
     if "admin" in granted and not user.is_admin:
         granted.discard("admin")
-    if "publish" in granted and not (user.can_publish or user.is_admin):
-        granted.discard("publish")
+    if not (user.can_publish or user.is_admin):
+        granted -= {"publish", "docker:push"}
     if identity.token is not None:
         granted &= set(identity.token.scopes or [])
     granted = granted or {"read"}
