@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
-# Prefix for the base images. CI sets this to GitLab's dependency proxy so
-# node/python are pulled through the cache rather than Docker Hub, which
-# both speeds up builds and avoids anonymous pull limits. Empty locally.
+# Optional prefix for the base images, e.g. a mirror ("<host>/<path>/",
+# trailing slash included). Empty means Docker Hub.
 ARG BASE_REGISTRY=
 
 # ---------------------------------------------------------------------------
