@@ -276,11 +276,10 @@ on which directory ruff was invoked from.
 | test | `build:frontend` | Builds the SPA and asserts it actually emitted `index.html` |
 | build | `build:image` | Builds and pushes the container image |
 
-Base images are pulled through GitLab's dependency proxy via
-`CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX`, and the `build:image` job passes the
-same prefix into the build as `BASE_REGISTRY` so the `FROM` lines in the
-Dockerfile use the cache too. `build:image` runs on `main`, on tags, and tags a
-release build as `:latest` as well.
+Images come straight from Docker Hub. `BASE_REGISTRY` (empty by default) is
+passed into the build as a prefix for the Dockerfile's `FROM` lines, so a
+mirror can be set without editing the Dockerfile. `build:image` runs on
+`main`, on tags, and tags a release build as `:latest` as well.
 
 There is no frontend lint job: the SPA is plain JavaScript with no linter or
 type checker configured, so `build:frontend` is the real compile-time check.
