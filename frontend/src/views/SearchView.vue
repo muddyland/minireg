@@ -57,7 +57,10 @@ onMounted(run)
   <div class="page-head">
     <div>
       <h1>Search packages</h1>
-      <p class="page-sub">Everything this registry has indexed, across npm, PyPI and cargo.</p>
+      <p class="page-sub">
+        Everything this registry has indexed, across npm, PyPI and cargo. Container images are under
+        <router-link :to="{ name: 'images' }">Images</router-link>.
+      </p>
     </div>
   </div>
 

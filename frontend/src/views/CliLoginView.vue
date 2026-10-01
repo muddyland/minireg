@@ -166,7 +166,7 @@ const requestedScopes = computed(() => pending.value?.requested_scopes || ['read
             </p>
             <label class="check">
               <input type="checkbox" checked disabled />
-              <span><strong>read</strong> <span class="faint small">— install and search</span></span>
+              <span><strong>read</strong> <span class="faint small">— install, pull and search</span></span>
             </label>
             <label v-if="auth.canPublish" class="check">
               <input
@@ -175,6 +175,14 @@ const requestedScopes = computed(() => pending.value?.requested_scopes || ['read
                 @change="toggleScope('publish')"
               />
               <span><strong>publish</strong> <span class="faint small">— publish new versions</span></span>
+            </label>
+            <label v-if="auth.canPublish" class="check">
+              <input
+                type="checkbox"
+                :checked="scopes.includes('docker:push')"
+                @change="toggleScope('docker:push')"
+              />
+              <span><strong>docker:push</strong> <span class="faint small">— push images under local/</span></span>
             </label>
             <label v-if="auth.isAdmin" class="check">
               <input

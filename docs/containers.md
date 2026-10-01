@@ -41,7 +41,16 @@ The first path segment chooses where the image comes from:
 repository and share one cache entry.
 
 When anonymous reads are enabled, pulls need no login. Otherwise, run
-`docker login` with your username and an API token that has the `read` scope.
+`docker login` with your username and an API token that has the `read` scope,
+or let the CLI do it with the token it already holds:
+
+```
+minireg configure docker
+```
+
+To check an image before you run it, `minireg audit --image alpine:3.20`
+prints its findings and whether the registry would serve it, and exits non-zero
+when it would not. See [The CLI](cli.md#container-images).
 
 ### As a Docker Hub mirror
 

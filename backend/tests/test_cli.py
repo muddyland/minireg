@@ -686,6 +686,40 @@ class TestRequestedScopes:
         )
         assert approved.json()["scopes"] == ["read"]
 
+    async def test_docker_push_can_be_requested_and_granted(self, client):
+        # `minireg configure docker` hands this token to `docker login`.
+        start = (
+            await client.post("/api/cli/auth/start", json={"scopes": ["read", "docker:push"]})
+        ).json()
+        await login_session(client)
+        pending = await client.get(f"/api/cli/auth/pending/{start['user_code']}")
+        assert pending.json()["requested_scopes"] == ["docker:push", "read"]
+        approved = await client.post(
+            "/api/cli/auth/approve",
+            json={"user_code": start["user_code"], "scopes": ["read", "docker:push"]},
+        )
+        assert approved.json()["scopes"] == ["docker:push", "read"]
+
+    async def test_docker_push_needs_publish_rights(self, client):
+        start = (
+            await client.post("/api/cli/auth/start", json={"scopes": ["read", "docker:push"]})
+        ).json()
+        await login_session(client, "reader", "reader-password-1234")
+        approved = await client.post(
+            "/api/cli/auth/approve",
+            json={"user_code": start["user_code"], "scopes": ["read", "docker:push"]},
+        )
+        assert approved.json()["scopes"] == ["read"]
+
+    async def test_scanner_scope_cannot_come_from_a_cli_login(self, client):
+        # The worker's token is minted on API tokens, never on a laptop.
+        start = (await client.post("/api/cli/auth/start", json={"scopes": ["scanner"]})).json()
+        await login_session(client)
+        approved = await client.post(
+            "/api/cli/auth/approve", json={"user_code": start["user_code"], "scopes": ["scanner"]}
+        )
+        assert approved.json()["scopes"] == ["read"]
+
 
 class TestRequirementsParsing:
     """A requirements.txt of ranges used to audit as "0 packages" and get

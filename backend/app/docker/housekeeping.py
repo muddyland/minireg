@@ -151,7 +151,7 @@ async def refresh_watched(name: str, tag: str) -> dict:
             for child in children:
                 if child.platform in ("unknown/unknown", None):
                     continue
-                if policy.platforms and child.platform not in policy.platforms:
+                if not policy.scans_platform(child.platform):
                     continue
                 child_served = await reg.get_manifest(session, target, repo, child.digest, head=True)
                 manifests.append(child_served.manifest)

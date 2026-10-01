@@ -79,13 +79,16 @@ class Image:
 def index_of(*images: tuple[Image, str], attestation: Image | None = None) -> tuple[bytes, str]:
     entries = []
     for img, platform in images:
-        os_, arch = platform.split("/")[:2]
+        os_, arch, *variant = platform.split("/")
+        spec = {"os": os_, "architecture": arch}
+        if variant:
+            spec["variant"] = variant[0]
         entries.append(
             {
                 "mediaType": OCI_MANIFEST,
                 "digest": img.digest,
                 "size": len(img.manifest),
-                "platform": {"os": os_, "architecture": arch},
+                "platform": spec,
             }
         )
     if attestation is not None:

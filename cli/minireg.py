@@ -6,10 +6,13 @@ from the registry it talks to, and asking someone to set up a virtualenv before
 they can point npm at their own mirror would defeat the purpose.
 
     minireg login                 authenticate via the browser
-    minireg configure             point npm / pip at the registry
+    minireg configure             point npm / pip / cargo at the registry
+    minireg configure docker      log docker in, print the mirror config
     minireg audit                 check this project's dependencies for CVEs
-    minireg search <query>        search the registry
+    minireg audit --image <ref>   check a container image, gate on the verdict
+    minireg search <query>        search packages and images
     minireg info <package>        show a package, its versions and CVEs
+    minireg info --ecosystem docker <image>   show an image, its scan and verdict
     minireg whoami                show the current identity
     minireg logout                forget the stored token
 """
@@ -23,8 +26,10 @@ import json
 import os
 import platform
 import re
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -34,7 +39,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 DEFAULT_TIMEOUT = 30
 USER_AGENT = f"minireg-cli/{__version__}"
@@ -385,8 +390,13 @@ def cmd_configure(args):
 
     targets = args.target
     if targets == "all":
+        # Not docker: `docker login` writes a credential into ~/.docker, which
+        # a plain `minireg configure` in CI should not start doing unasked.
         targets = "npm,pip,cargo"
     wanted = {t.strip() for t in targets.split(",") if t.strip()}
+    unknown = wanted - {"npm", "pip", "cargo", "docker"}
+    if unknown:
+        die(f"unknown target(s): {', '.join(sorted(unknown))} (choose npm, pip, cargo, docker, all)")
 
     host = registry.split("://", 1)[-1]
     changed = []
@@ -458,6 +468,9 @@ def cmd_configure(args):
                 _upsert_lines(cargo_conf, lines, "minireg")
                 changed.append(str(cargo_conf))
 
+    if "docker" in wanted:
+        configure_docker(args, registry, token, config)
+
     if args.dry_run:
         info(dim("\n(dry run — nothing written)"))
         return 0
@@ -467,6 +480,301 @@ def cmd_configure(args):
     if not token:
         info(dim("\n  Tip: run 'minireg login' first to include credentials."))
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# configure docker
+# --------------------------------------------------------------------------- #
+CONTAINER_CLIS = ("docker", "podman")
+
+
+def _loopback(host: str) -> bool:
+    name = host.rsplit(":", 1)[0].strip("[]").lower()
+    return name in ("localhost", "::1") or name.startswith("127.")
+
+
+def docker_client_config(registry: str, token, args) -> dict:
+    try:
+        return api(registry, "/api/docker/client-config", token=token, insecure=args.insecure)
+    except ApiError as exc:
+        if exc.status == 401:
+            die("not logged in. Run: minireg login")
+        if exc.status == 404:
+            die("this registry does not serve container images")
+        die(exc.detail)
+
+
+def configure_docker(args, registry: str, token, config: dict) -> None:
+    """`docker login` with the stored token, and the mirror config to paste.
+
+    The daemon config is printed, not written: it lives in /etc, needs root
+    and a daemon restart, and a mistake there stops every container on the
+    machine. Logging in is per-user and harmless, so that part is done.
+    """
+    dc = docker_client_config(registry, token, args)
+    # The address you reach the registry at, as given to `minireg login`,
+    # not the server's PUBLIC_URL: behind a split-horizon or a port-forward
+    # those differ, and only the one that works from here is any use to
+    # `docker login`.
+    host = urllib.parse.urlsplit(registry).netloc or dc["host"]
+    tool = args.container_cli or next((t for t in CONTAINER_CLIS if shutil.which(t)), None)
+    username = config.get("username") or "minireg"
+    plain_http = registry.startswith("http://")
+
+    print(f"\n{bold('Containers')}  {dim(host)}")
+    if not token:
+        info(dim("  no token stored; skipping login (anonymous pulls may still work)"))
+    elif args.dry_run:
+        print(f"  would run: {tool or 'docker'} login {host} -u {username} --password-stdin")
+    elif tool is None:
+        info(yellow("  neither docker nor podman is on PATH; log in later with:"))
+        print(f"    docker login {host} -u {username}   {dim('# password: your minireg token')}")
+    else:
+        if plain_http and not _loopback(host):
+            info(
+                yellow(
+                    f"  {host} is plain HTTP: {tool} only talks to it if it is listed under "
+                    "insecure-registries (see the daemon config below)."
+                )
+            )
+        # The token goes in on stdin, never argv, where any user on the
+        # machine could read it from the process list.
+        try:
+            proc = subprocess.run(
+                [tool, "login", host, "-u", username, "--password-stdin"],
+                input=token.encode(),
+                capture_output=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            die(f"{tool} login failed: {exc}")
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).decode(errors="replace").strip().splitlines()
+            die(f"{tool} login {host} failed: {detail[-1] if detail else 'exit ' + str(proc.returncode)}")
+        print(f"  {green('✓')} {tool} login {host}  {dim('(credentials stored by ' + tool + ')')}")
+        scopes = _token_scopes(registry, token, args)
+        if scopes is not None and "docker:push" not in scopes and "admin" not in scopes:
+            info(
+                dim(
+                    "  this token can pull but not push. For pushes: "
+                    "minireg login --scopes read,docker:push, then run this again."
+                )
+            )
+
+    print(f"\n  Pull through it:\n    docker pull {host}/alpine:3.20")
+    others = [u for u in dc.get("upstreams") or [] if u != dc.get("default_upstream")]
+    if others:
+        print(f"    docker pull {host}/{others[0]}/<image>:<tag>")
+    print(f"  Push under {dc.get('local_namespace', 'local')}/:")
+    print(f"    docker push {host}/{dc.get('local_namespace', 'local')}/<team>/<image>:<tag>")
+    print(
+        f"\n  {bold('Optional')}: make it Docker Hub's mirror, so plain `docker pull alpine` goes through it."
+    )
+    print(f"  {dim('Not written: it needs root and a daemon restart.')}")
+    print("\n  /etc/docker/daemon.json")
+    for line in json.dumps(dc["daemon_json"], indent=2).splitlines():
+        print(f"    {line}")
+    print(f"\n  {dc.get('containerd_path') or 'containerd hosts.toml'}")
+    for line in (dc.get("containerd_hosts_toml") or "").splitlines():
+        print(f"    {line}")
+
+
+def _token_scopes(registry: str, token: str, args):
+    try:
+        me = api(registry, "/api/auth/me", token=token, insecure=args.insecure)
+    except ApiError:
+        return None
+    return set(me.get("scopes") or [])
+
+
+# --------------------------------------------------------------------------- #
+# Container images: shared lookup and rendering
+# --------------------------------------------------------------------------- #
+SEV_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
+PENDING_SCAN = ("queued", "scanning")
+
+
+def sev_paint(severity):
+    return {"CRITICAL": magenta, "HIGH": red, "MEDIUM": yellow}.get((severity or "").upper(), dim)
+
+
+def format_counts(counts: dict) -> str:
+    parts = [
+        sev_paint(s)(f"{counts[s]} {s.lower()}") for s in SEV_LEVELS if (counts or {}).get(s)
+    ]
+    return ", ".join(parts) or green("no findings")
+
+
+def human_bytes(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def inspect_image(registry: str, token, ref: str, args, findings: int) -> dict:
+    query = urllib.parse.urlencode({"ref": ref, "platform": args.platform, "findings": findings})
+    try:
+        return api(
+            registry, f"/api/docker/inspect?{query}", token=token, timeout=180, insecure=args.insecure
+        )
+    except ApiError as exc:
+        if exc.status == 401:
+            die("not logged in. Run: minireg login")
+        if exc.status == 404 and exc.detail == "Not Found":
+            die("this registry cannot look up images (it is older than this CLI, or has images turned off)")
+        die(f"{ref}: {exc.detail}")
+
+
+def wait_for_scan(registry: str, token, ref: str, args, data: dict, findings: int) -> dict:
+    """Poll while a scan is queued or running, up to --wait seconds.
+
+    "unscanned" is not waited on: the lookup queues a scan whenever policy
+    allows one, so an image still unscanned afterwards will stay that way.
+    """
+    deadline = time.monotonic() + max(0, args.wait)
+    announced = False
+    while data["image"]["scan_status"] in PENDING_SCAN and time.monotonic() < deadline:
+        if not announced:
+            info(dim(f"  waiting up to {args.wait}s for the scan of {ref} ({data['image']['scan_status']})…"))
+            announced = True
+        time.sleep(3)
+        data = inspect_image(registry, token, ref, args, findings)
+    return data
+
+
+def _scan_line(image: dict) -> str:
+    status = image.get("scan_status")
+    if status == "scanned":
+        when = (image.get("scanned_at") or "")[:16].replace("T", " ")
+        return f"scanned {dim(when)}" if when else "scanned"
+    if status in PENDING_SCAN:
+        return yellow(f"{status} — results shortly")
+    if status == "failed":
+        return red("scan failed")
+    if status == "not_applicable":
+        return dim("not an image (nothing to scan)")
+    return yellow("not scanned")
+
+
+def render_image(data: dict, limit: int) -> None:
+    image = data["image"]
+    verdict = data["verdict"]
+    print(f"\n  {bold(data['pull_reference'])}")
+    origin = "pushed here" if data.get("local") else f"cached from {data.get('upstream') or 'upstream'}"
+    print(f"  repository : {data['repository']}  {dim(origin)}")
+    print(f"  digest     : {data['digest']}")
+    if data.get("is_index"):
+        print(f"  platforms  : {', '.join(data.get('platforms') or []) or '--'}")
+        print(f"  showing    : {image.get('platform') or '--'}  {dim(image['digest'])}")
+    size = human_bytes(image.get("total_size"))
+    print(f"  size       : {size}, {image.get('layer_count') or 0} layer(s)")
+    print(f"  scan       : {_scan_line(image)}")
+    if image.get("scan_status") == "scanned":
+        line = format_counts(image.get("severity_counts") or {})
+        fixable = image.get("fixable_count") or 0
+        if fixable:
+            line += dim(f"  ({fixable} fixable)")
+        if image.get("kev_count"):
+            line += "  " + red(f"{image['kev_count']} known-exploited")
+        print(f"  findings   : {line}")
+    if data.get("quarantined"):
+        print(f"  {red('quarantined')}")
+    if verdict["allowed"]:
+        print(f"  verdict    : {green('pull allowed')}")
+    elif verdict.get("code") == "UNAVAILABLE":
+        print(f"  verdict    : {yellow('not served yet')} — {verdict.get('reason')}")
+    else:
+        print(f"  verdict    : {red('BLOCKED')} — {verdict.get('reason')}")
+
+    shown = (data.get("findings") or [])[:limit]
+    if shown:
+        order = "known-exploited first, then by score" if image.get("kev_count") else "worst first"
+        print(f"\n  {bold('Findings')}  {dim(order)}")
+        for f in shown:
+            sev = (f.get("severity") or "UNKNOWN").upper()
+            fix = (
+                f"-> {green(f['fixed_version'])}" if f.get("fixed_version") else dim("no fix")
+            )
+            flags = ""
+            if f.get("kev"):
+                flags += " " + red("[KEV]")
+            if f.get("denied"):
+                flags += " " + red("[denied by policy]")
+            if f.get("accepted"):
+                flags += " " + dim("[accepted risk]")
+            print(
+                f"    {sev_paint(sev)(sev[:4].ljust(4))}  {f['vuln_id']:<20} "
+                f"{f['pkg_name']} {dim(f.get('installed_version') or '')} {fix}{flags}"
+            )
+        rest = (data.get("findings_total") or 0) - len(shown)
+        if rest > 0:
+            print(dim(f"    … and {rest} more (see the image page in the web UI)"))
+    tags = data.get("tags") or []
+    if tags:
+        more = "" if len(tags) < 30 else " …"
+        print(f"\n  tags       : {dim(', '.join(tags[:12]) + ('' if len(tags) <= 12 else ' …') + more)}")
+
+
+def audit_images(args, registry: str, token: str) -> int:
+    """`minireg audit --image REF`: the registry's own scan and verdict.
+
+    Same exit codes as a lockfile audit: 2 when the registry would refuse the
+    pull or a finding meets --fail-on, 3 when the image has not been scanned.
+    Findings on the accepted-risk list do not count, because the registry does
+    not count them either.
+    """
+    if args.fix:
+        die("--fix applies to lockfiles; rebuild the image on a patched base instead")
+    gate_findings = []
+    blocked = False
+    unscanned = 0
+    reports = []
+    for ref in args.image:
+        data = inspect_image(registry, token, ref, args, findings=2000)
+        data = wait_for_scan(registry, token, ref, args, data, findings=2000)
+        reports.append(data)
+        image = data["image"]
+        verdict = data["verdict"]
+        if not verdict["allowed"] and verdict.get("code") == "DENIED":
+            blocked = True
+        if image.get("kind") == "image" and image.get("scan_status") != "scanned":
+            unscanned += 1
+        listed = data.get("findings") or []
+        if (data.get("findings_total") or 0) > len(listed):
+            # More findings than one response carries: gate on the counts,
+            # which is conservative (they include accepted risks).
+            for sev, n in (image.get("severity_counts") or {}).items():
+                if n:
+                    gate_findings.append(
+                        {"name": data["repository"], "version": image["digest"], "cves": [{"severity": sev.lower()}]}
+                    )
+        else:
+            for f in listed:
+                if f.get("accepted"):
+                    continue
+                gate_findings.append(
+                    {
+                        "name": f"{data['repository']}:{f['pkg_name']}",
+                        "version": f.get("installed_version") or "",
+                        "cves": [{"severity": (f.get("severity") or "none").lower()}],
+                    }
+                )
+        if not args.json:
+            render_image(data, limit=15)
+
+    if args.json:
+        print(json.dumps({"images": reports, "blocked": blocked, "unscanned_total": unscanned}, indent=2))
+    else:
+        parts = [f"{len(reports)} image(s)"]
+        if blocked:
+            parts.append(red("blocked — the registry will refuse these pulls"))
+        if unscanned:
+            parts.append(f"{unscanned} not scanned yet")
+        print(f"\n  {bold('Summary')}: " + ", ".join(parts))
+    return audit_exit_code(args, gate_findings, blocked, unscanned, noun="image(s)")
 
 
 # --------------------------------------------------------------------------- #
@@ -684,6 +992,8 @@ def audit_request(registry, token, ecosystem, packages, args) -> dict:
 def cmd_audit(args):
     registry = require_registry(args)
     token = require_token()
+    if args.image:
+        return audit_images(args, registry, token)
     root = Path(args.path).resolve()
 
     if root.is_file():
@@ -835,7 +1145,7 @@ def cmd_audit(args):
     return audit_exit_code(args, total_findings, exit_blocked, total_unscanned)
 
 
-def audit_exit_code(args, findings, exit_blocked, unscanned) -> int:
+def audit_exit_code(args, findings, exit_blocked, unscanned, noun: str = "package(s)") -> int:
     """Translate an audit into a process exit code.
 
     "We could not check" is not "we checked and it is fine". An unreachable
@@ -865,7 +1175,7 @@ def audit_exit_code(args, findings, exit_blocked, unscanned) -> int:
     if unscanned and fail_unscanned:
         info(
             red(
-                f"  {unscanned} package(s) could not be checked. Failing because "
+                f"  {unscanned} {noun} could not be checked. Failing because "
                 "an unchecked dependency is not a clean one "
                 "(pass --no-fail-on-unscanned to allow it)."
             )
@@ -1143,9 +1453,57 @@ def verify_fixes(registry, token, planned, args):
 # --------------------------------------------------------------------------- #
 # search / info
 # --------------------------------------------------------------------------- #
+def search_images(registry: str, token: str, args, strict: bool) -> tuple:
+    query = urllib.parse.urlencode({"q": args.query, "limit": args.limit})
+    try:
+        data = api(registry, f"/api/docker/images?{query}", token=token, insecure=args.insecure)
+    except ApiError as exc:
+        if exc.status == 401:
+            die("not logged in. Run: minireg login")
+        if not strict:
+            # An older registry, or images switched off: packages still answer.
+            return [], 0
+        if exc.status == 404:
+            die("this registry does not serve container images")
+        die(exc.detail)
+    images = data.get("images") or []
+    return images, data.get("total", len(images))
+
+
+def print_image_row(item: dict) -> None:
+    line = f"  {blue('docker')}  {bold(item.get('pull_reference') or item['name'])}"
+    line += f"  {dim(str(item.get('tag_count', 0)) + ' tag(s)')}"
+    if item.get("quarantined"):
+        line += f"  {red('[quarantined]')}"
+    print(line)
+    worst = item.get("worst_counts") or {}
+    detail = []
+    if item.get("scanned_count"):
+        detail.append(format_counts(worst) if any(worst.values()) else "no critical or high findings")
+    else:
+        detail.append("not scanned yet")
+    if item.get("kev_count"):
+        detail.append(red(f"{item['kev_count']} known-exploited"))
+    origin = "pushed here" if item.get("local") else f"from {item.get('upstream') or 'upstream'}"
+    print(f"        {dim(origin)} · " + " · ".join(detail))
+
+
 def cmd_search(args):
     registry = require_registry(args)
     token = require_token()
+    images, image_total = [], 0
+    if args.ecosystem in (None, "docker"):
+        images, image_total = search_images(registry, token, args, strict=args.ecosystem == "docker")
+    if args.ecosystem == "docker":
+        if not images:
+            info("No images matched.")
+            return 0
+        for item in images:
+            print_image_row(item)
+        print()
+        print(dim(f"  {len(images)} of {image_total} images"))
+        return 0
+
     params = {"q": args.query, "limit": args.limit}
     if args.ecosystem:
         params["ecosystem"] = args.ecosystem
@@ -1159,8 +1517,8 @@ def cmd_search(args):
         die(exc.detail)
 
     results = result.get("results") or []
-    if not results:
-        info("No packages matched.")
+    if not results and not images:
+        info("No packages matched." if args.ecosystem else "No packages or images matched.")
         return 0
 
     for item in results:
@@ -1175,14 +1533,24 @@ def cmd_search(args):
         print(line)
         if item.get("description"):
             print(f"        {dim(item['description'][:96])}")
+    for item in images:
+        print_image_row(item)
     print()
-    print(dim(f"  {len(results)} of {result.get('total', len(results))} results"))
+    summary = f"  {len(results)} of {result.get('total', len(results))} results"
+    if images:
+        summary += f", {len(images)} of {image_total} images"
+    print(dim(summary))
     return 0
 
 
 def cmd_info(args):
     registry = require_registry(args)
     token = require_token()
+    if args.ecosystem == "docker":
+        data = inspect_image(registry, token, args.package, args, findings=args.limit)
+        render_image(data, limit=args.limit)
+        print()
+        return 0
     ecosystem = args.ecosystem or ("npm" if not args.package.startswith("py:") else "pypi")
     name = args.package
 
@@ -1377,8 +1745,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  minireg login --url https://registry.example.com\n"
             "  minireg configure\n"
             "  minireg audit --fail-on high\n"
+            "  minireg audit --image python:3.12-slim --fail-on critical\n"
+            "  minireg configure docker\n"
             "  minireg search express\n"
             "  minireg info lodash\n"
+            "  minireg info --ecosystem docker alpine:3.20\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"minireg {__version__}")
@@ -1391,7 +1762,9 @@ def build_parser() -> argparse.ArgumentParser:
     login = sub.add_parser("login", help="authenticate via the browser")
     login.add_argument("--no-browser", action="store_true", help="do not open a browser")
     login.add_argument(
-        "--scopes", default="read", help="comma-separated: read,publish,admin (default: read)"
+        "--scopes",
+        default="read",
+        help="comma-separated: read,publish,docker:push,admin (default: read)",
     )
     login.set_defaults(func=cmd_login)
 
@@ -1406,12 +1779,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("whoami", help="show the current identity").set_defaults(func=cmd_whoami)
 
     configure = sub.add_parser(
-        "configure", help="point npm / pip / cargo at the registry"
+        "configure", help="point npm / pip / cargo / docker at the registry"
     )
     configure.add_argument(
-        "target", nargs="?", default="all", help="npm, pip, cargo, or all (default: all)"
+        "target",
+        nargs="?",
+        default="all",
+        help="npm, pip, cargo, docker, or a comma-separated list (default: all = npm,pip,cargo)",
     )
     configure.add_argument("--dry-run", action="store_true", help="print instead of writing")
+    configure.add_argument(
+        "--container-cli",
+        choices=CONTAINER_CLIS,
+        help="which client to log in with (default: docker, else podman)",
+    )
     configure.set_defaults(func=cmd_configure)
 
     audit_cmd = sub.add_parser("audit", help="check this project's dependencies for CVEs")
@@ -1452,18 +1833,37 @@ def build_parser() -> argparse.ArgumentParser:
     audit_cmd.add_argument(
         "--dry-run", action="store_true", help="with --fix, show the changes without writing"
     )
+    audit_cmd.add_argument(
+        "--image",
+        action="append",
+        metavar="REF",
+        help="audit a container image instead of lockfiles (repeatable), e.g. alpine:3.20",
+    )
+    audit_cmd.add_argument(
+        "--platform", default="linux/amd64", help="with --image: the platform to judge (default linux/amd64)"
+    )
+    audit_cmd.add_argument(
+        "--wait",
+        type=int,
+        default=120,
+        metavar="SECONDS",
+        help="with --image: how long to wait for a queued scan (default 120)",
+    )
     audit_cmd.set_defaults(func=cmd_audit)
 
     search = sub.add_parser("search", help="search the registry")
     search.add_argument("query")
-    search.add_argument("--ecosystem", choices=["npm", "pypi", "cargo"])
+    search.add_argument("--ecosystem", choices=["npm", "pypi", "cargo", "docker"])
     search.add_argument("--limit", type=int, default=25)
     search.set_defaults(func=cmd_search)
 
-    info_cmd = sub.add_parser("info", help="show a package")
-    info_cmd.add_argument("package")
-    info_cmd.add_argument("--ecosystem", choices=["npm", "pypi", "cargo"], default="npm")
+    info_cmd = sub.add_parser("info", help="show a package or container image")
+    info_cmd.add_argument("package", help="package name, or an image reference with --ecosystem docker")
+    info_cmd.add_argument("--ecosystem", choices=["npm", "pypi", "cargo", "docker"], default="npm")
     info_cmd.add_argument("--limit", type=int, default=20)
+    info_cmd.add_argument(
+        "--platform", default="linux/amd64", help="docker: the platform of a multi-platform image"
+    )
     info_cmd.set_defaults(func=cmd_info)
 
     return parser
