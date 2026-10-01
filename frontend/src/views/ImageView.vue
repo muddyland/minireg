@@ -1,23 +1,20 @@
 <script setup>
 /**
- * One image repository: tags, platforms, scan status, and the findings of
- * whichever platform image is selected. Admin controls (pin, quarantine,
- * watch, refresh, rescan) sit alongside.
+ * One image repository. Each tag is a row; expanding it shows everything
+ * about that image (TagDetails): platforms, vulnerabilities, packages from
+ * the SBOM, layers with their build steps, config and scan history.
+ *
+ * The open tag is kept in the URL (?tag=), so a link can point straight at it.
  */
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import api from '@/api/client'
+import TagDetails from '@/components/TagDetails.vue'
 import { useAuthStore } from '@/stores/auth'
-import {
-  SEVERITIES,
-  formatBytes,
-  formatDateTime,
-  relativeTime,
-  shortDigest,
-  trivySeverityClass,
-} from '@/utils/format'
+import { SEVERITIES, formatBytes, relativeTime, shortDigest, trivySeverityClass } from '@/utils/format'
 
 const route = useRoute()
+const router = useRouter()
 const auth = useAuthStore()
 const name = computed(() => route.params.name)
 
@@ -25,14 +22,12 @@ const repo = ref(null)
 const loading = ref(true)
 const error = ref(null)
 const message = ref(null)
-const copied = ref(null)
-
-const selected = ref(null)   // digest of the platform image shown below
-const detail = ref(null)
-const findings = ref([])
-const findingsTotal = ref(0)
-const filters = ref({ severity: '', fixable: '', kev: '', q: '' })
 const watchInput = ref('')
+const tagFilter = ref('')
+// Bumped after admin actions so open panels drop their cached data.
+const generation = ref(0)
+
+const open = ref(new Set(route.query.tag ? [String(route.query.tag)] : []))
 
 async function load() {
   loading.value = true
@@ -40,8 +35,8 @@ async function load() {
   try {
     repo.value = await api.dockerRepository(name.value)
     watchInput.value = (repo.value.watched_tags || []).join(', ')
-    if (!selected.value) selected.value = defaultDigest()
-    if (selected.value) await loadDetail()
+    // Nothing chosen: open the newest tag, so the page is never just a list.
+    if (!open.value.size && repo.value.tags.length) open.value = new Set([repo.value.tags[0].tag])
   } catch (err) {
     error.value = err.status === 404 ? 'This repository has not been pulled or pushed yet.' : err.detail
   } finally {
@@ -49,51 +44,35 @@ async function load() {
   }
 }
 
-function defaultDigest() {
-  const tag = repo.value?.tags?.[0]
-  if (!tag) return repo.value?.digests?.[0]?.digest || null
-  if (!tag.manifest.is_index) return tag.manifest.digest
-  const amd = tag.platforms.find((p) => p.platform === 'linux/amd64' && p.fetched)
-  const any = tag.platforms.find((p) => p.fetched && !p.attestation)
-  return (amd || any)?.digest || null
+function toggle(tag) {
+  const next = new Set(open.value)
+  next.has(tag) ? next.delete(tag) : next.add(tag)
+  open.value = next
+  const only = next.size === 1 ? [...next][0] : undefined
+  router.replace({ query: { ...route.query, tag: only } })
 }
 
-async function loadDetail() {
-  detail.value = await api.dockerManifest(selected.value)
-  await loadFindings()
-}
+const tags = computed(() => {
+  const q = tagFilter.value.trim().toLowerCase()
+  return (repo.value?.tags || []).filter((t) => !q || t.tag.toLowerCase().includes(q))
+})
 
-async function loadFindings() {
-  if (!detail.value || detail.value.scan_status !== 'scanned') {
-    findings.value = []
-    findingsTotal.value = 0
-    return
+/** The scan summary a tag row shows: its own (single image) or the worst platform's. */
+function rowScan(tag) {
+  const images = tag.manifest.is_index
+    ? tag.platforms.filter((p) => !p.attestation && p.manifest).map((p) => p.manifest)
+    : [tag.manifest]
+  const scanned = images.filter((m) => m.scan_status === 'scanned')
+  const pending = images.some((m) => ['queued', 'scanning'].includes(m.scan_status))
+  const blocked = images.find((m) => m.policy_block_reason)
+  const worst = {}
+  let kev = 0
+  for (const m of scanned) {
+    kev = Math.max(kev, m.kev_count || 0)
+    for (const s of SEVERITIES) worst[s] = Math.max(worst[s] || 0, (m.severity_counts || {})[s] || 0)
   }
-  const f = filters.value
-  const data = await api.dockerFindings(selected.value, {
-    severity: f.severity || undefined,
-    fixable: f.fixable === '' ? undefined : f.fixable,
-    kev: f.kev === '' ? undefined : f.kev,
-    q: f.q || undefined,
-    limit: 500,
-  })
-  findings.value = data.findings
-  findingsTotal.value = data.total
-}
-
-async function select(digest) {
-  selected.value = digest
-  await loadDetail()
-}
-
-async function copy(text, key) {
-  try {
-    await navigator.clipboard.writeText(text)
-    copied.value = key
-    setTimeout(() => (copied.value = null), 1500)
-  } catch {
-    copied.value = null
-  }
+  const size = Math.max(0, ...images.map((m) => m.total_size || 0))
+  return { scanned: scanned.length, total: images.length, pending, blocked, worst, kev, size }
 }
 
 async function update(payload, note) {
@@ -115,8 +94,8 @@ function toggleQuarantine() {
 }
 
 function saveWatch() {
-  const tags = watchInput.value.split(',').map((t) => t.trim()).filter(Boolean)
-  return update({ watched_tags: tags }, tags.length ? `Watching ${tags.join(', ')}.` : 'No longer watching any tags.')
+  const list = watchInput.value.split(',').map((t) => t.trim()).filter(Boolean)
+  return update({ watched_tags: list }, list.length ? `Watching ${list.join(', ')}.` : 'No longer watching any tags.')
 }
 
 async function refresh(tag) {
@@ -124,30 +103,15 @@ async function refresh(tag) {
   try {
     const result = await api.dockerRefreshTag(name.value, tag)
     message.value = `${tag}: ${result.source}, ${result.layers_fetched} layers fetched, scans queued for ${result.platforms.join(', ') || 'the image'}.`
+    generation.value++
     await load()
   } catch (err) {
     error.value = err.detail || 'Refresh failed.'
   }
 }
 
-async function rescan(full) {
-  message.value = null
-  try {
-    const result = await api.dockerRescan(selected.value, full)
-    message.value = result.queued
-      ? `Rescan queued (${result.mode === 'sbom' ? 'against the stored SBOM, no image pull' : 'full image scan'}).`
-      : 'A scan is already queued for this image.'
-    await loadDetail()
-  } catch (err) {
-    error.value = err.detail || 'Could not queue a rescan.'
-  }
-}
-
-const countsFor = (m) => SEVERITIES.filter((s) => (m?.severity_counts || {})[s]).map((s) => [s, m.severity_counts[s]])
-
-watch(filters, loadFindings, { deep: true })
 watch(name, () => {
-  selected.value = null
+  open.value = new Set()
   load()
 })
 onMounted(load)
@@ -163,7 +127,10 @@ onMounted(load)
         <span v-else class="badge">cached from {{ repo.upstream }}</span>
         <span v-if="repo.quarantined" class="badge badge-danger">quarantined</span>
         <span v-if="repo.pinned" class="badge">pinned</span>
-        <span class="faint small">· {{ repo.pull_count }} pulls · last {{ relativeTime(repo.last_pulled_at || repo.last_pushed_at) }}</span>
+        <span class="faint small">
+          · {{ repo.tags.length }} tag{{ repo.tags.length === 1 ? '' : 's' }} · {{ repo.pull_count }} pulls · last
+          {{ relativeTime(repo.last_pulled_at || repo.last_pushed_at) }}
+        </span>
       </p>
     </div>
   </div>
@@ -177,247 +144,253 @@ onMounted(load)
       Pulls from this repository are refused<span v-if="repo.quarantine_reason">: {{ repo.quarantine_reason }}</span>.
     </div>
 
-    <div class="card mb">
-      <div class="card-body">
-        <div class="copy-block">
-          <pre>docker pull {{ repo.pull_reference }}:{{ repo.tags[0]?.tag || 'latest' }}</pre>
-          <button class="btn btn-sm" @click="copy(`docker pull ${repo.pull_reference}:${repo.tags[0]?.tag || 'latest'}`, 'pull')">
-            {{ copied === 'pull' ? 'Copied' : 'Copy' }}
-          </button>
-        </div>
+    <div v-if="auth.isAdmin" class="card admin-strip mb">
+      <div class="admin-strip-body">
+        <span class="admin-label">Administration</span>
+        <button class="btn btn-sm" title="Exempt from storage eviction" @click="update({ pinned: !repo.pinned }, repo.pinned ? 'Unpinned.' : 'Pinned: exempt from eviction.')">
+          {{ repo.pinned ? 'Unpin' : 'Pin' }}
+        </button>
+        <button
+          class="btn btn-sm"
+          :class="repo.quarantined ? '' : 'btn-danger'"
+          title="Refuse every pull, with a reason shown to the client; recorded in the audit log"
+          @click="toggleQuarantine"
+        >
+          {{ repo.quarantined ? 'Lift quarantine' : 'Quarantine' }}
+        </button>
+        <template v-if="!repo.local">
+          <span class="admin-sep" />
+          <label for="watch-tags" class="small dim nowrap" title="Revalidated, pre-fetched and rescanned hourly; never evicted">Watched tags</label>
+          <input id="watch-tags" v-model="watchInput" class="watch-input" placeholder="3.12-slim, latest" @keyup.enter="saveWatch" />
+          <button class="btn btn-sm" @click="saveWatch">Save</button>
+        </template>
       </div>
     </div>
 
-    <div class="grid grid-2 mb image-grid">
-      <div class="card">
+    <div class="image-layout">
+      <div class="card tags-card">
         <div class="card-head">
           <h3>Tags</h3>
-          <span class="faint small">{{ repo.tags.length }}</span>
+          <input
+            v-if="repo.tags.length > 6"
+            v-model="tagFilter"
+            type="search"
+            class="tag-filter"
+            placeholder="Filter tags…"
+          />
         </div>
-        <div class="card-body tight">
-          <div v-if="!repo.tags.length" class="empty">No tags cached yet.</div>
-          <div v-else class="table-wrap">
-            <table>
-              <thead>
-                <tr><th>Tag</th><th>Digest</th><th>Platforms</th><th>Checked</th><th></th></tr>
-              </thead>
-              <tbody>
-                <tr v-for="tag in repo.tags" :key="tag.tag">
-                  <td class="mono">{{ tag.tag }}</td>
-                  <td class="mono small" :title="tag.manifest.digest">{{ shortDigest(tag.manifest.digest) }}</td>
-                  <td>
-                    <template v-if="tag.manifest.is_index">
-                      <button
-                        v-for="p in tag.platforms.filter((x) => !x.attestation)"
-                        :key="p.digest"
-                        class="eco-chip"
-                        :class="{ active: selected === p.digest }"
-                        :disabled="!p.fetched"
-                        :title="p.fetched ? p.digest : 'not pulled yet'"
-                        @click="select(p.digest)"
-                      >
-                        {{ p.platform || '?' }}
-                      </button>
-                      <span v-if="tag.platforms.some((x) => x.attestation)" class="faint small" title="BuildKit provenance / SBOM attestations; recorded, not scanned">
-                        + attestations
-                      </span>
-                    </template>
-                    <button
-                      v-else
-                      class="eco-chip"
-                      :class="{ active: selected === tag.manifest.digest }"
-                      @click="select(tag.manifest.digest)"
-                    >
-                      {{ tag.manifest.platform || 'single platform' }}
-                    </button>
-                  </td>
-                  <td class="faint small nowrap">{{ relativeTime(tag.checked_at) }}</td>
-                  <td class="num">
-                    <button v-if="auth.isAdmin && !repo.local" class="btn btn-sm" title="Revalidate upstream now, pre-fetch layers, queue scans" @click="refresh(tag.tag)">
-                      Refresh
-                    </button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <div v-if="!repo.tags.length" class="empty">No tags cached yet.</div>
+        <ul v-else class="tag-list">
+          <li v-for="tag in tags" :key="tag.tag" :class="{ open: open.has(tag.tag) }">
+            <div
+              class="tag-row"
+              role="button"
+              tabindex="0"
+              :aria-expanded="open.has(tag.tag)"
+              @click="toggle(tag.tag)"
+              @keydown.enter.prevent="toggle(tag.tag)"
+              @keydown.space.prevent="toggle(tag.tag)"
+            >
+              <span class="chev" aria-hidden="true">›</span>
+              <span class="tag-id">
+                <span class="tag-name mono">{{ tag.tag }}</span>
+                <span class="tag-digest mono faint" :title="tag.manifest.digest">{{ shortDigest(tag.manifest.digest) }}</span>
+              </span>
+              <span class="tag-platforms small">
+                <template v-if="tag.manifest.is_index">
+                  {{ tag.platforms.filter((p) => !p.attestation).length }}
+                  platform{{ tag.platforms.filter((p) => !p.attestation).length === 1 ? '' : 's' }}
+                </template>
+                <template v-else>{{ tag.manifest.platform || 'single platform' }}</template>
+              </span>
+              <span class="tag-scan">
+                <template v-for="s in [rowScan(tag)]" :key="'s'">
+                  <span v-if="s.blocked" class="badge badge-danger" :title="s.blocked.policy_block_reason">blocked</span>
+                  <template v-if="s.scanned">
+                    <span v-if="s.kev" class="sev-mini kev" title="Known exploited (CISA KEV)">KEV {{ s.kev }}</span>
+                    <span
+                      v-for="sev in ['CRITICAL', 'HIGH', 'MEDIUM']"
+                      v-show="s.worst[sev]"
+                      :key="sev"
+                      class="sev-mini"
+                      :class="trivySeverityClass(sev)"
+                      :title="`${sev.toLowerCase()} (worst platform)`"
+                    >{{ sev[0] }} {{ s.worst[sev] }}</span>
+                    <span v-if="!s.kev && !s.worst.CRITICAL && !s.worst.HIGH && !s.worst.MEDIUM" class="badge badge-ok">clean</span>
+                  </template>
+                  <span v-else-if="s.pending" class="badge badge-warn">scanning</span>
+                  <span v-else class="faint small">not scanned</span>
+                </template>
+              </span>
+              <span class="tag-size small faint nowrap">{{ rowScan(tag).size ? formatBytes(rowScan(tag).size) : '' }}</span>
+              <span class="tag-checked faint small nowrap" :title="`Checked against the upstream ${relativeTime(tag.checked_at)}`">
+                {{ relativeTime(tag.updated_at || tag.checked_at) }}
+              </span>
+              <span class="tag-actions" @click.stop>
+                <button
+                  v-if="auth.isAdmin && !repo.local"
+                  class="btn btn-sm btn-ghost"
+                  title="Revalidate upstream now, pre-fetch layers, queue scans"
+                  @click="refresh(tag.tag)"
+                >Refresh</button>
+              </span>
+            </div>
+            <TagDetails
+              v-if="open.has(tag.tag)"
+              :key="`${tag.tag}:${tag.manifest.digest}:${generation}`"
+              :repo="repo"
+              :tag="tag"
+              @message="(m) => (message = m)"
+              @error="(e) => (error = e)"
+            />
+          </li>
+        </ul>
+        <div v-if="repo.tags.length && !tags.length" class="empty small">No tags match.</div>
       </div>
 
-      <div v-if="auth.isAdmin" class="card">
-        <div class="card-head"><h3>Administration</h3></div>
-        <div class="card-body">
-          <div class="row mb">
-            <button class="btn" @click="update({ pinned: !repo.pinned }, repo.pinned ? 'Unpinned.' : 'Pinned: exempt from eviction.')">
-              {{ repo.pinned ? 'Unpin' : 'Pin' }}
-            </button>
-            <button class="btn" :class="repo.quarantined ? '' : 'btn-danger'" @click="toggleQuarantine">
-              {{ repo.quarantined ? 'Lift quarantine' : 'Quarantine' }}
-            </button>
-          </div>
-          <div v-if="!repo.local" class="field">
-            <label for="watch-tags">Watched tags</label>
-            <div class="row">
-              <input id="watch-tags" v-model="watchInput" placeholder="3.12-slim, latest" style="flex: 1" />
-              <button class="btn" @click="saveWatch">Save</button>
-            </div>
-            <p class="field-hint">
-              Revalidated, pre-fetched and rescanned every hour, so CI finds them warm and current.
-              Watched tags are never evicted.
-            </p>
-          </div>
-          <p class="field-hint" style="margin: 0">
-            Pinning exempts the repository from storage eviction. Quarantine refuses every pull
-            with the reason you give, and is recorded in the audit log.
-          </p>
-        </div>
-      </div>
     </div>
 
-    <div v-if="detail" class="card mb">
+    <div v-if="repo.digests?.length" class="card mt">
       <div class="card-head">
-        <h3>
-          <span class="mono">{{ shortDigest(detail.digest) }}</span>
-          <span v-if="detail.platform" class="faint small"> · {{ detail.platform }}</span>
-        </h3>
-        <div class="row-tight">
-          <a v-if="detail.has_sbom" class="btn btn-sm" :href="api.dockerSbomUrl(detail.digest)">SBOM (CycloneDX)</a>
-          <template v-if="auth.isAdmin && detail.kind === 'image'">
-            <button class="btn btn-sm" :disabled="detail.scan_status === 'queued' || detail.scan_status === 'scanning'" @click="rescan(false)">
-              Rescan
-            </button>
-            <button class="btn btn-sm" title="Pull the image and scan it again from scratch" @click="rescan(true)">Full rescan</button>
-          </template>
-        </div>
+        <h3>Untagged digests</h3>
+        <span class="faint small">{{ repo.digests.length }}</span>
       </div>
-      <div class="card-body">
-        <div v-if="detail.policy_block_reason" class="alert alert-error">
-          Pulls of this image are refused: {{ detail.policy_block_reason }}
+      <div class="card-body tight">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Digest</th><th>Kind</th><th>Platform</th><th>Scan</th><th class="num">Size</th><th>Last used</th></tr></thead>
+            <tbody>
+              <tr v-for="m in repo.digests" :key="m.digest">
+                <td class="mono small" :title="m.digest">{{ shortDigest(m.digest) }}</td>
+                <td class="small">{{ m.kind }}</td>
+                <td class="small">{{ m.platform || '—' }}</td>
+                <td class="small">{{ m.scan_status.replace('_', ' ') }}</td>
+                <td class="num small">{{ formatBytes(m.total_size) }}</td>
+                <td class="faint small">{{ relativeTime(m.last_accessed_at) }}</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
-        <div class="stat-row mb">
-          <div>
-            <div class="faint small">Scan</div>
-            <span class="badge" :class="{ 'badge-ok': detail.scan_status === 'scanned', 'badge-warn': ['queued', 'scanning'].includes(detail.scan_status), 'badge-danger': detail.scan_status === 'failed' }">
-              {{ detail.scan_status.replace('_', ' ') }}
-            </span>
-            <div v-if="detail.scanned_at" class="faint small">{{ relativeTime(detail.scanned_at) }}</div>
-          </div>
-          <div>
-            <div class="faint small">Findings</div>
-            <div class="row-tight">
-              <span v-if="detail.kev_count" class="sev sev-critical" title="Known exploited (CISA KEV)">KEV {{ detail.kev_count }}</span>
-              <span v-for="[sev, n] in countsFor(detail)" :key="sev" class="sev" :class="trivySeverityClass(sev)">
-                {{ sev.toLowerCase() }} {{ n }}
-              </span>
-              <span v-if="detail.scan_status === 'scanned' && !countsFor(detail).length" class="badge badge-ok">none</span>
-            </div>
-            <div v-if="detail.scan_status === 'scanned'" class="faint small">{{ detail.fixable_count }} with a fixed version</div>
-          </div>
-          <div>
-            <div class="faint small">Size</div>
-            <div>{{ formatBytes(detail.total_size) }} <span class="faint small">· {{ detail.layer_count }} layers</span></div>
-          </div>
-          <div v-if="detail.scans[0]">
-            <div class="faint small">Scanner</div>
-            <div class="small">Trivy {{ detail.scans[0].trivy_version }} · {{ detail.scans[0].os || 'unknown OS' }}</div>
-            <div class="faint small">DB {{ formatDateTime(detail.scans[0].db_updated_at) }}</div>
-          </div>
-        </div>
-        <div v-if="detail.last_job?.status === 'failed'" class="alert alert-error small">
-          Last scan failed after {{ detail.last_job.attempts }} attempts: {{ detail.last_job.error }}
-        </div>
-        <div v-if="detail.kind !== 'image'" class="alert alert-info small">
-          This is {{ detail.kind === 'index' ? 'a multi-platform index' : `an ${detail.kind}` }}, not a runnable image, so it is not scanned itself.
-        </div>
-
-        <template v-if="detail.scan_status === 'scanned'">
-          <div class="row mb">
-            <select v-model="filters.severity" style="width: auto">
-              <option value="">Any severity</option>
-              <option value="CRITICAL">Critical</option>
-              <option value="CRITICAL,HIGH">High and above</option>
-              <option value="MEDIUM">Medium</option>
-              <option value="LOW">Low</option>
-            </select>
-            <select v-model="filters.fixable" style="width: auto">
-              <option value="">Fixed or not</option>
-              <option :value="true">Has a fix</option>
-              <option :value="false">No fix yet</option>
-            </select>
-            <select v-model="filters.kev" style="width: auto">
-              <option value="">Any</option>
-              <option :value="true">Known exploited only</option>
-            </select>
-            <input v-model.lazy="filters.q" type="search" placeholder="CVE or package…" style="flex: 1; min-width: 160px" />
-            <span class="faint small">{{ findingsTotal }} shown</span>
-          </div>
-          <div v-if="!findings.length" class="empty">No findings match.</div>
-          <div v-else class="table-wrap">
-            <table>
-              <thead>
-                <tr><th>Vulnerability</th><th>Severity</th><th>Package</th><th>Installed</th><th>Fixed in</th><th>Title</th></tr>
-              </thead>
-              <tbody>
-                <tr v-for="f in findings" :key="f.vuln_id + f.pkg_name + f.installed_version">
-                  <td class="mono nowrap">
-                    <a v-if="f.url" :href="f.url" target="_blank" rel="noopener noreferrer">{{ f.vuln_id }}</a>
-                    <span v-else>{{ f.vuln_id }}</span>
-                    <div class="row-tight">
-                      <span v-if="f.kev" class="badge badge-danger" title="CISA Known Exploited Vulnerability">KEV</span>
-                      <span v-if="f.denied" class="badge badge-danger">denied</span>
-                      <span v-if="f.accepted" class="badge badge-warn">risk accepted</span>
-                    </div>
-                  </td>
-                  <td>
-                    <span class="sev" :class="trivySeverityClass(f.severity)">{{ f.severity.toLowerCase() }}</span>
-                    <div v-if="f.cvss !== null" class="faint small">CVSS {{ f.cvss.toFixed(1) }}</div>
-                  </td>
-                  <td class="mono small">{{ f.pkg_name }}<div class="faint small">{{ f.pkg_type }}</div></td>
-                  <td class="mono small">{{ f.installed_version || '—' }}</td>
-                  <td class="mono small">{{ f.fixed_version || '—' }}</td>
-                  <td class="small truncate" style="max-width: 320px" :title="f.title">{{ f.title || '—' }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </template>
-
-        <details v-if="detail.layers.length" class="mt">
-          <summary class="small dim">Layers ({{ detail.layers.length }})</summary>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Type</th><th>Digest</th><th class="num">Size</th><th>Cached</th></tr></thead>
-              <tbody>
-                <tr v-for="layer in detail.layers" :key="layer.digest">
-                  <td class="small">{{ layer.type }}</td>
-                  <td class="mono small" :title="layer.digest">{{ shortDigest(layer.digest) }}</td>
-                  <td class="num small">{{ formatBytes(layer.size) }}</td>
-                  <td class="small">{{ layer.cached ? 'yes' : 'no' }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </details>
       </div>
     </div>
   </template>
 </template>
 
 <style scoped>
-.stat-row {
+/* The expanded tag needs the full width, so administration is a strip above
+   the list rather than a sidebar beside it. */
+.admin-strip-body {
   display: flex;
   flex-wrap: wrap;
-  gap: 1.6rem;
+  align-items: center;
+  gap: 0.5rem 0.6rem;
+  padding: 0.55rem 1rem;
 }
-.stat-row .row-tight {
+.admin-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  margin-right: 0.3rem;
+}
+.admin-sep {
+  width: 1px;
+  height: 1.4rem;
+  background: var(--border);
+  margin: 0 0.4rem;
+}
+/* The global input rule (six :not()s, specificity 0,6,1) sets width: 100%;
+   only an id out-ranks it without !important. */
+#watch-tags {
+  width: 260px;
+  height: 30px;
+}
+.tag-filter {
+  width: 220px;
+  height: 30px;
+}
+.tag-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.tag-list > li + li {
+  border-top: 1px solid var(--border);
+}
+.tag-row {
+  display: grid;
+  grid-template-columns: 1rem minmax(8rem, 1fr) 7.5rem minmax(12rem, 18rem) 4.5rem 6.5rem 5.5rem;
+  gap: 0.9rem;
+  align-items: center;
+  padding: 0.6rem 1rem;
+  cursor: pointer;
+  user-select: none;
+}
+.tag-row:hover {
+  background: var(--surface-2);
+}
+.tag-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+li.open > .tag-row {
+  background: var(--accent-soft);
+}
+.chev {
+  display: inline-block;
+  color: var(--text-faint);
+  font-size: 1.1rem;
+  line-height: 1;
+  transition: transform 0.12s ease;
+}
+li.open .chev {
+  transform: rotate(90deg);
+  color: var(--accent);
+}
+.tag-id {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.tag-name {
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tag-digest {
+  font-size: 0.74rem;
+}
+.tag-scan {
+  display: flex;
   flex-wrap: wrap;
+  gap: 0.3rem;
+  align-items: center;
 }
-.eco-chip + .eco-chip {
-  margin-left: 0.3rem;
+.sev-mini {
+  font-size: 0.76rem;
+  font-weight: 650;
+  padding: 0.05rem 0.42rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  white-space: nowrap;
 }
-@media (max-width: 1000px) {
-  .image-grid {
-    grid-template-columns: 1fr;
+.sev-mini.kev {
+  color: var(--critical);
+  outline: 1px solid color-mix(in srgb, currentColor 45%, transparent);
+}
+.tag-actions {
+  justify-self: end;
+}
+
+@media (max-width: 900px) {
+  .tag-row {
+    grid-template-columns: 1rem minmax(0, 1fr) auto auto;
+  }
+  .tag-platforms,
+  .tag-size,
+  .tag-checked {
+    display: none;
   }
 }
 </style>

@@ -25,6 +25,7 @@ from ..config import settings
 from ..core.deps import Identity, client_ip, require_admin, require_user
 from ..core.security import encrypt_credential
 from ..db import get_session
+from ..docker import details as image_details
 from ..docker import housekeeping, scanning
 from ..docker import registry as reg
 from ..docker.errors import RegistryError
@@ -596,6 +597,115 @@ def finding_payload(f: DockerFinding, policy: ImagePolicy) -> dict[str, Any]:
         "denied": f.vuln_id in policy.deny_cves,
         "accepted": f.vuln_id in policy.allow_cves,
     }
+
+
+async def _config_bytes(session: AsyncSession, m: DockerManifest) -> bytes | None:
+    """The image config blob: from the store, else fetched (a few KB) from the
+    upstream through a repository that holds this manifest."""
+    if not m.config_digest:
+        return None
+    store = get_oci_store()
+    if store.exists(m.config_digest):
+        return await store.read_bytes(m.config_digest, limit=image_details.MAX_CONFIG_BYTES)
+    repo = (
+        await session.execute(
+            select(DockerRepository)
+            .join(DockerRepoManifest, DockerRepoManifest.repository_id == DockerRepository.id)
+            .where(DockerRepoManifest.manifest_id == m.id, DockerRepository.is_local.is_(False))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if repo is None:
+        return None
+    try:
+        target = await reg.resolve_target(session, repo.name, mirror_host=False)
+        blob = await reg.open_blob(session, target, repo, m.config_digest)
+        body = bytearray()
+        async for chunk in blob.chunks:
+            body.extend(chunk)
+            if len(body) > image_details.MAX_CONFIG_BYTES:
+                return None
+        return bytes(body)
+    except RegistryError as exc:
+        log.info("config %s for %s not available: %s", m.config_digest, m.digest, exc.message)
+        return None
+
+
+@router.get("/manifest/{digest}/config")
+async def get_image_config(
+    digest: str,
+    session: AsyncSession = Depends(get_session),
+    identity: Identity = Depends(require_user),
+) -> dict:
+    """Entrypoint, env, labels, ports and the build history of an image,
+    with each layer paired to the step that produced it."""
+    m = await _manifest_or_404(session, digest)
+    if m.kind != "image":
+        raise HTTPException(status_code=404, detail="only images have a config")
+    config = image_details.parse_config(await _config_bytes(session, m))
+    layers = (
+        await session.execute(
+            select(DockerManifestRef)
+            .where(DockerManifestRef.manifest_id == m.id, DockerManifestRef.ref_type == "blob")
+            .order_by(DockerManifestRef.position)
+        )
+    ).scalars().all()
+    await session.commit()
+    steps = image_details.layer_history(len(layers), config["history"]) if config else [None] * len(layers)
+    diff_ids = (config or {}).get("diff_ids") or []
+    store = get_oci_store()
+    return {
+        "digest": m.digest,
+        "available": config is not None,
+        "config": config,
+        "layers": [
+            {
+                "index": i,
+                "digest": ref.digest,
+                "media_type": ref.media_type,
+                "size": ref.size,
+                "cached": store.exists(ref.digest),
+                "diff_id": diff_ids[i] if i < len(diff_ids) else None,
+                "created_by": (steps[i] or {}).get("created_by"),
+                "created": (steps[i] or {}).get("created"),
+                "comment": (steps[i] or {}).get("comment"),
+            }
+            for i, ref in enumerate(layers)
+        ],
+    }
+
+
+@router.get("/manifest/{digest}/packages")
+async def get_image_packages(
+    digest: str,
+    session: AsyncSession = Depends(get_session),
+    identity: Identity = Depends(require_user),
+) -> dict:
+    """The SBOM as a package list: name, version, type, licences, and the
+    layer each package came from. The raw CycloneDX is at ``/sbom``."""
+    m = await _manifest_or_404(session, digest)
+    if not m.sbom_digest:
+        raise HTTPException(status_code=404, detail="no SBOM recorded for this image yet")
+    cached = image_details.SBOM_CACHE.get(m.sbom_digest)
+    if cached is None:
+        raw = await get_oci_store().read_bytes(m.sbom_digest, limit=image_details.MAX_SBOM_BYTES)
+        if raw is None:
+            raise HTTPException(status_code=404, detail="SBOM file missing")
+        cached = image_details.summarize_sbom(raw) or {}
+        image_details.SBOM_CACHE.put(m.sbom_digest, cached)
+    # Findings per package, so the list can show which ones are vulnerable.
+    vulnerable = (
+        await session.execute(
+            select(DockerFinding.pkg_name, DockerFinding.installed_version, DockerFinding.severity, func.count())
+            .where(DockerFinding.manifest_id == m.id)
+            .group_by(DockerFinding.pkg_name, DockerFinding.installed_version, DockerFinding.severity)
+        )
+    ).all()
+    findings: dict[str, dict[str, int]] = {}
+    for pkg, version, severity, n in vulnerable:
+        key = f"{pkg}@{version or ''}"
+        findings.setdefault(key, {})[(severity or "UNKNOWN").upper()] = n
+    return {**cached, "findings_by_package": findings}
 
 
 @router.get("/manifest/{digest}/sbom")

@@ -149,6 +149,7 @@ parsed, and text from them is shown as text, never as HTML.
   already have.
 - **SBOMs.** Each scanned image gets a CycloneDX SBOM. You can download it
   from the image page.
+
 - **Vulnerability database.** When minireg has a `ghcr` upstream, the worker
   downloads Trivy's database through minireg (`ghcr/aquasecurity/trivy-db`).
   ghcr.io rate-limits that artifact heavily, and routing it through minireg
@@ -169,6 +170,29 @@ The worker talks to minireg inside the compose network at
 an origin, so the token challenge sends the worker back to the internal
 address and not out through your public proxy. The **Image policy** page shows
 when each worker last checked in, and warns when none has.
+
+### What the image page shows
+
+Expand a tag on an image's page (**Images**, then the repository) to see the
+image behind it. For a multi-platform tag, pick the platform first. Only
+platforms pulled through minireg have details.
+
+| Tab | Shows |
+|-----|-------|
+| Vulnerabilities | Findings from the latest scan. You can filter by severity, by whether a fix exists and by known-exploited (KEV), or search for a CVE or package. Expand a finding to see the fix and the layer it came from. |
+| Packages | Every package in the SBOM, with version, type, licence, the findings against it and the layer that added it. |
+| Layers | Each layer with its size, whether it is cached, and the build step that made it (`RUN …`, `COPY …`). Expand a layer to see the packages it added. |
+| Config | Entrypoint, command, user (flagged when it is root), working directory, ports, volumes, environment, labels and the full build history. |
+| Scan history | Every scan of this digest, with the mode, the Trivy and database versions, and the counts. |
+
+All of this comes from data minireg already holds: the image config blob and
+the SBOM. You don't have to pull the image. If a cached image's config blob
+was never fetched, minireg fetches it from the upstream on first view. It is a
+few kilobytes.
+
+Keep in mind that the config and history are written by whoever built the
+image. A build step is only a label: the scan is what tells you what the
+layers actually contain.
 
 ## Pull policy
 

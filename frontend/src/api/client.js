@@ -153,6 +153,8 @@ export const api = {
   dockerFindings: (digest, params) =>
     request(`/api/docker/manifest/${encodeURIComponent(digest)}/findings${qs(params)}`),
   dockerSbomUrl: (digest) => `/api/docker/manifest/${encodeURIComponent(digest)}/sbom`,
+  dockerImageConfig: (digest) => request(`/api/docker/manifest/${encodeURIComponent(digest)}/config`),
+  dockerPackages: (digest) => request(`/api/docker/manifest/${encodeURIComponent(digest)}/packages`),
   dockerVulnerabilities: (params) => request(`/api/docker/vulnerabilities${qs(params)}`),
   dockerClientConfig: () => request('/api/docker/client-config'),
   dockerUpdateRepository: (name, payload) =>
