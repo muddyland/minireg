@@ -6,7 +6,7 @@
 # rules and silently diverge.
 
 line-length = 110
-target-version = "py312"
+target-version = "py314"
 
 # Where first-party packages live. Without this, `app` and `tests` resolve as
 # third-party from the repo root and import sorting fights itself depending on

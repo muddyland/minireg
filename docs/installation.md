@@ -51,8 +51,11 @@ Then read the initial admin password. If you left `BOOTSTRAP_ADMIN_PASSWORD`
 blank, one is generated and written to a `0600` file on the data volume:
 
 ```bash
-docker compose exec minireg cat /data/initial-admin-password
+docker compose exec minireg python -c "print(open('/data/initial-admin-password').read())"
 ```
+
+(`python -c` rather than `cat`: the image may be built on a hardened base with
+no shell utilities in it. See [Hardened base image](#hardened-base-image).)
 
 It is deliberately not printed to the container log: Docker's json-file driver
 keeps stdout for the life of the container, so anyone with the docker socket
@@ -60,7 +63,7 @@ or a log shipper could read it indefinitely. Sign in, change the password, then
 delete the file:
 
 ```bash
-docker compose exec minireg rm /data/initial-admin-password
+docker compose exec minireg python -c "import os; os.remove('/data/initial-admin-password')"
 ```
 
 Open the `PUBLIC_URL` you configured and sign in.
@@ -244,6 +247,35 @@ with TLS for anything beyond a trusted LAN.
 
 ---
 
+## Hardened base image
+
+Both images (the registry and the scanner) build on `python:3.14-slim` by
+default. They can instead be built on a
+[Docker Hardened Image](https://docs.docker.com/dhi/), whose runtime has no
+shell, package manager or `curl`. Pass a matching pair: the `-dev` variant
+installs the dependencies, and the plain variant ships them.
+
+```bash
+docker build \
+  --build-arg PYTHON_BUILDER_IMAGE=dhi.io/python:3.14-debian13-dev \
+  --build-arg PYTHON_RUNTIME_IMAGE=dhi.io/python:3.14-debian13 \
+  -t minireg .
+```
+
+The same two arguments work for `scanner/Dockerfile`. Use the `debian13`
+variants, not `alpine`: the hashed lock and Trivy are built for glibc, the
+same as slim. `dhi.io` needs a Docker login, or point the arguments at a mirror
+that serves it. In CI, set `USE_DHI=true`, and set `DHI_PYTHON_IMAGE` too for a
+mirror.
+
+Both bases behave the same way: uid 10001 (10002 for the scanner), a
+read-only root, and the same `/data` layout. Every command in these docs that
+runs inside the container uses `python`, so they work on either base. With no
+shell in the image, debug it with `docker debug` rather than
+`docker compose exec minireg sh`.
+
+---
+
 ## Upgrading
 
 ```bash
@@ -265,12 +297,12 @@ Python dependencies install from `backend/requirements.lock` with
 dependencies. After changing `backend/requirements.txt`, regenerate it:
 
 ```bash
-docker run --rm -v "$PWD/backend:/w" -w /w python:3.12-slim sh -c \
+docker run --rm -v "$PWD/backend:/w" -w /w python:3.14-slim sh -c \
   'pip install -q pip-tools && pip-compile --generate-hashes \
    --no-emit-index-url -o requirements.lock requirements.txt'
 ```
 
-Generate it inside `python:3.12-slim`, matching the runtime image: markers and
+Generate it inside `python:3.14-slim`, matching the runtime image: markers and
 backport packages differ between interpreter versions, so a lock built on a
 different Python can install the wrong set. Check the result has no
 `--index-url` line before committing — `pip-compile` bakes in whatever the

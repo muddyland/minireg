@@ -10,12 +10,15 @@
 
 ARG BASE_REGISTRY=
 ARG TRIVY_VERSION=0.74.0
+# Same switch as the registry image; see ../Dockerfile.
+ARG PYTHON_BUILDER_IMAGE=${BASE_REGISTRY}python:3.14-slim
+ARG PYTHON_RUNTIME_IMAGE=${BASE_REGISTRY}python:3.14-slim
 
-FROM ${BASE_REGISTRY}python:3.12-slim AS trivy
+FROM ${PYTHON_BUILDER_IMAGE} AS trivy
 ARG TRIVY_VERSION
 # Official release tarball, verified against the release's checksum file.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl gzip \
     && rm -rf /var/lib/apt/lists/* \
     && cd /tmp \
     && base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}" \
@@ -23,15 +26,16 @@ RUN apt-get update \
     && curl -fsSLO "${base}/trivy_${TRIVY_VERSION}_checksums.txt" \
     && grep " trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz\$" "trivy_${TRIVY_VERSION}_checksums.txt" | sha256sum -c - \
     && tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" trivy \
-    && install -m 0755 trivy /usr/local/bin/trivy
+    && install -D -m 0755 trivy /usr/local/bin/trivy \
+    && mkdir -p /skel/cache
 
-FROM ${BASE_REGISTRY}python:3.12-slim
+# No RUN steps: the hardened runtime has no shell. The worker is stdlib-only
+# and Trivy is a static binary, so the stage is all COPY.
+FROM ${PYTHON_RUNTIME_IMAGE}
 COPY --from=trivy /usr/local/bin/trivy /usr/local/bin/trivy
 COPY scanner/worker.py /app/worker.py
-RUN useradd --create-home --uid 10002 --shell /usr/sbin/nologin scanner \
-    && mkdir -p /cache \
-    && chown scanner:scanner /cache
-USER scanner
+COPY --from=trivy --chown=10002:10002 /skel/cache /cache
+USER 10002:10002
 ENV TRIVY_CACHE_DIR=/cache \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

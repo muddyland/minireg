@@ -12,7 +12,7 @@ part of it.
 ```bash
 cp .env.example .env     # set SECRET_KEY and PUBLIC_URL, then chmod 600 .env
 docker compose up -d --build
-docker compose exec minireg cat /data/initial-admin-password
+docker compose exec minireg python -c "print(open('/data/initial-admin-password').read())"
 ```
 
 The app will not start in production with a placeholder `SECRET_KEY`. Generate
