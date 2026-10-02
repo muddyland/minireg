@@ -23,6 +23,30 @@ os.environ.setdefault(
 )
 os.environ.setdefault("UPSTREAM_ALLOW_PRIVATE_ADDRESSES", "true")
 
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
+
+
+@event.listens_for(Engine, "connect")
+def _sqlite_without_fsync(dbapi_connection, _record):
+    """Don't wait for the disk on test databases.
+
+    Most fixtures build a fresh SQLite file per test, and the engine uses
+    NullPool, so every session is a new connection and every commit an
+    fsync. On storage with slow syncs (the Docker-executor runners measured
+    ~40 ms each) creating the 28-table schema alone took ten seconds, and
+    the suite went from 7 minutes to 46. A test database is thrown away
+    afterwards, so durability buys nothing here. Production engines are
+    untouched: this only runs where conftest is loaded.
+    """
+    if "sqlite" not in type(dbapi_connection).__module__:
+        return
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA synchronous=OFF")
+    cursor.execute("PRAGMA journal_mode=MEMORY")
+    cursor.close()
+
+
 from app.models import DistTag, Ecosystem, Package, PackageFile, PackageVersion
 
 # Container registry fixtures (docker_env and friends).
