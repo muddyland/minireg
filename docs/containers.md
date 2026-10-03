@@ -171,6 +171,12 @@ an origin, so the token challenge sends the worker back to the internal
 address and not out through your public proxy. The **Image policy** page shows
 when each worker last checked in, and warns when none has.
 
+CI publishes the worker as its own image next to the registry's, built from
+the same commit: `<registry image>/scanner:<tag>`, e.g.
+`registry.example/minireg/scanner:main` next to `registry.example/minireg:main`.
+A deployment that pulls images instead of building them uses the pair, so the
+worker always speaks the same scanner API as the registry it talks to.
+
 ### What the image page shows
 
 Expand a tag on an image's page (**Images**, then the repository) to see the

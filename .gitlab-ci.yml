@@ -119,7 +119,9 @@ build:frontend:
 
 # ── Build ─────────────────────────────────────────────────────────────────
 
-build:image:
+# Both images build the same way: on the dind service, tagged by ref, with the
+# USE_DHI switch. Each job sets IMAGE_REPO and IMAGE_DOCKERFILE.
+.image_build:
   stage: build
   tags: [saas-linux-small-amd64]
   image: $DOCKER_IMAGE
@@ -155,15 +157,35 @@ build:image:
         PY_ARGS="$PY_ARGS --build-arg PYTHON_RUNTIME_IMAGE=${DHI_PYTHON_IMAGE}:${DHI_PYTHON_TAG}"
       fi
       docker build --provenance=false --sbom=false --build-arg BASE_REGISTRY="$BASE_REGISTRY" $PY_ARGS \
-        --tag "$CI_REGISTRY_IMAGE:$IMAGE_TAG" .
-    - docker push "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
+        --file "$IMAGE_DOCKERFILE" --tag "$IMAGE_REPO:$IMAGE_TAG" .
+    - docker push "$IMAGE_REPO:$IMAGE_TAG"
     # A tagged build is also the release, so publish it as :latest too.
     - |
       if [ -n "$CI_COMMIT_TAG" ]; then
-        docker tag "$CI_REGISTRY_IMAGE:$IMAGE_TAG" "$CI_REGISTRY_IMAGE:latest"
-        docker push "$CI_REGISTRY_IMAGE:latest"
+        docker tag "$IMAGE_REPO:$IMAGE_TAG" "$IMAGE_REPO:latest"
+        docker push "$IMAGE_REPO:latest"
       fi
+
+# The registry: $CI_REGISTRY_IMAGE:<tag>.
+build:image:
+  extends: .image_build
+  variables:
+    IMAGE_REPO: $CI_REGISTRY_IMAGE
+    IMAGE_DOCKERFILE: Dockerfile
   rules:
     - if: '$CI_COMMIT_REF_NAME == "main"'
     - if: '$CI_COMMIT_TAG'
     - exists: [Dockerfile]
+
+# The Trivy scanner worker: $CI_REGISTRY_IMAGE/scanner:<tag>, so a deployment
+# can pull a matching pair instead of building the worker on the host. Built
+# from the same commit as the registry, it speaks the same scanner API.
+build:scanner:
+  extends: .image_build
+  variables:
+    IMAGE_REPO: $CI_REGISTRY_IMAGE/scanner
+    IMAGE_DOCKERFILE: scanner/Dockerfile
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "main"'
+    - if: '$CI_COMMIT_TAG'
+    - exists: [scanner/Dockerfile]
