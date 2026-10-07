@@ -9,7 +9,7 @@
 # shipped compose file does).
 
 ARG BASE_REGISTRY=
-ARG TRIVY_VERSION=0.74.0
+ARG TRIVY_VERSION=0.75.0
 # Same switch as the registry image; see ../Dockerfile.
 ARG PYTHON_BUILDER_IMAGE=${BASE_REGISTRY}python:3.14-slim
 ARG PYTHON_RUNTIME_IMAGE=${BASE_REGISTRY}python:3.14-slim
