@@ -887,7 +887,8 @@ async def rescore_vulnerabilities(
     would otherwise only apply to newly discovered vulnerabilities. Uses no
     network -- the full OSV record is stored alongside each row.
     """
-    result = await OsvScanner(session).rescore_stored()
+    scanner = OsvScanner(session)
+    result = await scanner.rescore_stored()
     await audit.record_audit(
         session,
         "admin.scan.rescored",
@@ -897,6 +898,9 @@ async def rescore_vulnerabilities(
         detail=result,
     )
     await session.commit()
+    # After the commit: a request in between would re-render from the old
+    # rows and cache the stale verdict again.
+    await scanner.invalidate_changed()
     return result
 
 

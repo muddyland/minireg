@@ -749,6 +749,10 @@ class OsvScanner:
             if version_row is not None and version_row.max_cvss != score:
                 version_row.max_cvss = score
                 versions_updated += 1
+                # The CVSS policy reads max_cvss, so the rendered documents
+                # for this package may now include or omit this version.
+                # The caller invalidates them after its commit.
+                await self._note_changed(version_row)
         await self.session.flush()
 
         # Fixed versions are derived from the same stored records, and were
