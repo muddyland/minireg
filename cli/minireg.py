@@ -1735,6 +1735,19 @@ def cmd_info(args):
                 label += f" (tier {source['tier']})"
             print(f"    {label}  {dim(location)}")
 
+    # Versions refused by policy are missing from the metadata clients see,
+    # which npm reports as ETARGET and pip as "could not find a version".
+    # A whole-package block was already printed above.
+    blocked = [] if pkg.get("blocked") else [
+        v for v in (pkg.get("versions") or []) if v.get("blocked")
+    ]
+    if blocked:
+        print(f"\n  {bold('Blocked versions')}  {dim('(not installable through this registry)')}")
+        for version in blocked[: args.limit]:
+            print(f"    {version['version']:<14} {red('blocked')}  {version.get('block_reason') or ''}")
+        if len(blocked) > args.limit:
+            print(f"    {dim(f'... and {len(blocked) - args.limit} more')}")
+
     vulnerable = [v for v in (pkg.get("versions") or []) if v.get("cves")]
     if vulnerable:
         print(f"\n  {bold('Versions with known CVEs')}")

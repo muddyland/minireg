@@ -57,10 +57,10 @@ To see which versions are blocked and why:
 
 - **The package page in the web UI** (**Search**, then the package) marks
   every blocked version with a **blocked** badge and the reason.
-- **`minireg info <package>`** (`--ecosystem pypi` or `cargo` for those)
-  shows from the command line whether the package is blocked and which
-  versions carry CVEs, and `minireg audit` checks a whole lockfile against
-  the policy.
+- **`minireg info <package>`** lists the blocked versions with their reasons
+  and the versions that carry CVEs (it looks in npm, PyPI and cargo unless
+  you pass `--ecosystem`), and `minireg audit` checks a whole lockfile
+  against the policy.
 
 Then upgrade to an allowed version, or ask an admin for a rule change or a
 risk acceptance.

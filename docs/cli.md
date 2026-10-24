@@ -440,8 +440,9 @@ minireg info --ecosystem docker alpine:3.20
 minireg info --ecosystem docker redis:7.4-alpine --platform linux/arm64
 ```
 
-`info` shows versions, known CVEs per version, and which upstreams carry the
-package with links to their pages. Without `--ecosystem` it looks in npm first,
+`info` shows versions, the versions blocked by policy with the reason (the
+usual cause of npm `ETARGET` or pip "could not find a version"), known CVEs
+per version, and which upstreams carry the package with links to their pages. Without `--ecosystem` it looks in npm first,
 then PyPI, then cargo, and says where it found the package. For an image it shows the platforms, size,
 scan status, findings by severity (known-exploited first), the pull verdict
 and recent tags — the same report as `audit --image`, without the exit code.

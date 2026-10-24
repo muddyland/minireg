@@ -1520,3 +1520,35 @@ class TestInfoLooksInEveryEcosystem:
         with pytest.raises(SystemExit):
             cli.cmd_info(args)
         assert "not found in npm, pypi or cargo" in capsys.readouterr().err
+
+
+class TestInfoShowsBlockedVersions:
+    """A pinned version that npm calls ETARGET is usually blocked by policy;
+    `minireg info` is where the docs send people to find out."""
+
+    def test_lists_blocked_versions_with_reasons(self, tmp_path, monkeypatch, capsys):
+        _cli_env(tmp_path, monkeypatch, "tok")
+        monkeypatch.setattr(
+            cli,
+            "api",
+            lambda *_a, **_k: {
+                "name": "widget",
+                "ecosystem": "npm",
+                "blocked": False,
+                "versions": [
+                    {"version": "1.0.2", "blocked": False, "cves": []},
+                    {
+                        "version": "1.0.1",
+                        "blocked": True,
+                        "block_reason": "blocked by CVE policy: highest CVSS 9.8",
+                        "cves": [],
+                    },
+                ],
+            },
+        )
+        args = cli.build_parser().parse_args(["info", "widget", "--ecosystem", "npm"])
+        assert cli.cmd_info(args) == 0
+        out = capsys.readouterr().out
+        assert "Blocked versions" in out
+        assert "1.0.1" in out and "highest CVSS 9.8" in out
+        assert "1.0.2" not in out.split("Blocked versions", 1)[1]
