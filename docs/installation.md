@@ -68,6 +68,11 @@ docker compose exec minireg python -c "import os; os.remove('/data/initial-admin
 
 Open the `PUBLIC_URL` you configured and sign in.
 
+Running the backend from a checkout with `uvicorn` instead of the image? The
+web UI is served from `backend/app/static`, which is gitignored and only built
+by the Dockerfile, so rebuild it first (`cd frontend && npm ci && npm run
+build`) or you get a stale or missing UI. See the README's Development section.
+
 ---
 
 ## The one setting that must be right

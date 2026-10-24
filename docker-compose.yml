@@ -128,6 +128,8 @@ services:
       # -- secrets ---------------------------------------------------------
       SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
       CREDENTIAL_KEY: ${CREDENTIAL_KEY:-}
+      # Bearer token Prometheus presents to /metrics. Empty = admins only.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
 
       # -- backing services -------------------------------------------------
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-minireg}:${POSTGRES_PASSWORD:-minireg}@postgres:5432/${POSTGRES_DB:-minireg}
@@ -139,6 +141,8 @@ services:
       BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@localhost}
+      # Lifetime of tokens minted by `minireg login`. 0 = no expiry.
+      CLI_TOKEN_TTL_DAYS: ${CLI_TOKEN_TTL_DAYS:-90}
 
       # -- OIDC ---------------------------------------------------------------
       OIDC_ENABLED: ${OIDC_ENABLED:-false}
@@ -161,6 +165,13 @@ services:
       META_CACHE_TTL: ${META_CACHE_TTL:-60}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
       UPSTREAM_TIER_PARALLEL: ${UPSTREAM_TIER_PARALLEL:-true}
+      UPSTREAM_MAX_KEEPALIVE: ${UPSTREAM_MAX_KEEPALIVE:-40}
+      # Whole-download deadline for one upstream artifact.
+      ARTIFACT_DOWNLOAD_TIMEOUT_SECONDS: ${ARTIFACT_DOWNLOAD_TIMEOUT_SECONDS:-900}
+      # Publishes are refused if upstreams cannot confirm the name is free in time.
+      PUBLISH_SHADOW_CHECK_TIMEOUT_SECONDS: ${PUBLISH_SHADOW_CHECK_TIMEOUT_SECONDS:-10}
+      # Postgres terminates a transaction left idle this long.
+      DB_IDLE_TRANSACTION_TIMEOUT_SECONDS: ${DB_IDLE_TRANSACTION_TIMEOUT_SECONDS:-60}
 
       # -- rate limits (per minute; see docs/configuration.md) ---------------
       # Anonymous traffic is limited per client IP, so a CI fleet behind one
@@ -179,6 +190,7 @@ services:
       OSV_CVE_ONLY: ${OSV_CVE_ONLY:-false}
       OSV_HYDRATE_CONCURRENCY: ${OSV_HYDRATE_CONCURRENCY:-8}
       OSV_HOUSEKEEPING_BUDGET_SECONDS: ${OSV_HOUSEKEEPING_BUDGET_SECONDS:-600}
+      OSV_TIMEOUT_SECONDS: ${OSV_TIMEOUT_SECONDS:-30}
 
       # -- upstream trust -----------------------------------------------------
       # Artifact URLs come out of upstream metadata, so fetches are restricted
@@ -197,6 +209,13 @@ services:
       DOCKER_INTERNAL_URL: ${DOCKER_INTERNAL_URL:-http://minireg:8000}
       DOCKER_TAG_TTL_SECONDS: ${DOCKER_TAG_TTL_SECONDS:-600}
       DOCKER_STORAGE_BUDGET_BYTES: ${DOCKER_STORAGE_BUDGET_BYTES:-214748364800}
+      DOCKER_MAX_INDEX_ENTRIES: ${DOCKER_MAX_INDEX_ENTRIES:-256}
+      DOCKER_BLOB_DOWNLOAD_TIMEOUT_SECONDS: ${DOCKER_BLOB_DOWNLOAD_TIMEOUT_SECONDS:-3600}
+      DOCKER_MAX_REDIRECTS: ${DOCKER_MAX_REDIRECTS:-3}
+      DOCKER_RATELIMIT_WARN_REMAINING: ${DOCKER_RATELIMIT_WARN_REMAINING:-20}
+      # Empty = fetch the Trivy DB through this registry's own ghcr upstream.
+      DOCKER_TRIVY_DB_REPOSITORY: ${DOCKER_TRIVY_DB_REPOSITORY:-}
+      KEV_FEED_URL: ${KEV_FEED_URL:-https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json}
 
       # -- limits -------------------------------------------------------------
       MAX_PUBLISH_BYTES: ${MAX_PUBLISH_BYTES:-268435456}

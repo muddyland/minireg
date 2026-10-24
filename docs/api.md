@@ -106,6 +106,43 @@ There is no publish, yank or owners surface. See
 
 ---
 
+## Container registry (OCI)
+
+Mounted at `/v2`. Implements the OCI distribution spec 1.1, so `docker`,
+Podman, containerd, crane and skopeo work unmodified. Image names contain
+slashes, so one catch-all route dispatches on the path suffix. Every response
+carries `Docker-Distribution-API-Version: registry/2.0`, and every error is an
+OCI error body (`{"errors": [{"code": "DENIED", "message": …}]}`). The whole
+surface answers 404 `UNSUPPORTED` when `DOCKER_ENABLED=false`.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/v2/` | Version check. Always challenges an anonymous client, so `docker push` knows to log in |
+| `GET` `POST` | `/v2/token` | Docker token endpoint (GET) and OAuth2 password grant (POST, what `docker login` sends). Exchanges an API token for a short-lived registry bearer token |
+| `GET` | `/v2/_catalog` | Repository list. `n`, `last`; paginates with a `Link` header. Requires a login |
+| `GET` `HEAD` | `/v2/{name}/manifests/{reference}` | Manifest or index by tag or digest. Pull policy is enforced here: a refused image is `DENIED` with the reason |
+| `PUT` | `/v2/{name}/manifests/{reference}` | Push a manifest (local namespace only) |
+| `DELETE` | `/v2/{name}/manifests/{digest}` | Delete a pushed manifest |
+| `GET` `HEAD` | `/v2/{name}/blobs/{digest}` | Layer or config blob. Fetched from the upstream and verified on first request |
+| `DELETE` | `/v2/{name}/blobs/{digest}` | Unlink a blob from a pushed repository |
+| `POST` | `/v2/{name}/blobs/uploads/` | Start an upload; supports monolithic (`?digest=`) and cross-repository mount (`?mount=&from=`) |
+| `GET` `PATCH` `PUT` `DELETE` | `/v2/{name}/blobs/uploads/{uuid}` | Upload status, append a chunk, complete (`?digest=`), cancel |
+| `GET` | `/v2/{name}/tags/list` | Tags. `n`, `last`; paginates with a `Link` header |
+| `GET` | `/v2/{name}/referrers/{digest}` | OCI referrers (signatures, SBOMs, attestations). `artifactType` filters |
+
+Authentication is the Docker token flow: the client sends Basic credentials
+(any username, an **API token** as the password) to `/v2/token` and gets a
+bearer token valid for `DOCKER_TOKEN_TTL_SECONDS`. Pulls need the `read`
+scope, or nothing when `ALLOW_ANONYMOUS_READ=true`. Pushes need the
+`docker:push` scope on an account allowed to publish, and are accepted only
+under `DOCKER_LOCAL_NAMESPACE/` (default `local/`); any write to a cached
+upstream repository is `DENIED`. On `DOCKER_MIRROR_HOSTNAME`, every name is a
+Docker Hub name and the surface is read-only.
+
+See [Container images](containers.md) for naming, the mirror, and policy.
+
+---
+
 ## Web API
 
 ### Auth
@@ -200,6 +237,46 @@ Response:
 Records describing the same CVE are collapsed: the highest score wins, but the
 *lowest* fixed version is kept, because that is the smallest upgrade that
 resolves it.
+
+### Container images
+
+Read endpoints require a signed-in user; the rest require an admin unless
+noted. Repositories are addressed by a `name` query parameter, because image
+names contain slashes.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/api/docker/images` | user | List repositories. `q`, `scope` (`local`, `cached`, `quarantined`, `watched`), `limit`, `offset` |
+| `GET` | `/api/docker/repository` | user | One repository: tags, digests, scan status. `name` |
+| `GET` | `/api/docker/inspect` | user | Resolve a reference the way `docker pull` would and report its findings and whether a pull would be allowed. `ref`, `platform` (default `linux/amd64`), `findings`. Used by `minireg audit --image` and `minireg info --ecosystem docker` |
+| `GET` | `/api/docker/manifest/{digest}` | user | Manifest detail: layers, platforms, repositories that reference it, latest scan |
+| `GET` | `/api/docker/manifest/{digest}/findings` | user | Trivy findings. `severity` (comma-separated), `fixable`, `kev`, `q`, `limit`, `offset` |
+| `GET` | `/api/docker/manifest/{digest}/config` | user | Entrypoint, env, labels, ports and build history, each layer paired with its step |
+| `GET` | `/api/docker/manifest/{digest}/packages` | user | The SBOM as a package list |
+| `GET` | `/api/docker/manifest/{digest}/sbom` | user | The raw CycloneDX SBOM, as a download |
+| `GET` | `/api/docker/vulnerabilities` | user | Which images contain a CVE (or package, or severity). `cve`, `package`, `severity`, `kev`, `limit` |
+| `GET` | `/api/docker/client-config` | user | Copy-pasteable `docker login`, pull and mirror configuration |
+| `PATCH` | `/api/docker/repository` | admin | Pin, quarantine (with a reason) or watch tags. `name` |
+| `POST` | `/api/docker/repository/refresh` | admin | Revalidate one watched tag now. `name` |
+| `DELETE` | `/api/docker/repository` | admin | Forget a cached repository; files go at the next GC. Pushed repositories are refused (delete them through `/v2`). `name` |
+| `POST` | `/api/docker/manifest/{digest}/rescan` | admin | Queue a rescan. `full=true` re-pulls the layers instead of rescanning the stored SBOM |
+| `GET` `PUT` | `/api/docker/policy` | admin | Read or replace the image policy |
+| `GET` | `/api/docker/stats` | admin | Disk use against the budget, pulls in the last 24 hours, scan queue, counts of KEV, critical and push-blocked images, upstream rate-limit headroom, when each scanner was last seen |
+| `GET` | `/api/docker/presets` | admin | Well-known registries (Docker Hub, ghcr, Quay, …) and whether each is configured |
+| `POST` | `/api/docker/presets/{name}` | admin | Add a well-known registry as an upstream |
+| `POST` | `/api/docker/upstreams/{id}/index` | admin | List a GitLab container registry's repositories into search |
+
+The scanner worker uses its own routes, which accept **only** a token with
+exactly the `scanner` scope (an admin token is refused):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/docker/scanner/claim` | Claim the next scan job; `204` when there is none or scanning is off |
+| `POST` | `/api/docker/scanner/jobs/{id}/heartbeat` | Extend the job's lease while Trivy runs. `worker` |
+| `GET` | `/api/docker/scanner/jobs/{id}/sbom` | The stored SBOM, for an SBOM-only rescan |
+| `POST` | `/api/docker/scanner/jobs/{id}/result` | Upload the Trivy report (and SBOM) as multipart form data |
+| `POST` | `/api/docker/scanner/jobs/{id}/fail` | Report a failure; `permanent` skips the image instead of retrying |
+| `GET` | `/api/docker/scanner/config` | Where to fetch the Trivy database from (through the `ghcr` upstream when one exists) |
 
 ### Admin
 
