@@ -164,16 +164,18 @@ _relay_state: dict[str, object] = {}
 def check_trusted_proxy_config() -> str | None:
     """Startup check: does TRUSTED_PROXY_IPS trust our own gateway?
 
-    Returns the gateway address when it does (after logging a warning), so
-    the operator is told once per start that the setting is only safe while
-    the published port is not reachable by clients directly. See
-    :func:`_warn_if_relayed_direct` for the stronger, traffic-based signal.
+    Returns the gateway address when it does. Logged at INFO, not WARNING:
+    the shipped layout (proxy on the host, port bound to loopback) trusts the
+    gateway too and is safe, and a warning that fires on every correct
+    deployment teaches operators to ignore it. The traffic-based check in
+    :func:`_warn_if_relayed_direct` is the one that warns, because it only
+    fires when a client really is reaching the port directly.
     """
     gateway = _default_gateway()
     _relay_state["gateway"] = gateway
     if not gateway or not _is_trusted_proxy(gateway):
         return None
-    log.warning(
+    log.info(
         "TRUSTED_PROXY_IPS trusts %s, this container's gateway. Docker's port "
         "relay connects from that address, so X-Forwarded-For is believed from "
         "anything that reaches the published port. That is safe only while the "

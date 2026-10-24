@@ -403,13 +403,16 @@ class TestTrustedProxyWarning:
         assert _default_gateway(str(table)) == "172.18.0.1"
         assert _default_gateway(str(tmp_path / "missing")) is None
 
-    def test_startup_warns_when_the_gateway_is_trusted(self, monkeypatch, caplog):
+    def test_startup_notes_a_trusted_gateway_without_warning(self, monkeypatch, caplog):
+        # The safe default layout trusts the gateway too, so this is INFO;
+        # only the traffic-based check below may warn.
         from app.core import deps
 
         monkeypatch.setattr(deps, "_default_gateway", lambda: "172.18.0.1")
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             assert deps.check_trusted_proxy_config() == "172.18.0.1"
         assert "BIND_ADDRESS" in caplog.text
+        assert all(r.levelno < logging.WARNING for r in caplog.records)
 
     def test_startup_is_quiet_when_it_is_not(self, monkeypatch, caplog):
         from app.core import deps
