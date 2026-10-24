@@ -6,15 +6,17 @@
  * no access to the repository it was built from, so the docs travel inside
  * the image and are served from /api/help.
  *
- * The markdown is our own, baked in at build time and not editable by anyone
- * at runtime, so it is rendered as trusted content. If that ever stops being
- * true — user-supplied pages, an editable knowledge base — this needs a
- * sanitiser before the `v-html` below.
+ * The markdown is our own and baked in at build time, but the rendered HTML
+ * still goes through DOMPurify before the `v-html` below: docs are edited by
+ * people who are not thinking about XSS, raw HTML in markdown passes straight
+ * through marked, and the cost of sanitising a few pages is nothing.
  */
 import { computed, nextTick, ref, watch } from 'vue'
+import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { useRoute, useRouter } from 'vue-router'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 
 const route = useRoute()
 const router = useRouter()
@@ -25,6 +27,13 @@ const loading = ref(true)
 const error = ref(null)
 
 const slug = computed(() => route.params.slug || pages.value[0]?.slug || null)
+
+const escapeAttr = (value) =>
+  String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
 
 function slugify(text) {
   return String(text)
@@ -55,20 +64,26 @@ const renderer = {
     } else if (/^https?:\/\//i.test(target)) {
       attrs = ' target="_blank" rel="noopener noreferrer"'
     }
-    const titleAttr = title ? ` title="${title}"` : ''
-    return `<a href="${target}"${titleAttr}${attrs}>${text}</a>`
+    // marked hands a custom renderer the raw title and href; a quote in
+    // either would otherwise end the attribute.
+    const titleAttr = title ? ` title="${escapeAttr(title)}"` : ''
+    return `<a href="${escapeAttr(target)}"${titleAttr}${attrs}>${text}</a>`
   },
 }
 
 marked.use({ renderer, gfm: true, breaks: false })
 
-const rendered = computed(() => (page.value ? marked.parse(page.value.markdown) : ''))
+const rendered = computed(() =>
+  page.value
+    ? DOMPurify.sanitize(marked.parse(page.value.markdown), { ADD_ATTR: ['target'] })
+    : '',
+)
 
 async function loadIndex() {
   try {
     pages.value = (await api.helpPages()).pages || []
   } catch (err) {
-    error.value = err.detail || 'Could not load the documentation index.'
+    error.value = errorMessage(err, 'Could not load the documentation index.')
   }
 }
 
@@ -80,7 +95,7 @@ async function loadPage(target) {
     page.value = await api.helpPage(target)
   } catch (err) {
     page.value = null
-    error.value = err.detail || 'That page is not available.'
+    error.value = errorMessage(err, 'That page is not available.')
   } finally {
     loading.value = false
   }
@@ -133,7 +148,7 @@ watch(() => route.hash, scrollToHash)
     </div>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
   <div class="help-layout">
     <nav class="help-index card">

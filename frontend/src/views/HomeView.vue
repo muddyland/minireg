@@ -295,7 +295,10 @@ onMounted(async () => {
             missing. Blocked versions are removed from the metadata.
           </p>
           <p style="margin-bottom: 0">
-            Search for the package to see which versions are allowed and why, then upgrade. See
+            Open the package from <router-link :to="{ name: 'search' }">Search</router-link>: each
+            blocked version is marked with the reason, so you can pick one to upgrade to. Or run
+            <code>minireg info &lt;package&gt;</code>. A package blocked outright is not listed in
+            search; the install error names the reason. See
             <router-link :to="{ name: 'help-page', params: { slug: 'troubleshooting' } }">Troubleshooting</router-link>.
           </p>
         </div>

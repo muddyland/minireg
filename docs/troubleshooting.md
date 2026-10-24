@@ -37,6 +37,39 @@ Test a package against the policy** — it names the rule.
 If it is the CVE policy, **Vulnerabilities** shows which CVE pushed the version
 into the blocked range.
 
+### `ETARGET`, "No matching version found", "Could not find a version"
+
+```
+npm error code ETARGET
+npm error notarget No matching version found for lodash@4.17.20.
+ERROR: Could not find a version that satisfies the requirement requests==2.19.0
+error: failed to select a version for the requirement `time = "=0.3.20"`
+```
+
+The version almost always exists upstream: it is **blocked by policy** — a
+CVE score in the blocked range, a version-range block rule, or allowlist mode
+— and blocked versions are left out of the metadata the registry serves (cargo
+sees them as yanked). The client therefore reports "no such version" rather
+than a `403`. Pins and lockfiles written against public npm or PyPI hit this
+first.
+
+To see which versions are blocked and why:
+
+- **The package page in the web UI** (**Search**, then the package) marks
+  every blocked version with a **blocked** badge and the reason.
+- **`minireg info <package>`** lists the blocked versions with their reasons
+  and the versions that carry CVEs (it looks in npm, PyPI and cargo unless
+  you pass `--ecosystem`), and `minireg audit` checks a whole lockfile
+  against the policy.
+
+Then upgrade to an allowed version, or ask an admin for a rule change or a
+risk acceptance.
+
+A package blocked outright by name does not appear in **Search** for
+non-admins (see [Browsing](usage.md#browsing)). Installing it fails with a
+`403` whose message names the reason, and `minireg info <name>` or opening
+`/packages/<ecosystem>/<name>` in the web UI shows it as well.
+
 ### `401` on install
 
 - `ALLOW_ANONYMOUS_READ=false` and the client sent no token.
@@ -296,7 +329,7 @@ The blob store is content-addressed and every download is verified against the
 digest the upstream advertised, so corruption is caught rather than served. If
 a file is missing, purge it and let it re-download:
 
-**Packages → Purge cache** for that package.
+**Manage packages → Purge cache** for that package.
 
 ### Reset everything except data
 

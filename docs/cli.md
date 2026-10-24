@@ -6,8 +6,8 @@ CVE data this registry already holds.
 
 It is deliberately one Python file with no third-party imports: it is fetched
 from the registry it talks to, and requiring a virtualenv before you can point
-npm at your own mirror would defeat the purpose. Python 3.9+ is the only
-requirement.
+npm at your own mirror would defeat the purpose. Python 3.9 or newer is the
+only requirement.
 
 ---
 
@@ -231,11 +231,24 @@ Two things distinguish this from `npm audit` / `pip-audit`:
 | `poetry.lock` | PyPI |
 | `uv.lock` | PyPI |
 | `Pipfile.lock` | PyPI |
+| `requirements.lock`, `requirements-lock.txt` | PyPI (pip-compile output kept beside a ranged `requirements.txt`) |
 | `requirements.txt` | PyPI (pinned `==` entries only) |
+| `requirements*.txt` — `requirements-dev.txt`, `requirements-test.txt`, … | PyPI (pinned `==` entries only) |
 | `Cargo.lock` | cargo (crates.io entries only) |
 
 Every lockfile found in the directory is audited, so a project with npm, Python
-and Rust dependencies is covered in one run.
+and Rust dependencies is covered in one run. Each `requirements*.txt` is
+reported on its own: a CVE in a test-only dependency still runs in CI.
+
+`-r other.txt` (or `--requirement other.txt`) includes are followed when the
+file sits in the same directory. An included file that is itself audited — the
+`-r requirements.txt` at the top of most `requirements-dev.txt` files — is not
+counted again; the audit notes the include and moves on. Any other included
+file (`common.txt`, say) is counted under the first file that includes it.
+Includes outside the directory are not followed, and the audit says so.
+
+Passing a single file — `minireg audit requirements-dev.txt` — audits it with
+every include merged in.
 
 `Cargo.lock` also lists the workspace's own crates and any `git` or `path`
 dependencies. Those are not on crates.io, so they are skipped — asking the
@@ -263,7 +276,7 @@ minireg audit --fail-on high
 | Exit | Meaning |
 |---|---|
 | `0` | Nothing at or above the threshold, and everything was checked |
-| `1` | The audit could not run (not logged in, registry unreachable) |
+| `1` | The audit could not run (not logged in, token expired or revoked, registry unreachable) |
 | `2` | A finding at or above the threshold, or a blocked dependency |
 | `3` | Something could not be checked at all |
 
@@ -421,13 +434,16 @@ minireg search express                                # packages and images
 minireg search requests --ecosystem pypi --limit 10   # or: npm, cargo, docker
 
 minireg info lodash
+minireg info requests                  # not on npm here? tries pypi, then cargo
 minireg info requests --ecosystem pypi
 minireg info --ecosystem docker alpine:3.20
 minireg info --ecosystem docker redis:7.4-alpine --platform linux/arm64
 ```
 
-`info` shows versions, known CVEs per version, and which upstreams carry the
-package with links to their pages. For an image it shows the platforms, size,
+`info` shows versions, the versions blocked by policy with the reason (the
+usual cause of npm `ETARGET` or pip "could not find a version"), known CVEs
+per version, and which upstreams carry the package with links to their pages. Without `--ecosystem` it looks in npm first,
+then PyPI, then cargo, and says where it found the package. For an image it shows the platforms, size,
 scan status, findings by severity (known-exploited first), the pull verdict
 and recent tags — the same report as `audit --image`, without the exit code.
 
@@ -529,7 +545,7 @@ a side effect of traffic it was making anyway and says one line when it has
 fallen behind:
 
 ```
-  note: this registry ships CLI 1.3.0, you have 1.2.0 — run 'minireg update'
+  note: this registry ships CLI 1.4.0, you have 1.3.0 — run 'minireg update'
 ```
 
 That costs no extra request, and it goes to stderr — piping `--json` output

@@ -9,6 +9,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import {
   formatBytes,
   formatDateTime,
@@ -78,7 +79,7 @@ async function load() {
     entries.value = data.entries
     total.value = data.total
   } catch (err) {
-    error.value = err.detail || 'Could not load the request log.'
+    error.value = errorMessage(err, 'Could not load the request log.')
   } finally {
     loading.value = false
   }
@@ -159,12 +160,12 @@ onBeforeUnmount(stopStream)
     </label>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
   <div class="card mb">
     <div class="card-body">
       <div class="row">
-        <select v-model="filters.ecosystem" style="width: auto" @change="applyFilters">
+        <select v-model="filters.ecosystem" style="width: auto" aria-label="Ecosystem" @change="applyFilters">
           <option value="">All ecosystems</option>
           <option value="npm">npm</option>
           <option value="pypi">PyPI</option>
@@ -173,6 +174,7 @@ onBeforeUnmount(stopStream)
         <select
           v-model.number="filters.days"
           style="width: auto"
+          aria-label="Time window"
           :disabled="live"
           :title="live ? 'The window applies to the history below, not the live tail' : ''"
           @change="applyFilters"
@@ -185,12 +187,14 @@ onBeforeUnmount(stopStream)
         <input
           v-model="filters.package_name"
           placeholder="Package name…"
+          aria-label="Package name"
           style="flex: 1; min-width: 160px"
           @keyup.enter="applyFilters"
         />
         <input
           v-model="filters.username"
           placeholder="Username…"
+          aria-label="Username"
           style="width: 150px"
           @keyup.enter="applyFilters"
         />

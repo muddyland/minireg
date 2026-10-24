@@ -1,6 +1,7 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import { formatBytes, formatDate, formatNumber, severityClass } from '@/utils/format'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
@@ -9,6 +10,10 @@ const total = ref(0)
 const loading = ref(true)
 const error = ref(null)
 const detail = ref(null)
+const detailError = ref(null)
+// Package id with a request in flight, so its buttons cannot be double-fired.
+const opening = ref(null)
+const busy = ref(null)
 
 const filters = ref({ ecosystem: '', search: '', local_only: false })
 const page = ref(0)
@@ -27,19 +32,43 @@ async function load() {
     packages.value = data.packages
     total.value = data.total
   } catch (err) {
-    error.value = err.detail || 'Could not load packages.'
+    error.value = errorMessage(err, 'Could not load packages.')
   } finally {
     loading.value = false
   }
 }
 
+function reload() {
+  page.value = 0
+  error.value = null
+  load()
+}
+
 async function openDetail(pkg) {
-  detail.value = await api.adminPackageDetail(pkg.id)
+  error.value = null
+  detailError.value = null
+  opening.value = pkg.id
+  try {
+    detail.value = await api.adminPackageDetail(pkg.id)
+  } catch (err) {
+    error.value = errorMessage(err, `Could not load "${pkg.name}".`)
+  } finally {
+    opening.value = null
+  }
 }
 
 async function purge(pkg) {
   if (!confirm(`Drop cached files for "${pkg.name}"? Metadata is kept and files re-download on demand.`)) return
-  await api.deletePackage(pkg.id, true)
+  error.value = null
+  busy.value = pkg.id
+  try {
+    await api.deletePackage(pkg.id, true)
+  } catch (err) {
+    error.value = errorMessage(err, `Could not purge the cache for "${pkg.name}".`)
+    return
+  } finally {
+    busy.value = null
+  }
   await load()
 }
 
@@ -48,7 +77,22 @@ async function remove(pkg) {
     ? `"${pkg.name}" was published here. Deleting it is PERMANENT — the artifacts cannot be recovered from an upstream. Continue?`
     : `Delete "${pkg.name}" entirely? It will be re-fetched from upstream on the next request.`
   if (!confirm(warning)) return
-  await api.deletePackage(pkg.id, false)
+  // Report into the dialog when the delete came from it, so the failure is
+  // not hidden behind the modal.
+  const fromDialog = detail.value?.package?.id === pkg.id
+  error.value = null
+  detailError.value = null
+  busy.value = pkg.id
+  try {
+    await api.deletePackage(pkg.id, false)
+  } catch (err) {
+    const message = errorMessage(err, `Could not delete "${pkg.name}".`)
+    if (fromDialog) detailError.value = message
+    else error.value = message
+    return
+  } finally {
+    busy.value = null
+  }
   detail.value = null
   await load()
 }
@@ -59,28 +103,35 @@ onMounted(load)
 <template>
   <div class="page-head">
     <div>
-      <h1>Packages</h1>
+      <h1>Manage packages</h1>
       <p class="page-sub">Everything this registry has indexed or cached.</p>
     </div>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
   <div class="card mb">
     <div class="card-body">
       <div class="row">
-        <select v-model="filters.ecosystem" style="width: auto" @change="((page = 0), load())">
+        <select v-model="filters.ecosystem" style="width: auto" aria-label="Ecosystem" @change="reload">
           <option value="">All ecosystems</option>
           <option value="npm">npm</option>
           <option value="pypi">PyPI</option>
           <option value="cargo">cargo</option>
         </select>
-        <input v-model="filters.search" type="search" placeholder="Name contains…" style="flex: 1" @keyup.enter="((page = 0), load())" />
+        <input
+          v-model="filters.search"
+          type="search"
+          placeholder="Name contains…"
+          aria-label="Name contains"
+          style="flex: 1"
+          @keyup.enter="reload"
+        />
         <label class="check">
-          <input v-model="filters.local_only" type="checkbox" @change="((page = 0), load())" />
+          <input v-model="filters.local_only" type="checkbox" @change="reload" />
           Published here only
         </label>
-        <button class="btn" @click="((page = 0), load())">Filter</button>
+        <button class="btn" @click="reload">Filter</button>
       </div>
     </div>
   </div>
@@ -126,9 +177,13 @@ onMounted(load)
               </td>
               <td class="faint small nowrap">{{ formatDate(pkg.first_seen_at) }}</td>
               <td class="num nowrap">
-                <button class="btn btn-sm" @click="openDetail(pkg)">Details</button>
-                <button v-if="!pkg.is_local" class="btn btn-sm" @click="purge(pkg)">Purge cache</button>
-                <button class="btn btn-sm btn-danger" @click="remove(pkg)">Delete</button>
+                <button class="btn btn-sm" :disabled="opening === pkg.id" @click="openDetail(pkg)">
+                  {{ opening === pkg.id ? 'Loading…' : 'Details' }}
+                </button>
+                <button v-if="!pkg.is_local" class="btn btn-sm" :disabled="busy === pkg.id" @click="purge(pkg)">
+                  Purge cache
+                </button>
+                <button class="btn btn-sm btn-danger" :disabled="busy === pkg.id" @click="remove(pkg)">Delete</button>
               </td>
             </tr>
           </tbody>
@@ -144,20 +199,21 @@ onMounted(load)
     </div>
   </div>
 
-  <div v-if="detail" class="modal-backdrop" @click.self="detail = null">
-    <div class="modal" style="max-width: 860px">
+  <div v-if="detail" class="modal-backdrop" @click.self="detail = null" @keydown.esc="detail = null">
+    <div class="modal" style="max-width: 860px" role="dialog" aria-modal="true" aria-labelledby="pkg-detail-title">
       <div class="modal-head">
         <div>
-          <h3 style="margin: 0">{{ detail.package.name }}</h3>
+          <h3 id="pkg-detail-title" style="margin: 0">{{ detail.package.name }}</h3>
           <div class="row-tight" style="margin-top: 0.25rem">
             <EcosystemBadge :ecosystem="detail.package.ecosystem" />
             <span v-if="detail.package.is_local" class="badge badge-accent">published here</span>
             <span class="faint small">{{ formatNumber(detail.package.download_count) }} downloads</span>
           </div>
         </div>
-        <button class="btn btn-sm btn-ghost" @click="detail = null">✕</button>
+        <button class="btn btn-sm btn-ghost" aria-label="Close" @click="detail = null">✕</button>
       </div>
       <div class="modal-body">
+        <div v-if="detailError" class="alert alert-error" role="alert">{{ detailError }}</div>
         <p v-if="detail.package.description" class="dim">{{ detail.package.description }}</p>
 
         <div v-if="detail.upstreams?.length" class="mb">
@@ -248,7 +304,9 @@ onMounted(load)
         </div>
       </div>
       <div class="modal-foot">
-        <button class="btn btn-danger" @click="remove(detail.package)">Delete package</button>
+        <button class="btn btn-danger" :disabled="busy === detail.package.id" @click="remove(detail.package)">
+          Delete package
+        </button>
         <button class="btn" @click="detail = null">Close</button>
       </div>
     </div>

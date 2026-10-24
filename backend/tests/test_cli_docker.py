@@ -113,8 +113,8 @@ def stub(monkeypatch):
 
 
 class TestVersion:
-    def test_is_1_3_0(self):
-        assert cli.__version__ == "1.3.0"
+    def test_is_1_4_0(self):
+        assert cli.__version__ == "1.4.0"
 
     def test_still_runs_on_python_3_9(self):
         """Shipped verbatim to laptops: no syntax newer than 3.9."""

@@ -30,6 +30,7 @@ affects *how the registry runs*, it lives in `.env`.
 |---|---|---|
 | `SECRET_KEY` | *required* | Signs session cookies and OIDC login state. Changing it logs everyone out. |
 | `CREDENTIAL_KEY` | derived from `SECRET_KEY` | Encrypts stored upstream credentials. Set it explicitly if you ever plan to rotate `SECRET_KEY` without re-entering every upstream credential. |
+| `METRICS_TOKEN` | empty | Bearer token Prometheus presents to `GET /metrics`. Empty means `/metrics` answers only an admin session or admin-scoped token. |
 
 Rotating `SECRET_KEY` while `CREDENTIAL_KEY` is unset makes existing upstream
 credentials undecryptable — they must be re-entered. Set both from the start.
@@ -55,6 +56,7 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 | `STORAGE_QUOTA_BYTES` | `0` | `0` disables the cap. |
 | `CACHE_ARTIFACTS` | `true` | Turning this off makes every download a passthrough fetch. |
 | `STREAM_CHUNK_SIZE` | `262144` | Read/write chunk size for artifact streaming. |
+| `ARTIFACT_DOWNLOAD_TIMEOUT_SECONDS` | `900` | Wall-clock deadline for one upstream artifact download. The upstream read timeout is per chunk, so without this a trickling upstream could hold the download (and every client waiting on it) indefinitely. |
 
 ### Access
 
@@ -64,8 +66,12 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 | `SESSION_COOKIE` | `minireg_session` | |
 | `SESSION_TTL_SECONDS` | `43200` | 12 hours. |
 | `TOKEN_PREFIX` | `mrg` | Leading segment of issued API tokens. Changing it invalidates every existing token, since lookup is by prefix. |
+| `CLI_TOKEN_TTL_DAYS` | `90` | Lifetime of a token minted by `minireg login` (the device flow). `0` means no expiry. Tokens created on the **API tokens** page set their own expiry. |
 | `BOOTSTRAP_ADMIN_USERNAME` | `admin` | Created only when the database has no users at all. |
 | `BOOTSTRAP_ADMIN_PASSWORD` | *(generated)* | Blank means one is generated and printed to the log exactly once. |
+| `BOOTSTRAP_ADMIN_EMAIL` | `admin@localhost` | Email address recorded on that bootstrap admin. |
+| `TRUSTED_PROXY_HOPS` | `1` | Reverse proxies in front of the app. The client address is read this many hops from the right of `X-Forwarded-For`. |
+| `TRUSTED_PROXY_IPS` | `127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | Peers whose forwarding headers are believed at all. A request from anywhere else is treated as coming straight from the client, header or no header. |
 
 ### Upstreams
 
@@ -74,8 +80,10 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 | `UPSTREAM_TIMEOUT_SECONDS` | `20` | Overridable per upstream in the UI. |
 | `UPSTREAM_CONNECT_TIMEOUT_SECONDS` | `5` | |
 | `UPSTREAM_MAX_CONNECTIONS` | `100` | Shared pool across all upstreams. |
+| `UPSTREAM_MAX_KEEPALIVE` | `40` | Idle keep-alive connections kept open per upstream client pool (package and container upstreams). |
 | `UPSTREAM_RETRIES` | `2` | Retries apply to 5xx/429 and transport errors, never to a 404. |
 | `UPSTREAM_TIER_PARALLEL` | `true` | Race every upstream in a tier and take the first success. Off = try them one at a time by priority (fewer upstream requests, higher latency). |
+| `PUBLISH_SHADOW_CHECK_TIMEOUT_SECONDS` | `10` | Budget for the "does an upstream already serve this name?" check on a publish. If upstreams do not answer in time the publish is **refused**, not allowed — a slow upstream must not be enough to publish a name that shadows a public package. |
 
 ### CVE scanning
 
@@ -86,6 +94,7 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 | `OSV_INLINE_SCAN` | `true` | Scan a version the first time it is served. |
 | `OSV_INLINE_TIMEOUT_SECONDS` | `4` | Budget for that inline scan. Exceeding it does **not** block the request. |
 | `OSV_BATCH_SIZE` | `200` | Versions per OSV batch query. |
+| `OSV_TIMEOUT_SECONDS` | `30` | Per-request HTTP timeout for OSV API calls that have no tighter budget of their own (background scans, advisory fetches). The inline scan uses `OSV_INLINE_TIMEOUT_SECONDS`. |
 | `OSV_REFRESH_INTERVAL_SECONDS` | `21600` | How often the background task re-scans. |
 | `OSV_HOUSEKEEPING_BUDGET_SECONDS` | `600` | Wall-clock the hourly pass spends draining the scan backlog. |
 | `OSV_HYDRATE_CONCURRENCY` | `8` | Concurrent advisory fetches per batch. |
@@ -127,6 +136,12 @@ Full guide: [Container images](containers.md).
 | `DOCKER_NEGATIVE_CACHE_TTL_SECONDS` | `60` | How long an upstream "manifest unknown" is remembered. |
 | `DOCKER_MAX_BLOB_BYTES` | `17179869184` | Largest layer fetched or pushed. |
 | `DOCKER_STORAGE_BUDGET_BYTES` | `214748364800` | Starting disk budget for cached images; adjustable on the Image policy page. `0` is unlimited. |
+| `DOCKER_MAX_INDEX_ENTRIES` | `256` | Most platform entries an image index may list; a larger index is refused as `MANIFEST_INVALID`. |
+| `DOCKER_BLOB_DOWNLOAD_TIMEOUT_SECONDS` | `3600` | Wall-clock deadline for one upstream layer download. |
+| `DOCKER_MAX_REDIRECTS` | `3` | Redirect hops followed on a layer fetch (registries hand layers off to a CDN). Each hop is checked against the upstream's allowed hosts. |
+| `DOCKER_RATELIMIT_WARN_REMAINING` | `20` | When an upstream reports this many pulls or fewer left in its rate-limit window (Docker Hub's `ratelimit-remaining`), a warning is logged. |
+| `DOCKER_TRIVY_DB_REPOSITORY` | empty | Where the scanner worker fetches the Trivy vulnerability database. Empty means through this registry's own `ghcr` upstream when one is configured, so the 1.4 GB database is not pulled from ghcr.io once per worker. |
+| `KEV_FEED_URL` | CISA's `known_exploited_vulnerabilities.json` | The CISA Known Exploited Vulnerabilities catalogue, refreshed daily, behind the image policy's **Block known-exploited** rule. Point at a mirror for an offline install. |
 
 ### Limits
 
@@ -138,6 +153,7 @@ Full guide: [Container images](containers.md).
 | `STORAGE_QUOTA_BYTES` | `0` | Stops caching new upstream artifacts above this. Publishes are exempt. `0` disables. |
 | `DB_POOL_TIMEOUT_SECONDS` | `10` | Wait for a pooled connection before failing. |
 | `DB_STATEMENT_TIMEOUT_SECONDS` | `30` | Server-side cap per query. |
+| `DB_IDLE_TRANSACTION_TIMEOUT_SECONDS` | `60` | Postgres `idle_in_transaction_session_timeout`: a transaction left open and idle this long is terminated, so an abandoned one cannot hold row locks forever. |
 
 ### Rate limits
 
@@ -182,7 +198,9 @@ to the largest lockfile times the number of jobs that can start together.
 
 ## Upstreams
 
-**Upstreams → Add upstream.**
+**Upstreams → Add upstream.** This page is for npm, PyPI and cargo. Container
+registries are configured on their own **Container registries** page; see
+[Container images](containers.md#admin-pages) for why.
 
 | Field | Meaning |
 |---|---|

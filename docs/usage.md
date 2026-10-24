@@ -221,7 +221,7 @@ applies to everyone who builds it, with no per-developer setup.
 cargo build -v 2>&1 | grep -i registry.example.com
 ```
 
-Or check the **Packages** page in the UI — crates appear there as soon as they
+Or search for the crate on the **Search** page in the UI — crates appear there as soon as they
 are resolved through the registry.
 
 ### Auditing
@@ -335,10 +335,17 @@ A package page shows:
 - **Install** — the exact command for that ecosystem
 - **Available from** — which upstreams have it, with links to their package
   pages, in tier order
-- **Versions** — publish dates, files, cache state, and known CVEs per version
+- **Versions** — publish dates, files, cache state, and known CVEs per version,
+  and for every version blocked by policy (a block rule, allowlist mode or the
+  CVE policy) a **blocked** badge with the reason. This is shown to everyone,
+  not only admins, so you can tell why an install says a version does not
+  exist and which version to move to.
 
-Non-admins never see blocked packages in search results, because advertising
-something the registry will refuse to serve is worse than not listing it.
+Non-admins never see packages blocked outright by name in search results,
+because advertising something the registry will refuse to serve is worse than
+not listing it. The package page (`/packages/<ecosystem>/<name>`) and
+`minireg info <name>` still show such a package as blocked, with the reason.
+Packages with only some versions blocked appear in search as usual.
 
 ---
 

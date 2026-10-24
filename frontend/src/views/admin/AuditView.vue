@@ -1,6 +1,7 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import { formatDateTime } from '@/utils/format'
 
 const entries = ref([])
@@ -16,6 +17,7 @@ const pageSize = 100
 
 async function loadAudit() {
   loading.value = true
+  error.value = null
   try {
     const data = await api.auditLog({
       action: filters.value.action || undefined,
@@ -28,7 +30,7 @@ async function loadAudit() {
     entries.value = data.entries
     total.value = data.total
   } catch (err) {
-    error.value = err.detail || 'Could not load the audit log.'
+    error.value = errorMessage(err, 'Could not load the audit log.')
   } finally {
     loading.value = false
   }
@@ -43,7 +45,12 @@ function actionClass(action) {
 
 onMounted(async () => {
   await loadAudit()
-  actions.value = (await api.auditActions()).actions
+  // Only the action filter's options; the log itself is already shown.
+  try {
+    actions.value = (await api.auditActions()).actions
+  } catch (err) {
+    error.value = errorMessage(err, 'Could not load the list of actions to filter by.')
+  }
 })
 </script>
 
@@ -58,23 +65,23 @@ onMounted(async () => {
     </div>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
   <div class="card mb">
     <div class="card-body">
       <div class="row">
-        <select v-model="filters.action" style="width: auto" @change="((page = 0), loadAudit())">
+        <select v-model="filters.action" style="width: auto" aria-label="Action" @change="((page = 0), loadAudit())">
           <option value="">All actions</option>
           <option v-for="item in actions" :key="item.action" :value="item.action">
             {{ item.action }} ({{ item.count }})
           </option>
         </select>
-        <select v-model="filters.success" style="width: auto" @change="loadAudit">
+        <select v-model="filters.success" style="width: auto" aria-label="Outcome" @change="loadAudit">
           <option value="">Any outcome</option>
           <option value="true">Successful</option>
           <option value="false">Failed</option>
         </select>
-        <select v-model.number="filters.days" style="width: auto" @change="loadAudit">
+        <select v-model.number="filters.days" style="width: auto" aria-label="Time window" @change="loadAudit">
           <option :value="1">Last 24 hours</option>
           <option :value="7">Last 7 days</option>
           <option :value="30">Last 30 days</option>
@@ -84,6 +91,7 @@ onMounted(async () => {
         <input
           v-model="filters.username"
           placeholder="Filter by username…"
+          aria-label="Username"
           style="flex: 1; min-width: 160px"
           @keyup.enter="loadAudit"
         />

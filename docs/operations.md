@@ -293,7 +293,7 @@ fails. Then issue a replacement.
 
 ### Remove a package entirely
 
-**Packages → Delete**. For an upstream package this only clears local state; it
+**Manage packages → Delete**. For an upstream package this only clears local state; it
 re-downloads on next request. Block it if you want it gone for good.
 
 For a locally published package, deletion is permanent.

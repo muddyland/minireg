@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
 import { relativeTime } from '@/utils/format'
+import { errorMessage } from '@/utils/errors'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const upstreams = ref([])
@@ -9,6 +10,9 @@ const loading = ref(true)
 const error = ref(null)
 const message = ref(null)
 const testing = ref(null)
+// Upstream id whose enable/delete/index call is in flight.
+const busy = ref(null)
+const saving = ref(false)
 
 const blank = () => ({
   name: '',
@@ -35,6 +39,7 @@ const blank = () => ({
 const showForm = ref(false)
 const editing = ref(null)
 const form = ref(blank())
+const formError = ref(null)
 
 const ECOSYSTEMS = ['npm', 'pypi', 'cargo']
 
@@ -82,19 +87,21 @@ async function load() {
   try {
     upstreams.value = (await api.listUpstreams()).upstreams
   } catch (err) {
-    error.value = err.detail || 'Could not load upstreams.'
+    error.value = errorMessage(err, 'Could not load upstreams.')
   } finally {
     loading.value = false
   }
 }
 
 function openCreate() {
+  formError.value = null
   editing.value = null
   form.value = blank()
   showForm.value = true
 }
 
 function openEdit(upstream) {
+  formError.value = null
   editing.value = upstream
   form.value = {
     ...blank(),
@@ -117,6 +124,7 @@ function onEcosystemChange() {
 
 async function save() {
   error.value = null
+  formError.value = null
   const payload = { ...form.value }
   if (!payload.credential) delete payload.credential
   // The form takes a comma-separated string; the API takes a list.
@@ -127,6 +135,7 @@ async function save() {
   for (const key of ['gitlab_project_id', 'gitlab_group_id', 'auth_header_name', 'web_url_template']) {
     if (!payload[key]) payload[key] = null
   }
+  saving.value = true
   try {
     if (editing.value) {
       delete payload.ecosystem
@@ -138,22 +147,29 @@ async function save() {
     showForm.value = false
     await load()
   } catch (err) {
-    error.value = err.detail || 'Could not save the upstream.'
+    // Shown inside the dialog: the page alert is hidden behind the backdrop.
+    formError.value = errorMessage(err, 'Could not save the upstream.')
+  } finally {
+    saving.value = false
   }
 }
 
 async function test(upstream) {
   testing.value = upstream.id
+  error.value = null
   message.value = null
   try {
     const result = await api.testUpstream(upstream.id)
     message.value = result.healthy
       ? `${upstream.name} is reachable.`
       : `${upstream.name} failed: ${result.error}`
+  } catch (err) {
+    error.value = errorMessage(err, `Could not test ${upstream.name}.`)
   } finally {
     testing.value = null
-    await load()
   }
+  // Refresh the health columns the test just updated; load() reports its own failure.
+  await load()
 }
 
 async function reindex(upstream) {
@@ -167,25 +183,50 @@ async function reindex(upstream) {
       'They are name-only entries; metadata is still fetched on demand. Continue?'
   if (!confirm(warning)) return
 
+  error.value = null
   message.value = null
+  busy.value = upstream.id
   try {
     const result = await api.indexUpstream(upstream.id)
     message.value = `${upstream.name}: discovered ${result.discovered} packages, added ${result.added} new.`
     await load()
   } catch (err) {
-    error.value = err.detail || 'Indexing failed.'
+    error.value = errorMessage(err, `Indexing ${upstream.name} failed.`)
+  } finally {
+    busy.value = null
   }
 }
 
 async function remove(upstream) {
   if (!confirm(`Delete upstream "${upstream.name}"? Cached packages are kept.`)) return
-  await api.deleteUpstream(upstream.id)
-  await load()
+  error.value = null
+  message.value = null
+  busy.value = upstream.id
+  try {
+    await api.deleteUpstream(upstream.id)
+    await load()
+  } catch (err) {
+    error.value = errorMessage(err, `Could not delete ${upstream.name}.`)
+  } finally {
+    busy.value = null
+  }
 }
 
 async function toggleEnabled(upstream) {
-  await api.updateUpstream(upstream.id, { enabled: !upstream.enabled })
-  await load()
+  error.value = null
+  message.value = null
+  busy.value = upstream.id
+  try {
+    await api.updateUpstream(upstream.id, { enabled: !upstream.enabled })
+    await load()
+  } catch (err) {
+    error.value = errorMessage(
+      err,
+      `Could not ${upstream.enabled ? 'disable' : 'enable'} ${upstream.name}.`,
+    )
+  } finally {
+    busy.value = null
+  }
 }
 
 onMounted(load)
@@ -203,15 +244,18 @@ onMounted(load)
     <button class="btn btn-primary" @click="openCreate">Add upstream</button>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
-  <div v-if="message" class="alert alert-info">{{ message }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
+  <div v-if="message" class="alert alert-info" role="status">{{ message }}</div>
 
   <div v-if="loading" class="empty">Loading…</div>
 
   <template v-else>
     <div class="alert alert-info small">
       Container registries (Docker Hub, GHCR, Quay…) are configured on
-      <router-link :to="{ name: 'docker-upstreams' }">Container upstreams</router-link>.
+      <router-link :to="{ name: 'docker-upstreams' }">Container registries</router-link>. They
+      are kept separate because an image upstream's name is the image path prefix, there is no
+      tier fall-through between registries, and each needs its CDN hosts listed. Container
+      vulnerability rules live on <router-link :to="{ name: 'image-policy' }">Image policy</router-link>.
     </div>
     <div v-for="eco in ECOSYSTEMS" :key="eco" class="card mb">
       <div class="card-head">
@@ -253,7 +297,13 @@ onMounted(load)
                 </td>
                 <td>
                   <span class="badge">{{ upstream.kind.replace('_', ' ') }}</span>
-                  <span v-if="upstream.has_credential" class="badge" title="Credential configured">🔒</span>
+                  <span
+                    v-if="upstream.has_credential"
+                    class="badge"
+                    role="img"
+                    title="Credential configured"
+                    aria-label="Credential configured"
+                  >🔒</span>
                 </td>
                 <td>
                   <span class="badge" :class="upstream.healthy ? 'badge-ok' : 'badge-danger'">
@@ -278,15 +328,16 @@ onMounted(load)
                     v-if="upstream.kind.startsWith('gitlab_') || upstream.kind === 'pypi'"
                     class="btn btn-sm"
                     title="Import this upstream's package list into the search index"
+                    :disabled="busy === upstream.id"
                     @click="reindex(upstream)"
                   >
                     Index
                   </button>
-                  <button class="btn btn-sm" @click="toggleEnabled(upstream)">
+                  <button class="btn btn-sm" :disabled="busy === upstream.id" @click="toggleEnabled(upstream)">
                     {{ upstream.enabled ? 'Disable' : 'Enable' }}
                   </button>
                   <button class="btn btn-sm" @click="openEdit(upstream)">Edit</button>
-                  <button class="btn btn-sm btn-danger" @click="remove(upstream)">Delete</button>
+                  <button class="btn btn-sm btn-danger" :disabled="busy === upstream.id" @click="remove(upstream)">Delete</button>
                 </td>
               </tr>
             </tbody>
@@ -300,26 +351,26 @@ onMounted(load)
     <div class="modal">
       <div class="modal-head">
         <h3>{{ editing ? `Edit ${editing.name}` : 'Add upstream' }}</h3>
-        <button class="btn btn-sm btn-ghost" @click="showForm = false">✕</button>
+        <button class="btn btn-sm btn-ghost" aria-label="Close" @click="showForm = false">✕</button>
       </div>
       <div class="modal-body">
         <div class="field">
-          <label>Name</label>
-          <input v-model="form.name" placeholder="e.g. npmjs-public" />
+          <label for="up-name">Name</label>
+          <input id="up-name" v-model="form.name" placeholder="e.g. npmjs-public" />
         </div>
 
         <div class="row" style="gap: 0.8rem">
           <div class="field" style="flex: 1">
-            <label>Ecosystem</label>
-            <select v-model="form.ecosystem" :disabled="!!editing" @change="onEcosystemChange">
+            <label for="up-ecosystem">Ecosystem</label>
+            <select id="up-ecosystem" v-model="form.ecosystem" :disabled="!!editing" @change="onEcosystemChange">
               <option value="npm">npm</option>
               <option value="pypi">PyPI</option>
               <option value="cargo">cargo</option>
             </select>
           </div>
           <div class="field" style="flex: 1">
-            <label>Type</label>
-            <select v-model="form.kind" :disabled="!!editing">
+            <label for="up-kind">Type</label>
+            <select id="up-kind" v-model="form.kind" :disabled="!!editing">
               <option v-for="option in kindOptions" :key="option.value" :value="option.value">
                 {{ option.label }}
               </option>
@@ -328,8 +379,9 @@ onMounted(load)
         </div>
 
         <div class="field">
-          <label>URL</label>
+          <label for="up-url">URL</label>
           <input
+            id="up-url"
             v-model="form.url"
             :placeholder="urlPlaceholder"
           />
@@ -345,23 +397,23 @@ onMounted(load)
 
         <div class="row" style="gap: 0.8rem">
           <div class="field" style="flex: 1">
-            <label>Tier</label>
-            <input v-model.number="form.tier" type="number" min="1" max="100" />
+            <label for="up-tier">Tier</label>
+            <input id="up-tier" v-model.number="form.tier" type="number" min="1" max="100" />
             <p class="field-hint">Lower tiers are tried first.</p>
           </div>
           <div class="field" style="flex: 1">
-            <label>Priority within tier</label>
-            <input v-model.number="form.priority" type="number" min="0" />
+            <label for="up-priority">Priority within tier</label>
+            <input id="up-priority" v-model.number="form.priority" type="number" min="0" />
           </div>
           <div class="field" style="flex: 1">
-            <label>Timeout (s)</label>
-            <input v-model.number="form.timeout_seconds" type="number" min="1" max="300" />
+            <label for="up-timeout">Timeout (s)</label>
+            <input id="up-timeout" v-model.number="form.timeout_seconds" type="number" min="1" max="300" />
           </div>
         </div>
 
         <div class="field">
-          <label>Authentication</label>
-          <select v-model="form.auth_type">
+          <label for="up-auth">Authentication</label>
+          <select id="up-auth" v-model="form.auth_type">
             <option value="none">None (public)</option>
             <option value="bearer">Bearer token</option>
             <option value="basic">Basic (user:password)</option>
@@ -371,8 +423,9 @@ onMounted(load)
         </div>
 
         <div v-if="form.auth_type !== 'none'" class="field">
-          <label>Credential</label>
+          <label for="up-credential">Credential</label>
           <input
+            id="up-credential"
             v-model="form.credential"
             type="password"
             :placeholder="editing?.has_credential ? 'unchanged — type to replace' : 'token, or user:password for basic'"
@@ -381,27 +434,28 @@ onMounted(load)
         </div>
 
         <div v-if="form.auth_type === 'token_header'" class="field">
-          <label>Header name</label>
-          <input v-model="form.auth_header_name" placeholder="PRIVATE-TOKEN" />
+          <label for="up-header">Header name</label>
+          <input id="up-header" v-model="form.auth_header_name" placeholder="PRIVATE-TOKEN" />
         </div>
 
         <template v-if="isGitlab">
           <div class="row" style="gap: 0.8rem">
             <div class="field" style="flex: 1">
-              <label>GitLab project ID</label>
-              <input v-model="form.gitlab_project_id" placeholder="e.g. 42" />
+              <label for="up-gitlab-project">GitLab project ID</label>
+              <input id="up-gitlab-project" v-model="form.gitlab_project_id" placeholder="e.g. 42" />
               <p class="field-hint">Required to publish.</p>
             </div>
             <div class="field" style="flex: 1">
-              <label>GitLab group ID</label>
-              <input v-model="form.gitlab_group_id" placeholder="optional" />
+              <label for="up-gitlab-group">GitLab group ID</label>
+              <input id="up-gitlab-group" v-model="form.gitlab_group_id" placeholder="optional" />
             </div>
           </div>
         </template>
 
         <div class="field">
-          <label>Package page URL (optional)</label>
+          <label for="up-web-url">Package page URL (optional)</label>
           <input
+            id="up-web-url"
             v-model="form.web_url_template"
             :placeholder="
               form.ecosystem === 'npm'
@@ -423,9 +477,9 @@ onMounted(load)
           Require a published digest for every artifact
         </label>
         <div class="field">
-          <label for="name-patterns">Reserved names</label>
+          <label for="up-name-patterns">Reserved names</label>
           <input
-            id="name-patterns"
+            id="up-name-patterns"
             v-model="form.name_patterns"
             type="text"
             placeholder="@corp/*, corp-*"
@@ -446,8 +500,11 @@ onMounted(load)
         </label>
       </div>
       <div class="modal-foot">
+        <span v-if="formError" class="alert alert-error small" role="alert" style="margin: 0; flex: 1">
+          {{ formError }}
+        </span>
         <button class="btn" @click="showForm = false">Cancel</button>
-        <button class="btn btn-primary" :disabled="!form.name || !form.url" @click="save">Save</button>
+        <button class="btn btn-primary" :disabled="saving || !form.name || !form.url" @click="save">Save</button>
       </div>
     </div>
   </div>

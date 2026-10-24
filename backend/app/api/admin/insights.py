@@ -23,6 +23,8 @@ from ...db import get_session, session_scope
 from ...models import (
     AuditLog,
     Blob,
+    DockerRepository,
+    DockerTag,
     DownloadLog,
     Ecosystem,
     Package,
@@ -123,17 +125,43 @@ async def stats_overview(
 
     upstreams = (await session.execute(select(Upstream))).scalars().all()
 
+    # Container images live in their own tables. Repositories discovered only
+    # by listing an upstream were never pulled, so they are not counted.
+    image_repos, image_local, image_quarantined = (
+        await session.execute(
+            select(
+                func.count(DockerRepository.id),
+                func.count(DockerRepository.id).filter(DockerRepository.is_local.is_(True)),
+                func.count(DockerRepository.id).filter(
+                    DockerRepository.quarantined.is_(True)
+                ),
+            ).where(DockerRepository.indexed_only.is_(False))
+        )
+    ).one()
+    image_tags = (await session.execute(select(func.count(DockerTag.id)))).scalar_one()
+
     return {
         "window_days": days,
         "packages": {
-            "npm": package_counts.get(Ecosystem.npm, 0),
-            "pypi": package_counts.get(Ecosystem.pypi, 0),
+            # Every package ecosystem, so a new one cannot silently drop off
+            # the dashboard again. docker never becomes a Package row.
+            **{
+                eco.value: package_counts.get(eco, 0)
+                for eco in Ecosystem
+                if eco is not Ecosystem.docker
+            },
             "total": sum(package_counts.values()),
             # Names that resolved to at least one version.
             "with_content": with_content,
             "index_only": max(0, sum(package_counts.values()) - with_content),
         },
         "versions": version_count,
+        "images": {
+            "repositories": image_repos,
+            "local": image_local,
+            "quarantined": image_quarantined,
+            "tags": image_tags,
+        },
         "files": {"total": file_count, "cached": cached_count},
         "downloads": {
             "total": downloads_total,
@@ -1052,7 +1080,14 @@ async def package_detail(
             select(Package)
             .where(Package.id == package_id)
             .options(
-                selectinload(Package.versions).selectinload(PackageVersion.files),
+                # Neither blob is rendered here. metadata_json is one upstream
+                # version document per row -- 5,600 of them for playwright --
+                # and cached_document is the whole packument (37MB for vite).
+                defer(Package.cached_document),
+                selectinload(Package.versions).options(
+                    defer(PackageVersion.metadata_json),
+                    selectinload(PackageVersion.files),
+                ),
                 selectinload(Package.dist_tags),
             )
         )

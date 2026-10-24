@@ -7,6 +7,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import { formatBytes, formatNumber, percent, relativeTime, shortDigest, trivySeverityClass } from '@/utils/format'
 
 const SEVERITY_OPTIONS = [
@@ -28,10 +29,14 @@ const budgetGb = ref(0)
 
 const cve = ref('')
 const cveResult = ref(null)
+const cveSearching = ref(false)
+const cveError = ref(null)
 const summary = ref(null)
+const loading = ref(true)
 
 async function load() {
   error.value = null
+  loading.value = true
   try {
     const [p, s, sum] = await Promise.all([
       api.dockerPolicy(),
@@ -46,7 +51,9 @@ async function load() {
     platformsText.value = p.platforms.join(', ')
     budgetGb.value = Math.round(p.effective_budget_bytes / 1024 ** 3)
   } catch (err) {
-    error.value = err.detail || 'Could not load image settings.'
+    error.value = errorMessage(err, 'Could not load image settings.')
+  } finally {
+    loading.value = false
   }
 }
 
@@ -68,18 +75,28 @@ async function save() {
     message.value = 'Image policy saved. Pushed images were re-checked against the push rules.'
     stats.value = await api.dockerStats()
   } catch (err) {
-    error.value = err.detail || 'Could not save.'
+    error.value = errorMessage(err, 'Could not save the image policy.')
   } finally {
     saving.value = false
   }
 }
 
 async function searchCve() {
-  if (!cve.value.trim()) {
+  cveError.value = null
+  const query = cve.value.trim()
+  if (!query) {
     cveResult.value = null
     return
   }
-  cveResult.value = await api.dockerVulnerabilities({ cve: cve.value.trim() })
+  cveSearching.value = true
+  try {
+    cveResult.value = { ...(await api.dockerVulnerabilities({ cve: query })), query }
+  } catch (err) {
+    cveResult.value = null
+    cveError.value = errorMessage(err, `Could not search for ${query}.`)
+  } finally {
+    cveSearching.value = false
+  }
 }
 
 const storagePct = computed(() =>
@@ -104,12 +121,20 @@ onMounted(load)
         are allowed by default and blocked only by the rules below; images pushed here are held
         to a stricter bar before anyone can run them.
       </p>
+      <p class="page-sub">
+        Images have their own policy, separate from
+        <router-link :to="{ name: 'policy' }">Package policy</router-link>: a CVSS threshold like the
+        package one would block nearly every base image, which ship hundreds of OS-package findings.
+        So image policy works on denied CVEs, known-exploited (KEV) findings, quarantine and a stricter
+        bar for pushes. Package rules never apply to images, and these rules never apply to packages.
+      </p>
     </div>
     <router-link class="btn" :to="{ name: 'help-page', params: { slug: 'containers' } }">Documentation</router-link>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
-  <div v-if="message" class="alert alert-ok">{{ message }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
+  <div v-if="message" class="alert alert-ok" role="status">{{ message }}</div>
+  <div v-if="loading && !policy" class="empty">Loading…</div>
 
   <template v-if="policy && stats">
     <div class="grid grid-4 mb">
@@ -150,7 +175,7 @@ onMounted(load)
     <div class="card mb">
       <div class="card-head">
         <h3>Upstream rate limits</h3>
-        <router-link class="small" :to="{ name: 'docker-upstreams' }">Manage container upstreams →</router-link>
+        <router-link class="small" :to="{ name: 'docker-upstreams' }">Container registries →</router-link>
       </div>
       <div class="card-body">
         <p v-if="!ratelimits.length" class="field-hint" style="margin: 0">
@@ -182,8 +207,8 @@ onMounted(load)
         <div class="card-body">
           <label class="check"><input v-model="policy.pull.block_kev" type="checkbox" /> Block images with a CISA known-exploited vulnerability</label>
           <div class="field">
-            <label>Block at severity</label>
-            <select v-model="policy.pull.block_severity">
+            <label for="pull-severity">Block at severity</label>
+            <select id="pull-severity" v-model="policy.pull.block_severity">
               <option v-for="o in SEVERITY_OPTIONS" :key="String(o.value)" :value="o.value">{{ o.label }}</option>
             </select>
             <p class="field-hint">
@@ -199,12 +224,12 @@ onMounted(load)
           <label class="check"><input v-model="policy.hold_enabled" type="checkbox" /> Hold a first pull while the image is scanned</label>
           <div class="row" style="gap: 0.8rem">
             <div class="field" style="flex: 1">
-              <label>Hold for up to (s)</label>
-              <input v-model.number="policy.hold_seconds" type="number" min="0" max="120" />
+              <label for="hold-seconds">Hold for up to (s)</label>
+              <input id="hold-seconds" v-model.number="policy.hold_seconds" type="number" min="0" max="120" />
             </div>
             <div class="field" style="flex: 1">
-              <label>Only images up to (MB)</label>
-              <input :value="Math.round(policy.hold_max_bytes / 1024 ** 2)" type="number" min="0" @change="policy.hold_max_bytes = $event.target.value * 1024 ** 2" />
+              <label for="hold-max">Only images up to (MB)</label>
+              <input id="hold-max" :value="Math.round(policy.hold_max_bytes / 1024 ** 2)" type="number" min="0" @change="policy.hold_max_bytes = $event.target.value * 1024 ** 2" />
             </div>
           </div>
           <p class="field-hint" style="margin: 0">Larger images are served straight away and scanned in the background.</p>
@@ -216,8 +241,8 @@ onMounted(load)
         <div class="card-body">
           <label class="check"><input v-model="policy.push.block_kev" type="checkbox" /> Block images with a known-exploited vulnerability</label>
           <div class="field">
-            <label>Block at severity</label>
-            <select v-model="policy.push.block_severity">
+            <label for="push-severity">Block at severity</label>
+            <select id="push-severity" v-model="policy.push.block_severity">
               <option v-for="o in SEVERITY_OPTIONS" :key="String(o.value)" :value="o.value">{{ o.label }}</option>
             </select>
           </div>
@@ -229,12 +254,12 @@ onMounted(load)
           </p>
           <hr />
           <div class="field">
-            <label>Denied CVEs <span class="faint">(always blocked, pull or push)</span></label>
-            <textarea v-model="denyText" rows="3" placeholder="CVE-2021-44228" />
+            <label for="deny-cves">Denied CVEs <span class="faint">(always blocked, pull or push)</span></label>
+            <textarea id="deny-cves" v-model="denyText" rows="3" placeholder="CVE-2021-44228" />
           </div>
           <div class="field">
-            <label>Accepted risks <span class="faint">(never count towards a block)</span></label>
-            <textarea v-model="allowText" rows="3" placeholder="CVE-2011-3374" />
+            <label for="allow-cves">Accepted risks <span class="faint">(never count towards a block)</span></label>
+            <textarea id="allow-cves" v-model="allowText" rows="3" placeholder="CVE-2011-3374" />
           </div>
         </div>
       </div>
@@ -258,28 +283,28 @@ onMounted(load)
           <label class="check"><input v-model="policy.ignore_unfixed" type="checkbox" /> Ignore findings with no fixed version</label>
           <div class="row" style="gap: 0.8rem">
             <div class="field" style="flex: 1">
-              <label>Rescan every (hours)</label>
-              <input v-model.number="policy.rescan_hours" type="number" min="1" />
+              <label for="rescan-hours">Rescan every (hours)</label>
+              <input id="rescan-hours" v-model.number="policy.rescan_hours" type="number" min="1" />
             </div>
             <div class="field" style="flex: 1">
-              <label>…if pulled in the last (days)</label>
-              <input v-model.number="policy.rescan_recent_days" type="number" min="1" />
+              <label for="rescan-days">…if pulled in the last (days)</label>
+              <input id="rescan-days" v-model.number="policy.rescan_recent_days" type="number" min="1" />
             </div>
           </div>
           <p class="field-hint">Rescans match the stored SBOM against the current vulnerability database; the image is not pulled again.</p>
           <div class="row" style="gap: 0.8rem">
             <div class="field" style="flex: 1">
-              <label>Scan timeout (s)</label>
-              <input v-model.number="policy.scan_timeout_seconds" type="number" min="30" />
+              <label for="scan-timeout">Scan timeout (s)</label>
+              <input id="scan-timeout" v-model.number="policy.scan_timeout_seconds" type="number" min="30" />
             </div>
             <div class="field" style="flex: 1">
-              <label>Largest image scanned (GB)</label>
-              <input :value="Math.round(policy.max_scan_bytes / 1024 ** 3)" type="number" min="0" @change="policy.max_scan_bytes = $event.target.value * 1024 ** 3" />
+              <label for="scan-max">Largest image scanned (GB)</label>
+              <input id="scan-max" :value="Math.round(policy.max_scan_bytes / 1024 ** 3)" type="number" min="0" @change="policy.max_scan_bytes = $event.target.value * 1024 ** 3" />
             </div>
           </div>
           <div class="field">
-            <label>Platforms scanned</label>
-            <input v-model="platformsText" placeholder="linux/amd64, linux/arm64" />
+            <label for="scan-platforms">Platforms scanned</label>
+            <input id="scan-platforms" v-model="platformsText" placeholder="linux/amd64, linux/arm64" />
             <p class="field-hint" style="margin: 0">Other platforms of a multi-platform image are served but not scanned. Empty scans all.</p>
           </div>
         </div>
@@ -289,8 +314,8 @@ onMounted(load)
         <div class="card-head"><h3>Storage</h3></div>
         <div class="card-body">
           <div class="field">
-            <label>Disk budget for cached images (GB)</label>
-            <input v-model.number="budgetGb" type="number" min="0" />
+            <label for="budget-gb">Disk budget for cached images (GB)</label>
+            <input id="budget-gb" v-model.number="budgetGb" type="number" min="0" />
             <p class="field-hint">
               Over budget, the least recently pulled cached images are evicted until usage is back
               under 90%. Pinned repositories, watched tags and pushed images are never evicted. 0 disables
@@ -316,16 +341,28 @@ onMounted(load)
     <div class="card">
       <div class="card-head"><h3>Which images contain…</h3></div>
       <div class="card-body">
-        <div class="row mb">
-          <input v-model="cve" type="search" placeholder="CVE-2024-3094" style="flex: 1" @keyup.enter="searchCve" />
-          <button class="btn" @click="searchCve">Search</button>
-        </div>
-        <template v-if="cveResult">
+        <form class="row mb" role="search" @submit.prevent="searchCve">
+          <input
+            v-model="cve"
+            type="search"
+            placeholder="CVE-2024-3094"
+            aria-label="Vulnerability id"
+            style="flex: 1"
+          />
+          <button type="submit" class="btn" :disabled="cveSearching">
+            {{ cveSearching ? 'Searching…' : 'Search' }}
+          </button>
+        </form>
+        <div v-if="cveError" class="alert alert-error" role="alert">{{ cveError }}</div>
+        <div v-if="cveSearching" class="empty" role="status">Searching scanned images…</div>
+        <template v-else-if="cveResult">
           <div v-if="cveResult.kev_entry" class="alert alert-error small">
             {{ cveResult.kev_entry.cve_id }} is on CISA's Known Exploited Vulnerabilities list
             ({{ cveResult.kev_entry.vendor }} {{ cveResult.kev_entry.product }}, added {{ cveResult.kev_entry.date_added }}<span v-if="cveResult.kev_entry.ransomware">, used in ransomware campaigns</span>).
           </div>
-          <div v-if="!cveResult.images.length" class="empty">No scanned image contains it.</div>
+          <div v-if="!cveResult.images.length" class="empty">
+            No scanned image contains {{ cveResult.query }}. Images not yet scanned are not searched.
+          </div>
           <div v-else class="table-wrap">
             <table>
               <thead><tr><th>Image</th><th>Platform</th><th>Where</th><th>Fixed in</th></tr></thead>

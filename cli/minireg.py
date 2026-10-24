@@ -39,7 +39,19 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-__version__ = "1.3.0"
+#: The supported floor, and what the docs promise. Older interpreters that can
+#: still parse this file (3.7, 3.8) get a clear message instead of whatever
+#: half-way failure an untested code path would produce; 3.6 and earlier
+#: cannot parse `from __future__ import annotations` and fail before this line.
+MIN_PYTHON = (3, 9)
+if sys.version_info < MIN_PYTHON:
+    sys.stderr.write(
+        f"minireg needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer; "
+        f"this is {platform.python_version()}.\n"
+    )
+    raise SystemExit(1)
+
+__version__ = "1.4.0"
 
 DEFAULT_TIMEOUT = 30
 USER_AGENT = f"minireg-cli/{__version__}"
@@ -154,6 +166,24 @@ def require_token() -> str:
     if not token:
         die("not logged in. Run: minireg login")
     return token
+
+
+def die_unauthorized(token: str | None):
+    """The registry refused our credentials with a 401.
+
+    "Not logged in" is only true when no token is stored. A stored token that
+    the server rejects has expired or been revoked, and telling someone who
+    just logged in last month that they are "not logged in" sends them looking
+    for a missing config file instead of re-running login.
+    """
+    if not token:
+        die("not logged in. Run: minireg login")
+    if os.environ.get("MINIREG_TOKEN"):
+        die(
+            "the token in MINIREG_TOKEN is invalid, expired or revoked. "
+            "Create a new one in the web UI, or unset it and run: minireg login"
+        )
+    die("the stored token is invalid, expired or revoked. Run: minireg login")
 
 
 # --------------------------------------------------------------------------- #
@@ -324,7 +354,7 @@ def cmd_whoami(args):
         me = api(registry, "/api/auth/me", token=token, insecure=args.insecure)
     except ApiError as exc:
         if exc.status == 401:
-            die("stored token is not valid. Run: minireg login")
+            die_unauthorized(token)
         die(exc.detail)
 
     user = me["user"]
@@ -385,7 +415,7 @@ def cmd_configure(args):
         client = api(registry, "/api/client-config", token=token, insecure=args.insecure)
     except ApiError as exc:
         if exc.status == 401:
-            die("not logged in. Run: minireg login")
+            die_unauthorized(token)
         die(exc.detail)
 
     targets = args.target
@@ -498,7 +528,7 @@ def docker_client_config(registry: str, token, args) -> dict:
         return api(registry, "/api/docker/client-config", token=token, insecure=args.insecure)
     except ApiError as exc:
         if exc.status == 401:
-            die("not logged in. Run: minireg login")
+            die_unauthorized(token)
         if exc.status == 404:
             die("this registry does not serve container images")
         die(exc.detail)
@@ -622,7 +652,7 @@ def inspect_image(registry: str, token, ref: str, args, findings: int) -> dict:
         )
     except ApiError as exc:
         if exc.status == 401:
-            die("not logged in. Run: minireg login")
+            die_unauthorized(token)
         if exc.status == 404 and exc.detail == "Not Found":
             die("this registry cannot look up images (it is older than this CLI, or has images turned off)")
         die(f"{ref}: {exc.detail}")
@@ -829,37 +859,108 @@ _PIN_RE = re.compile(
 _NAMED_RE = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)\s*(?:\[[^\]]*\])?\s*(?P<rest>.*)$")
 
 
-def parse_requirements(path: Path) -> list[dict]:
-    """requirements.txt.
+#: Notes about how a requirements file was read -- includes followed, skipped
+#: or reported elsewhere -- printed by the audit alongside that file.
+REQUIREMENT_NOTES: dict[Path, list[str]] = {}
+
+_INCLUDE_RE = re.compile(r"^(?:-r|--requirement)(?:\s*=\s*|\s+|(?=\S))(?P<file>\S+)")
+
+
+def _is_requirements_name(name: str) -> bool:
+    """``requirements.txt``, ``requirements-dev.txt``, ``requirements_test.txt``...
+
+    Every one of them is installed by someone, so every one of them is audited:
+    a CVE in a test-only dependency still runs in CI with CI's credentials.
+    """
+    return name.startswith("requirements") and name.endswith(".txt")
+
+
+def parse_requirements(
+    path: Path,
+    standalone: set[Path] | None = None,
+    claimed: dict[Path, Path] | None = None,
+) -> list[dict]:
+    """requirements.txt, following ``-r other.txt`` includes in the same directory.
 
     Only exactly-pinned entries can be audited: a range like ``>=2.0`` has no
     single version to look up. Anything named but unpinned is recorded in
     UNPINNED so the caller can say so out loud.
+
+    An included file that is audited on its own (it is in ``standalone``) is
+    not merged in -- requirements-dev.txt nearly always starts with
+    ``-r requirements.txt``, and counting those packages under both files
+    would report every finding twice. Any other include is merged into the
+    first file that includes it; ``claimed`` (shared across one directory's
+    files) remembers which, so a ``common.txt`` included by two files is
+    counted once.
     """
-    out = []
-    unpinned = []
-    try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        return out
+    standalone = standalone or {path.resolve()}
+    claimed = {} if claimed is None else claimed
+    out: list[dict] = []
+    unpinned: list[str] = []
+    notes: list[str] = []
+    seen_pins: set[tuple[str, str]] = set()
+    visited: set[Path] = set()
 
-    for raw in lines:
-        line = raw.split("#", 1)[0].strip().rstrip("\\").strip()
-        # Options (-r, -e, --hash continuation lines) and URL requirements are
-        # not version pins.
-        if not line or line.startswith("-") or "://" in line:
-            continue
+    def read(current: Path) -> None:
+        resolved = current.resolve()
+        if resolved in visited:
+            return
+        visited.add(resolved)
+        try:
+            lines = current.read_text().splitlines()
+        except OSError:
+            if resolved != path.resolve():
+                notes.append(f"could not read included {current.name}")
+            return
 
-        pin = _PIN_RE.match(line)
-        if pin:
-            out.append({"name": pin.group("name"), "version": pin.group("version")})
-            continue
+        for raw in lines:
+            line = raw.split("#", 1)[0].strip().rstrip("\\").strip()
+            if not line:
+                continue
+            include = _INCLUDE_RE.match(line)
+            if include:
+                target = (current.parent / include.group("file")).resolve()
+                if target.parent != path.parent.resolve():
+                    notes.append(
+                        f"not following -r {include.group('file')}: only files in "
+                        "the same directory are read"
+                    )
+                elif target in standalone and target != path.resolve():
+                    if target not in visited:
+                        visited.add(target)
+                        notes.append(f"includes {target.name} (audited on its own)")
+                elif claimed.get(target, path) != path:
+                    if target not in visited:
+                        visited.add(target)
+                        notes.append(
+                            f"includes {target.name} (counted under {claimed[target].name})"
+                        )
+                else:
+                    if target != path.resolve():
+                        claimed.setdefault(target, path)
+                    read(target)
+                continue
+            # Other options (-e, -c, --hash continuation lines) and URL
+            # requirements are not version pins.
+            if line.startswith("-") or "://" in line:
+                continue
 
-        named = _NAMED_RE.match(line)
-        if named and named.group("rest").lstrip()[:1] in ("", "<", ">", "~", "!", "="):
-            unpinned.append(line)
+            pin = _PIN_RE.match(line)
+            if pin:
+                key = (pin.group("name").lower(), pin.group("version"))
+                if key not in seen_pins:
+                    seen_pins.add(key)
+                    out.append({"name": pin.group("name"), "version": pin.group("version")})
+                continue
 
+            named = _NAMED_RE.match(line)
+            if named and named.group("rest").lstrip()[:1] in ("", "<", ">", "~", "!", "="):
+                unpinned.append(line)
+
+    read(path)
     UNPINNED[path] = unpinned
+    REQUIREMENT_NOTES[path] = notes
     return out
 
 
@@ -950,10 +1051,29 @@ def discover(root: Path) -> list[tuple[Path, str, list[dict]]]:
     is indistinguishable from not supporting the format, and the caller needs to
     explain *why* it found nothing.
     """
+    known = {name for name, _e, _p in LOCKFILES}
+    # The fixed names first (requirements.txt among them), then any other
+    # requirements*.txt in a stable order.
+    extra = sorted(
+        p.name for p in root.glob("requirements*.txt")
+        if p.is_file() and p.name not in known
+    )
+    entries = [*LOCKFILES, *((name, "pypi", parse_requirements) for name in extra)]
+    standalone = {
+        (root / name).resolve()
+        for name, _e, parser in entries
+        if parser is parse_requirements and (root / name).is_file()
+    }
+    claimed: dict[Path, Path] = {}
+
     found = []
-    for filename, ecosystem, parser in LOCKFILES:
+    for filename, ecosystem, parser in entries:
         path = root / filename
-        if path.is_file():
+        if not path.is_file():
+            continue
+        if parser is parse_requirements:
+            found.append((path, ecosystem, parse_requirements(path, standalone, claimed)))
+        else:
             found.append((path, ecosystem, parser(path)))
     return found
 
@@ -999,6 +1119,8 @@ def cmd_audit(args):
     if root.is_file():
         matched = next((e for name, e, p in LOCKFILES if root.name == name), None)
         parser = next((p for name, _e, p in LOCKFILES if root.name == name), None)
+        if parser is None and _is_requirements_name(root.name):
+            matched, parser = "pypi", parse_requirements
         if parser is None:
             die(f"don't know how to read {root.name}")
         sources = [(root, matched, parser(root))]
@@ -1008,7 +1130,7 @@ def cmd_audit(args):
     if not sources:
         die(
             f"no dependency file found in {root}\n"
-            f"  looked for: {', '.join(name for name, _, _ in LOCKFILES)}"
+            f"  looked for: {', '.join(name for name, _, _ in LOCKFILES)}, requirements*.txt"
         )
 
     total_findings = []
@@ -1020,6 +1142,8 @@ def cmd_audit(args):
     for path, ecosystem, packages in sources:
         rel = path.name
         unpinned = UNPINNED.get(path, [])
+        for note in REQUIREMENT_NOTES.get(path, []):
+            info(dim(f"{rel}: {note}"))
 
         if not packages:
             # Recognised the file, got nothing auditable out of it. Say so --
@@ -1054,7 +1178,7 @@ def cmd_audit(args):
             result = audit_request(registry, token, ecosystem, packages, args)
         except ApiError as exc:
             if exc.status == 401:
-                die("not logged in. Run: minireg login")
+                die_unauthorized(token)
             die(f"audit failed: {exc.detail}")
 
         findings = result.get("findings") or []
@@ -1459,7 +1583,7 @@ def search_images(registry: str, token: str, args, strict: bool) -> tuple:
         data = api(registry, f"/api/docker/images?{query}", token=token, insecure=args.insecure)
     except ApiError as exc:
         if exc.status == 401:
-            die("not logged in. Run: minireg login")
+            die_unauthorized(token)
         if not strict:
             # An older registry, or images switched off: packages still answer.
             return [], 0
@@ -1513,7 +1637,7 @@ def cmd_search(args):
         result = api(registry, f"/api/search?{query}", token=token, insecure=args.insecure)
     except ApiError as exc:
         if exc.status == 401:
-            die("not logged in. Run: minireg login")
+            die_unauthorized(token)
         die(exc.detail)
 
     results = result.get("results") or []
@@ -1551,22 +1675,41 @@ def cmd_info(args):
         render_image(data, limit=args.limit)
         print()
         return 0
-    ecosystem = args.ecosystem or ("npm" if not args.package.startswith("py:") else "pypi")
     name = args.package
+    if args.ecosystem:
+        candidates = [args.ecosystem]
+    elif name.startswith("py:"):
+        name = name[3:]
+        candidates = ["pypi"]
+    else:
+        # No --ecosystem: npm first, as before, then the others. A Python or
+        # Rust user typing `minireg info requests` should get the package,
+        # not "not found in npm" and a guess at which flag they missed.
+        candidates = ["npm", "pypi", "cargo"]
 
-    try:
-        pkg = api(
-            registry,
-            f"/api/packages/{ecosystem}/{urllib.parse.quote(name, safe='@/')}",
-            token=token,
-            insecure=args.insecure,
-        )
-    except ApiError as exc:
-        if exc.status == 404:
-            die(f"{name} not found in {ecosystem}")
-        if exc.status == 401:
-            die("not logged in. Run: minireg login")
-        die(exc.detail)
+    pkg = None
+    for ecosystem in candidates:
+        try:
+            pkg = api(
+                registry,
+                f"/api/packages/{ecosystem}/{urllib.parse.quote(name, safe='@/')}",
+                token=token,
+                insecure=args.insecure,
+            )
+            break
+        except ApiError as exc:
+            if exc.status == 404:
+                continue
+            if exc.status == 401:
+                die_unauthorized(token)
+            die(exc.detail)
+    if pkg is None:
+        if args.ecosystem:
+            others = "|".join(e for e in ("npm", "pypi", "cargo") if e != args.ecosystem)
+            die(f"{name} not found in {args.ecosystem} (try --ecosystem {others})")
+        die(f"{name} not found in npm, pypi or cargo")
+    if len(candidates) > 1 and ecosystem != candidates[0]:
+        info(dim(f"not in {', '.join(candidates[: candidates.index(ecosystem)])}; found in {ecosystem}"))
 
     print(f"\n  {bold(pkg['name'])}  {dim(pkg['ecosystem'])}")
     if pkg.get("description"):
@@ -1591,6 +1734,19 @@ def cmd_info(args):
             if source.get("tier") is not None and source.get("kind") != "local":
                 label += f" (tier {source['tier']})"
             print(f"    {label}  {dim(location)}")
+
+    # Versions refused by policy are missing from the metadata clients see,
+    # which npm reports as ETARGET and pip as "could not find a version".
+    # A whole-package block was already printed above.
+    blocked = [] if pkg.get("blocked") else [
+        v for v in (pkg.get("versions") or []) if v.get("blocked")
+    ]
+    if blocked:
+        print(f"\n  {bold('Blocked versions')}  {dim('(not installable through this registry)')}")
+        for version in blocked[: args.limit]:
+            print(f"    {version['version']:<14} {red('blocked')}  {version.get('block_reason') or ''}")
+        if len(blocked) > args.limit:
+            print(f"    {dim(f'... and {len(blocked) - args.limit} more')}")
 
     vulnerable = [v for v in (pkg.get("versions") or []) if v.get("cves")]
     if vulnerable:
@@ -1859,7 +2015,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     info_cmd = sub.add_parser("info", help="show a package or container image")
     info_cmd.add_argument("package", help="package name, or an image reference with --ecosystem docker")
-    info_cmd.add_argument("--ecosystem", choices=["npm", "pypi", "cargo", "docker"], default="npm")
+    info_cmd.add_argument(
+        "--ecosystem",
+        choices=["npm", "pypi", "cargo", "docker"],
+        help="default: try npm, then pypi, then cargo",
+    )
     info_cmd.add_argument("--limit", type=int, default=20)
     info_cmd.add_argument(
         "--platform", default="linux/amd64", help="docker: the platform of a multi-platform image"

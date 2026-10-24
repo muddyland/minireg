@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import api from '@/api/client'
 import { formatDate } from '@/utils/format'
+import { errorMessage } from '@/utils/errors'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const rules = ref([])
@@ -69,6 +70,9 @@ const allowlistMode = ref(false)
 
 const blockRules = computed(() => rules.value.filter((r) => r.action === 'block'))
 const allowRules = computed(() => rules.value.filter((r) => r.action === 'allow'))
+// Rule id whose enable/delete is in flight, so a double click cannot race it.
+const busyRule = ref(null)
+const savingAllowlist = ref(false)
 
 async function load() {
   loading.value = true
@@ -79,7 +83,7 @@ async function load() {
     cve.value = { ...s.cve_policy }
     allowlistMode.value = s.allowlist_mode
   } catch (err) {
-    error.value = err.detail || 'Could not load policy.'
+    error.value = errorMessage(err, 'Could not load policy.')
   } finally {
     loading.value = false
   }
@@ -104,23 +108,45 @@ async function saveRule() {
     specProbe.value = ''
     await load()
   } catch (err) {
-    saveError.value = err.detail || 'Could not create the rule.'
+    saveError.value = errorMessage(err, 'Could not create the rule.')
   }
 }
 
 async function deleteRule(rule) {
   if (!confirm(`Delete the ${rule.action} rule for "${rule.pattern}"?`)) return
-  await api.deleteRule(rule.id)
-  await load()
+  error.value = null
+  message.value = null
+  busyRule.value = rule.id
+  try {
+    await api.deleteRule(rule.id)
+    await load()
+  } catch (err) {
+    error.value = errorMessage(err, `Could not delete the rule for "${rule.pattern}".`)
+  } finally {
+    busyRule.value = null
+  }
 }
 
 async function toggleRule(rule) {
-  await api.updateRule(rule.id, { enabled: !rule.enabled })
-  await load()
+  error.value = null
+  message.value = null
+  busyRule.value = rule.id
+  try {
+    await api.updateRule(rule.id, { enabled: !rule.enabled })
+    await load()
+  } catch (err) {
+    error.value = errorMessage(
+      err,
+      `Could not ${rule.enabled ? 'disable' : 'enable'} the rule for "${rule.pattern}".`,
+    )
+  } finally {
+    busyRule.value = null
+  }
 }
 
 async function runTest() {
   tester.value.result = null
+  error.value = null
   try {
     tester.value.result = await api.testRule({
       ecosystem: tester.value.ecosystem,
@@ -128,7 +154,7 @@ async function runTest() {
       version: tester.value.version || undefined,
     })
   } catch (err) {
-    error.value = err.detail || 'Test failed.'
+    error.value = errorMessage(err, 'The policy test failed.')
   }
 }
 
@@ -140,16 +166,25 @@ async function saveCve() {
     message.value = 'CVE policy saved.'
     await load()
   } catch (err) {
-    error.value = err.detail || 'Could not save the CVE policy.'
+    error.value = errorMessage(err, 'Could not save the CVE policy.')
   }
 }
 
 async function saveAllowlist() {
-  await api.updateAllowlistMode(allowlistMode.value)
-  message.value = allowlistMode.value
-    ? 'Allowlist mode is ON — only allowed packages resolve.'
-    : 'Allowlist mode is OFF.'
-  await load()
+  error.value = null
+  message.value = null
+  savingAllowlist.value = true
+  try {
+    await api.updateAllowlistMode(allowlistMode.value)
+    message.value = allowlistMode.value
+      ? 'Allowlist mode is ON — only allowed packages resolve.'
+      : 'Allowlist mode is OFF.'
+    await load()
+  } catch (err) {
+    error.value = errorMessage(err, 'Could not save allowlist mode.')
+  } finally {
+    savingAllowlist.value = false
+  }
 }
 
 onMounted(load)
@@ -163,12 +198,16 @@ onMounted(load)
         Block rules are always enforced — on metadata, on downloads, and on publish. Nothing
         overrides them.
       </p>
+      <p class="page-sub">
+        These rules cover npm, PyPI and cargo packages only. Container images are governed
+        separately on <router-link :to="{ name: 'image-policy' }">Image policy</router-link>.
+      </p>
     </div>
     <button class="btn btn-primary" @click="showRule = true">Add rule</button>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
-  <div v-if="message" class="alert alert-ok">{{ message }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
+  <div v-if="message" class="alert alert-ok" role="status">{{ message }}</div>
   <div v-if="loading" class="empty">Loading…</div>
 
   <template v-else>
@@ -194,12 +233,12 @@ onMounted(load)
 
           <div class="row" style="gap: 0.8rem">
             <div class="field" style="flex: 1">
-              <label>Block from</label>
-              <input v-model.number="cve.min_score" type="number" min="0" max="10" step="0.1" />
+              <label for="policy-cve-min">Block from</label>
+              <input id="policy-cve-min" v-model.number="cve.min_score" type="number" min="0" max="10" step="0.1" />
             </div>
             <div class="field" style="flex: 1">
-              <label>Block up to</label>
-              <input v-model.number="cve.max_score" type="number" min="0" max="10" step="0.1" />
+              <label for="policy-cve-max">Block up to</label>
+              <input id="policy-cve-max" v-model.number="cve.max_score" type="number" min="0" max="10" step="0.1" />
             </div>
           </div>
           <p class="field-hint" style="margin-top: -0.5rem">
@@ -241,22 +280,27 @@ onMounted(load)
           <div v-if="allowlistMode && !allowRules.length" class="alert alert-warn small">
             You have no allow rules. Turning this on will block every package.
           </div>
-          <button class="btn btn-primary" @click="saveAllowlist">Save</button>
+          <button class="btn btn-primary" :disabled="savingAllowlist" @click="saveAllowlist">Save</button>
 
           <hr style="border: none; border-top: 1px solid var(--border); margin: 1.1rem 0" />
 
-          <h4 class="small">Test a package against the policy</h4>
-          <div class="row" style="gap: 0.5rem; margin-bottom: 0.5rem">
-            <select v-model="tester.ecosystem" style="width: auto">
+          <h4 id="policy-test-heading" class="small">Test a package against the policy</h4>
+          <div
+            class="row"
+            role="group"
+            aria-labelledby="policy-test-heading"
+            style="gap: 0.5rem; margin-bottom: 0.5rem"
+          >
+            <select v-model="tester.ecosystem" aria-label="Ecosystem" style="width: auto">
               <option value="npm">npm</option>
               <option value="pypi">PyPI</option>
               <option value="cargo">cargo</option>
             </select>
-            <input v-model="tester.name" placeholder="package name" style="flex: 1" />
-            <input v-model="tester.version" placeholder="version" style="width: 110px" />
+            <input v-model="tester.name" aria-label="Package name" placeholder="package name" style="flex: 1" />
+            <input v-model="tester.version" aria-label="Version (optional)" placeholder="version" style="width: 110px" />
             <button class="btn" :disabled="!tester.name" @click="runTest">Test</button>
           </div>
-          <div v-if="tester.result" class="alert small" :class="tester.result.allowed ? 'alert-ok' : 'alert-error'">
+          <div v-if="tester.result" role="status" class="alert small" :class="tester.result.allowed ? 'alert-ok' : 'alert-error'">
             <strong>{{ tester.result.allowed ? 'Allowed' : 'Blocked' }}</strong>
             <template v-if="tester.result.reason"> — {{ tester.result.reason }}</template>
             <template v-if="tester.result.source"> ({{ tester.result.source }})</template>
@@ -300,10 +344,10 @@ onMounted(load)
                   {{ formatDate(rule.created_at) }}<span v-if="rule.created_by"> by {{ rule.created_by }}</span>
                 </td>
                 <td class="num nowrap">
-                  <button class="btn btn-sm" @click="toggleRule(rule)">
+                  <button class="btn btn-sm" :disabled="busyRule === rule.id" @click="toggleRule(rule)">
                     {{ rule.enabled ? 'Disable' : 'Enable' }}
                   </button>
-                  <button class="btn btn-sm btn-danger" @click="deleteRule(rule)">Delete</button>
+                  <button class="btn btn-sm btn-danger" :disabled="busyRule === rule.id" @click="deleteRule(rule)">Delete</button>
                 </td>
               </tr>
             </tbody>
@@ -333,10 +377,10 @@ onMounted(load)
                 <td class="mono small">{{ rule.version_spec || 'all' }}</td>
                 <td class="dim small">{{ rule.reason || '—' }}</td>
                 <td class="num nowrap">
-                  <button class="btn btn-sm" @click="toggleRule(rule)">
+                  <button class="btn btn-sm" :disabled="busyRule === rule.id" @click="toggleRule(rule)">
                     {{ rule.enabled ? 'Disable' : 'Enable' }}
                   </button>
-                  <button class="btn btn-sm btn-danger" @click="deleteRule(rule)">Delete</button>
+                  <button class="btn btn-sm btn-danger" :disabled="busyRule === rule.id" @click="deleteRule(rule)">Delete</button>
                 </td>
               </tr>
             </tbody>
@@ -350,35 +394,35 @@ onMounted(load)
     <div class="modal">
       <div class="modal-head">
         <h3>Add policy rule</h3>
-        <button class="btn btn-sm btn-ghost" @click="showRule = false">✕</button>
+        <button class="btn btn-sm btn-ghost" aria-label="Close" @click="showRule = false">✕</button>
       </div>
       <div class="modal-body">
         <div class="field">
-          <label>Action</label>
-          <select v-model="ruleForm.action">
+          <label for="policy-rule-action">Action</label>
+          <select id="policy-rule-action" v-model="ruleForm.action">
             <option value="block">Block — never serve this package</option>
             <option value="allow">Allow — permit in allowlist mode</option>
           </select>
         </div>
         <div class="field">
-          <label>Ecosystem</label>
-          <select v-model="ruleForm.ecosystem">
-            <option value="">Both</option>
+          <label for="policy-rule-ecosystem">Ecosystem</label>
+          <select id="policy-rule-ecosystem" v-model="ruleForm.ecosystem">
+            <option value="">All ecosystems</option>
             <option value="npm">npm only</option>
             <option value="pypi">PyPI only</option>
             <option value="cargo">cargo only</option>
           </select>
         </div>
         <div class="field">
-          <label>Name pattern</label>
-          <input v-model="ruleForm.pattern" placeholder="e.g. event-stream, or @evilcorp/*" />
+          <label for="policy-rule-pattern">Name pattern</label>
+          <input id="policy-rule-pattern" v-model="ruleForm.pattern" placeholder="e.g. event-stream, or @evilcorp/*" />
           <p class="field-hint">
             Glob against the normalized name. <code>*</code> matches any run of characters.
           </p>
         </div>
         <div class="field">
-          <label>Version range (optional)</label>
-          <input v-model="ruleForm.version_spec" :placeholder="specPlaceholder" />
+          <label for="policy-rule-spec">Version range (optional)</label>
+          <input id="policy-rule-spec" v-model="ruleForm.version_spec" :placeholder="specPlaceholder" />
           <p class="field-hint">
             Leave blank to cover every version.
             <template v-if="ruleForm.ecosystem === 'pypi'">
@@ -409,6 +453,7 @@ onMounted(load)
           <div v-if="ruleForm.version_spec" class="row-tight" style="margin-top: 0.5rem">
             <input
               v-model="specProbe"
+              aria-label="Test a version against this range"
               placeholder="test a version…"
               style="width: 160px"
               class="small"
@@ -419,12 +464,12 @@ onMounted(load)
           </div>
         </div>
         <div class="field">
-          <label>Reason</label>
-          <input v-model="ruleForm.reason" placeholder="Shown to users who are blocked" />
+          <label for="policy-rule-reason">Reason</label>
+          <input id="policy-rule-reason" v-model="ruleForm.reason" placeholder="Shown to users who are blocked" />
         </div>
       </div>
       <div class="modal-foot">
-        <span v-if="saveError" class="alert alert-error small" style="margin: 0; flex: 1">
+        <span v-if="saveError" class="alert alert-error small" role="alert" style="margin: 0; flex: 1">
           {{ saveError }}
         </span>
         <button class="btn" @click="showRule = false">Cancel</button>

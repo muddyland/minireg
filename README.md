@@ -1,13 +1,16 @@
 # minireg
 
-A caching **npm**, **PyPI** and **cargo** package registry with tiered
-upstreams, OIDC single sign-on, CVE-based blocking, an admin UI, and a CLI.
+A caching **npm**, **PyPI** and **cargo** package registry and an **OCI
+container registry**, with tiered upstreams, OIDC single sign-on, CVE-based
+blocking, an admin UI, and a CLI.
 
 The npm and PyPI APIs are implemented to spec, including publishing, so the
 real clients work unmodified: `npm install`, `npm publish`, `pip install`,
 `twine upload`, `uv`, and `poetry`. Cargo is supported as a **read-only
 mirror** — see [Spec compliance](#spec-compliance) for why publishing is not
-part of it.
+part of it. Container images are served on `/v2/` to the OCI distribution
+spec, so `docker pull`, `docker push`, Podman and containerd work too — see
+[Container images](docs/containers.md).
 
 ```bash
 cp .env.example .env     # set SECRET_KEY and PUBLIC_URL, then chmod 600 .env
@@ -53,6 +56,7 @@ documentation, matching the version actually running.
 | **[Using the registry](docs/usage.md)** | npm, pip, uv, poetry, twine, CI |
 | **[The CLI](docs/cli.md)** | Install, login, configure, audit |
 | **[Package policy](docs/policy.md)** | Block rules, version ranges, CVE thresholds |
+| **[Container images](docs/containers.md)** | Pulling, pushing, the Docker Hub mirror, Trivy scanning, image policy |
 | **[Operations](docs/operations.md)** | Monitoring, backups, scaling, tuning |
 | **[Troubleshooting](docs/troubleshooting.md)** | When something does not work |
 | **[API reference](docs/api.md)** | Every endpoint |
@@ -86,6 +90,12 @@ documentation, matching the version actually running.
   Enforced on metadata, downloads, and publishes, without exception.
 - **Audits everything.** Every login and admin action is recorded; every
   package request is logged with user, IP, size, and cache outcome.
+- **Serves container images.** An OCI distribution registry on `/v2/`: a
+  pull-through cache for Docker Hub, ghcr.io, Quay, registry.k8s.io or any
+  OCI registry (and a Docker Hub mirror for `daemon.json`), plus hosting for
+  images you push under `local/`. Every image is scanned with Trivy by the
+  separate scanner worker, which also records a CycloneDX SBOM, and the
+  image policy can refuse pulls by severity or known-exploited CVEs.
 - **Ships a CLI** that configures your package managers, audits a project's
   lockfile against the same CVE data the registry blocks with, and can rewrite
   your dependency declarations to versions that clear the findings.
@@ -199,7 +209,12 @@ python -m venv .venv
 # Frontend
 cd frontend
 npm install && npm run dev          # proxies to :8000
+npm ci && npm run build             # writes ../backend/app/static
 ```
+
+The backend serves the UI from `backend/app/static`, which is gitignored and
+built only by the Dockerfile. Run `npm run build` before starting the backend
+with `uvicorn` on its own, or it serves whatever bundle was last built there.
 
 Two directories matter. `pytest` must run from `backend/`, because
 `asyncio_mode` lives in `backend/pyproject.toml` and losing it makes every

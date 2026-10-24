@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import api from '@/api/client'
 import CodeBlock from '@/components/CodeBlock.vue'
 import { useAuthStore } from '@/stores/auth'
+import { errorMessage } from '@/utils/errors'
 import { formatDate, relativeTime } from '@/utils/format'
 
 const auth = useAuthStore()
@@ -13,6 +14,8 @@ const loading = ref(true)
 const error = ref(null)
 
 const showCreate = ref(false)
+const formError = ref(null)
+const creating = ref(false)
 const blankForm = () => ({ name: '', scopes: ['read'], expires_in_days: null, prefixes: '' })
 const form = ref(blankForm())
 const issued = ref(null)
@@ -45,6 +48,11 @@ const isScanner = computed(() => form.value.scopes.includes('scanner'))
 // Preset for the scanner worker, reached from the Image policy page.
 function scannerPreset() {
   form.value = { ...blankForm(), name: 'scanner', scopes: ['scanner'] }
+  openCreate()
+}
+
+function openCreate() {
+  formError.value = null
   showCreate.value = true
 }
 
@@ -53,7 +61,7 @@ async function load() {
   try {
     tokens.value = (await api.listTokens()).tokens
   } catch (err) {
-    error.value = err.detail || 'Could not load tokens.'
+    error.value = errorMessage(err, 'Could not load tokens.')
   } finally {
     loading.value = false
   }
@@ -70,7 +78,8 @@ function toggleScope(scope) {
 }
 
 async function create() {
-  error.value = null
+  formError.value = null
+  creating.value = true
   try {
     const prefixes = wantsPush.value
       ? form.value.prefixes.split(/[\s,]+/).map((p) => p.trim()).filter(Boolean)
@@ -84,20 +93,34 @@ async function create() {
     issued.value = { ...created, scanner: isScanner.value }
     showCreate.value = false
     form.value = blankForm()
-    await load()
   } catch (err) {
-    error.value = err.detail || 'Could not create the token.'
+    formError.value = errorMessage(err, 'Could not create the token.')
+    return
+  } finally {
+    creating.value = false
   }
+  await load()
 }
 
 async function revoke(token) {
   if (!confirm(`Revoke "${token.name}"? Any client using it will stop working immediately.`)) return
-  await api.revokeToken(token.id)
+  error.value = null
+  try {
+    await api.revokeToken(token.id)
+  } catch (err) {
+    error.value = errorMessage(err, `Could not revoke "${token.name}".`)
+    return
+  }
   await load()
 }
 
 async function copyToken() {
-  await navigator.clipboard.writeText(issued.value.token)
+  try {
+    await navigator.clipboard.writeText(issued.value.token)
+  } catch {
+    error.value = 'Could not copy to the clipboard. Select the token and copy it by hand.'
+    return
+  }
   copied.value = true
   setTimeout(() => (copied.value = false), 1600)
 }
@@ -118,11 +141,11 @@ onMounted(() => {
     </div>
     <div class="head-actions">
       <button v-if="auth.isAdmin" class="btn" @click="scannerPreset">Scanner token</button>
-      <button class="btn btn-primary" @click="showCreate = true">New token</button>
+      <button class="btn btn-primary" @click="openCreate">New token</button>
     </div>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
   <div v-if="issued" class="card mb" style="border-color: var(--ok)">
     <div class="card-head">
@@ -147,7 +170,7 @@ onMounted(() => {
         />
         <p class="small dim" style="margin: 0.5rem 0 0">
           It shows as checked in on
-          <router-link :to="{ name: 'image-policy' }">Policy &amp; scanning</router-link> within a few seconds.
+          <router-link :to="{ name: 'image-policy' }">Image policy</router-link> within a few seconds.
         </p>
       </template>
     </div>
@@ -157,7 +180,8 @@ onMounted(() => {
     <div class="card-body tight">
       <div v-if="loading" class="empty">Loading…</div>
       <div v-else-if="!tokens.length" class="empty">
-        You have no tokens yet. Create one to configure npm or pip.
+        You have no tokens yet. Installs and pulls normally need none; create one to publish
+        packages, push images, use the CLI, or install from CI when anonymous reads are turned off.
       </div>
       <div v-else class="table-wrap">
         <table>
@@ -206,21 +230,27 @@ onMounted(() => {
     </div>
   </div>
 
-  <div v-if="showCreate" class="modal-backdrop" @click.self="showCreate = false">
-    <div class="modal">
+  <div
+    v-if="showCreate"
+    class="modal-backdrop"
+    @click.self="showCreate = false"
+    @keydown.esc="showCreate = false"
+  >
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="new-token-title">
       <div class="modal-head">
-        <h3>New API token</h3>
-        <button class="btn btn-sm btn-ghost" @click="showCreate = false">✕</button>
+        <h3 id="new-token-title">New API token</h3>
+        <button class="btn btn-sm btn-ghost" aria-label="Close" @click="showCreate = false">✕</button>
       </div>
       <div class="modal-body">
+        <div v-if="formError" class="alert alert-error" role="alert">{{ formError }}</div>
         <div class="field">
           <label for="tname">Name</label>
           <input id="tname" v-model="form.name" placeholder="e.g. ci-pipeline" />
           <p class="field-hint">A label so you can recognise this token later.</p>
         </div>
 
-        <div class="field">
-          <label>Scopes</label>
+        <div class="field" role="group" aria-labelledby="tscopes">
+          <label id="tscopes">Scopes</label>
           <label v-for="scope in availableScopes" :key="scope.value" class="check" style="margin-bottom: 0.3rem">
             <input
               type="checkbox"
@@ -249,8 +279,12 @@ onMounted(() => {
       </div>
       <div class="modal-foot">
         <button class="btn" @click="showCreate = false">Cancel</button>
-        <button class="btn btn-primary" :disabled="!form.name || !form.scopes.length" @click="create">
-          Create token
+        <button
+          class="btn btn-primary"
+          :disabled="creating || !form.name || !form.scopes.length"
+          @click="create"
+        >
+          {{ creating ? 'Creating…' : 'Create token' }}
         </button>
       </div>
     </div>

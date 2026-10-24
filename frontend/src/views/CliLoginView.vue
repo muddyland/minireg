@@ -1,6 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()
@@ -41,7 +42,7 @@ async function lookup() {
       pending.value = null
     }
   } catch (err) {
-    error.value = err.detail || 'That code is not valid.'
+    error.value = errorMessage(err, 'That code is not valid.')
   } finally {
     busy.value = false
   }
@@ -58,7 +59,7 @@ async function decide(approve) {
     })
     outcome.value = approve ? 'approved' : 'denied'
   } catch (err) {
-    error.value = err.detail || 'Could not complete the request.'
+    error.value = errorMessage(err, 'Could not complete the request.')
   } finally {
     busy.value = false
   }
@@ -97,7 +98,7 @@ const requestedScopes = computed(() => pending.value?.requested_scopes || ['read
     </div>
 
     <template v-else>
-      <div v-if="error" class="alert alert-error">{{ error }}</div>
+      <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
       <div v-if="!pending" class="card">
         <div class="card-body">
@@ -155,8 +156,8 @@ const requestedScopes = computed(() => pending.value?.requested_scopes || ['read
             <span class="mono small">{{ requestedScopes.join(', ') }}</span>
           </div>
 
-          <div class="field">
-            <label>Grant this tool</label>
+          <div class="field" role="group" aria-labelledby="grant-label">
+            <label id="grant-label">Grant this tool</label>
             <p
               v-if="(pending.requested_scopes || []).length > 1"
               class="field-hint"

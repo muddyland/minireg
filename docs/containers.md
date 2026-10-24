@@ -16,6 +16,31 @@ There are two reasons to put a registry in the middle:
   layer once, serves it from disk after that, and keeps serving the cached
   copy when the upstream is down or rate-limiting.
 
+## Admin pages
+
+Containers have their own two admin pages, under **Containers** in the menu:
+**Container registries** (the upstreams images are pulled through) and
+**Image policy** (pull and push rules, scanning, the disk budget, and "which
+of our images contain CVE-X?"). They are separate from the package
+**Upstreams** and **Package policy** pages because the models differ:
+
+- **Upstreams.** A container upstream's name is not a label: it is the first
+  path segment of every image it serves (`ghcr/aquasecurity/trivy` comes from
+  the `ghcr` upstream). There is no tier fall-through between registries, as
+  there is for packages; a name resolves to exactly one upstream. And each
+  registry needs its CDN hosts listed, because layer downloads are redirected
+  off the registry and minireg follows redirects only to hosts it has been
+  told about.
+- **Policy.** Package policy blocks individual versions by name, version
+  range and the CVSS score of OSV advisories. Images are scanned with Trivy
+  and an ordinary base image carries hundreds of findings, so a score
+  threshold would block nearly everything; image policy works with denied
+  CVEs, known-exploited (KEV) findings, quarantine and a stricter bar for
+  pushed images instead. See [Pull policy](#pull-policy).
+
+Package block rules do not apply to images, and image rules do not apply to
+packages.
+
 ## Pulling
 
 Put the registry's hostname in front of the image name:
