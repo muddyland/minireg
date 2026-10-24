@@ -3,10 +3,12 @@
 from types import SimpleNamespace
 
 import pytest
+import respx
 
 from app.api import cargo, npm, pypi
 
 from .test_integration import app_client, auth  # noqa: F401
+from .test_proxy import mock_npm_upstream
 
 
 @pytest.mark.parametrize("module", [npm, pypi, cargo])
@@ -73,3 +75,29 @@ async def test_admin_rescore_invalidates_packages_whose_score_moved(app_client, 
     assert response.status_code == 200, response.text
     assert response.json()["versions_updated"] == 1
     assert invalidated == [{("npm", "moved")}]
+
+
+@respx.mock
+async def test_package_page_for_an_uncached_package_loads_lean(app_client):  # noqa: F811
+    """The package page's cold path fetches from upstream with the heavy
+    columns deferred (raiseload). Nothing it renders may touch them."""
+    from app import db as db_module
+    from app.models import Ecosystem, Upstream, UpstreamKind
+
+    async with db_module.session_scope() as session:
+        session.add(
+            Upstream(
+                name="mock-npm",
+                ecosystem=Ecosystem.npm,
+                kind=UpstreamKind.npm,
+                url="https://upstream.test",
+                tier=1,
+                enabled=True,
+            )
+        )
+    mock_npm_upstream()
+    response = await app_client.get("/api/packages/npm/leftpad", headers=auth(app_client, "reader"))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "leftpad"
+    assert {v["version"] for v in body["versions"]} == {"1.0.0", "1.1.0"}

@@ -134,7 +134,8 @@ async def package_detail(
     ).scalar_one_or_none()
 
     if package is None:
-        lookup = await packages.fetch_package(session, ecosystem, name)
+        # This view renders neither the packument nor per-version metadata.
+        lookup = await packages.fetch_package(session, ecosystem, name, with_documents=False)
         package = lookup.package
     if package is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="package not found")
