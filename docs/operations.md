@@ -93,7 +93,9 @@ fetch them from.
 With `STORAGE_QUOTA_BYTES` set, eviction is also automatic. When a download
 would take the store over the quota, and again at each housekeeping pass, the
 least recently accessed cached upstream artifacts are evicted until usage is
-back to 90% of it. Artifacts read in the last 10 minutes are spared. A
+back to 90% of it. Artifacts read in the last 10 minutes are spared, and so
+are artifacts from a disabled upstream, which cannot be fetched again while it
+is paused. A
 download fails only when nothing evictable is left. Before this release,
 reaching the quota failed every uncached download until someone purged by
 hand.
