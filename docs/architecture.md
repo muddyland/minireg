@@ -60,7 +60,7 @@ request
   → policy: is the name blocked?           (before any network access)
   → Valkey: rendered document?              short TTL
   → Postgres: local rows, fresh?           local publishes never go stale
-  → upstream resolver                      tiered, raced
+  → upstream resolver                      tiered, raced; conditional when revalidating
   → persist
   → CVE scan for unseen versions           bounded, inline
   → render + filter blocked versions
@@ -76,7 +76,7 @@ generates outbound traffic.
 request
   → policy: blocked package or version?
   → blob store: present?                   serve immediately
-  → herd guard                             one fetch, not N
+  → herd guard                             one fetch, not N; a renewable lease across replicas
   → upstream fetch (streamed)
   → verify every advertised digest
   → store atomically
@@ -84,7 +84,10 @@ request
 ```
 
 A digest mismatch is treated as a poisoned upstream: the bytes are discarded
-and the request fails loudly rather than caching bad content.
+and the request fails loudly rather than caching bad content. A download still
+running after about 5 seconds is streamed to its clients while it downloads,
+but the last bytes are held back until the digest verifies; on a mismatch the
+connection is cut, so a client never receives a complete-looking bad file.
 
 ---
 
@@ -109,6 +112,12 @@ tier 2 upstreams (raced)
   produce a version list no upstream ever published.
 - Locally published versions are never overwritten by upstream data, so a
   private package shadowing a public name keeps its own content.
+- Cached versions follow the current answer. When a tier answers, versions
+  cached from a lower tier that it does not list are pruned; so is everything
+  only a disabled or deleted upstream supplied. An upstream that is merely
+  unreachable keeps its versions.
+- A refresh after `META_CACHE_TTL` sends the stored `ETag` / `Last-Modified`
+  back to the upstream that issued them. A `304` only restarts the TTL.
 
 ---
 
@@ -147,6 +156,10 @@ by a scan, or by **Recompute scores**.
 
 **Rendered documents are cached, not just source rows.** A large packument
 costs real CPU to serialize; caching the finished bytes skips that entirely.
+npm packuments over 1 MiB are the exception: Valkey runs with a fixed memory
+cap shared with locks and rate-limit counters, which a few such documents
+would evict. Packuments, simple pages and cargo index files carry a strong
+`ETag`, so a client revalidating gets a `304`.
 
 **Policy is baked into the cached document.** Blocked versions are filtered out
 before caching, so the hot path does no policy work. The cost is that a policy
@@ -179,6 +192,8 @@ win when a fleet asks for hundreds of packages at once.
 | Login limited per IP **and** per username | Neither a single source nor a single account can be brute-forced |
 | CLI login via device authorization | No password reaches the terminal; SSO works unchanged |
 | Blocks enforced on metadata, artifacts, and publish | No path bypasses policy |
+| Cookie-authenticated writes refused when cross-site | The cookie is the one credential a browser attaches on its own |
+| Metadata fetches guarded like artifact fetches, redirects followed by hand | An upstream must not be able to 302 a packument request to an internal address |
 
 ---
 

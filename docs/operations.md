@@ -29,7 +29,10 @@ curl -fsS https://registry.example.com/api/health/detailed | jq
 
 `degraded` means the database or storage is unreachable — the registry cannot
 serve. Valkey being down reports `ok` overall, because it is an accelerator: the
-registry gets slower, not broken.
+registry gets slower, not broken. While it is unreachable the app stops asking
+it for 2 seconds at a time, doubling up to 30, rather than paying a connection
+timeout on every call, and reconnects on its own once it is back. The login
+throttle keeps working through an outage on an in-process counter.
 
 The **Dashboard** shows the same information plus upstream health.
 
@@ -42,11 +45,14 @@ An hourly loop inside the app handles:
 | Task | What it does |
 |---|---|
 | Log retention | Prunes `download_log` and `audit_log` past their retention windows |
-| Orphan collection | Deletes blobs no package file references |
+| Orphan collection | Deletes blobs no package file references, and blob files with no database row once they are 24 hours old |
+| Quota | With `STORAGE_QUOTA_BYTES` set, evicts cached upstream artifacts back down to 90% of it. See [Eviction](#eviction) |
 | Temp cleanup | Removes staging files orphaned by a crash |
-| CVE refresh | Re-scans versions older than `OSV_REFRESH_INTERVAL_SECONDS` |
+| Container images | Garbage collection, eviction, watched tags, and the `orphans` step, which reconciles image blob files that have had no database row for 6 hours (see [Container images](containers.md#storage)) |
+| CVE refresh | Re-scans versions older than `OSV_REFRESH_INTERVAL_SECONDS`, and drops the cached rendered documents of every package whose verdict changed |
 
-The first run is delayed 60 seconds so a restart storm does not converge.
+The first run is delayed 60 seconds so a restart storm does not converge. Each
+pass takes a renewable lease in Valkey, so only one replica runs it at a time.
 
 ---
 
@@ -57,6 +63,7 @@ Artifacts are content-addressed by SHA-256, with a two-level directory fan-out:
 ```
 /data/packages/blobs/ab/cd/abcd…    the artifact
 /data/packages/tmp/                 staging
+/data/packages/partial/             downloads in progress that clients are reading
 ```
 
 Two packages shipping byte-identical files store one copy. **Storage** shows
@@ -64,6 +71,15 @@ how much that saves.
 
 Writes stage to a temp file on the same filesystem and `os.replace` into place,
 so a crash or a concurrent write can never expose a truncated artifact.
+
+A cold artifact whose download is still running after about 5 seconds is
+streamed to the client while it downloads, provided the upstream announced
+its length; concurrent requests for it, from any replica, share that one
+download through `partial/`. The digest is verified before the final bytes are
+released. On a mismatch the connection is cut, so the client sees a failed
+download rather than a truncated "success", and nothing is cached. Smaller or
+faster downloads are verified in full before the first byte is sent, as
+before.
 
 ### Eviction
 
@@ -73,6 +89,14 @@ anything ever downloaded it.
 Evicted artifacts re-download from their upstream on next request. **Files
 published directly to this registry are never evicted** — there is nowhere to
 fetch them from.
+
+With `STORAGE_QUOTA_BYTES` set, eviction is also automatic. When a download
+would take the store over the quota, and again at each housekeeping pass, the
+least recently accessed cached upstream artifacts are evicted until usage is
+back to 90% of it. Artifacts read in the last 10 minutes are spared. A
+download fails only when nothing evictable is left. Before this release,
+reaching the quota failed every uncached download until someone purged by
+hand.
 
 ### Garbage collection
 
@@ -183,8 +207,9 @@ test the pair together at least once.
 ## Scaling
 
 Run one worker per container and scale with replicas. The download-log batcher
-and the housekeeping loop are per-process; multiple workers in one container
-means duplicate housekeeping.
+is per-process. Housekeeping runs in every process but takes a lease in Valkey
+first, so one pass runs at a time across all replicas; without Valkey each
+process runs its own.
 
 ```yaml
 minireg:
@@ -197,7 +222,9 @@ a shared filesystem (NFS, EFS) for multi-host deployments.
 
 Valkey matters more as you scale: it holds the distributed lock that collapses
 concurrent cold-cache fetches into one upstream request. Without it, N replicas
-make N upstream requests for the same cold package.
+make N upstream requests for the same cold package. Long artifact downloads
+hold a lease that is renewed while they run, so a multi-minute download is
+never started a second time by another replica half way through.
 
 Postgres connections: each replica opens up to `DB_POOL_SIZE + DB_MAX_OVERFLOW`
 (default 40). Three replicas need 120, plus headroom. Raise
@@ -218,6 +245,15 @@ Postgres connections: each replica opens up to `DB_POOL_SIZE + DB_MAX_OVERFLOW`
 | 300s | Much less upstream traffic; new versions take up to 5 min to appear |
 
 Locally published packages are authoritative and never go stale regardless.
+
+A refresh after the TTL is a conditional request to the upstream that served
+the document (`If-None-Match` / `If-Modified-Since`). An unchanged document
+costs one round trip and a `304`, not a re-download, and when it has changed
+only the versions that differ are rewritten. A PyPI page merged from several
+upstreams has no single validator and is always refetched in full.
+
+Rendered npm packuments over 1 MiB are not stored in Valkey; they are
+rendered from the database on each request.
 
 ### Upstream racing
 
@@ -302,7 +338,9 @@ For a locally published package, deletion is permanent.
 
 **Vulnerabilities → Rescan all** re-queries OSV.
 **Vulnerabilities → Recompute scores** re-scores stored records without any
-network access — use it after a scoring change.
+network access — use it after a scoring change. Both drop the cached
+documents of every package whose verdict changed, so the new verdict is
+served at once.
 
 ### Index an upstream for search
 
@@ -317,5 +355,10 @@ Metadata is still fetched on demand — the names only populate search.
 3. Restore both on the new host.
 4. `docker compose up -d --build`.
 
-If `PUBLIC_URL` changed, every cached packument holds old tarball URLs — they
-expire within `META_CACHE_TTL`, or restart the app to clear them immediately.
+If `PUBLIC_URL` changed, every cached packument holds old tarball URLs. They
+expire within `META_CACHE_TTL`. Restarting the app does not clear them, because
+they live in Valkey, a separate container; flush it to clear them at once:
+
+```bash
+docker compose exec redis valkey-cli FLUSHDB
+```

@@ -132,6 +132,8 @@ docker push minireg.example.com/local/team-a/myapp:1.0
   mount from repositories the pusher can already read.
 - Manifests that reference layers stored elsewhere ("foreign layers") are
   refused.
+- Tags must match `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`. Anything else is
+  refused with `TAG_INVALID`, since it could never be pulled back.
 
 ### Pushed images are scanned before they can be pulled
 
@@ -245,6 +247,14 @@ around the registry. These are the tools that stay useful instead:
 A refused pull returns the standard `DENIED` error with the reason, which
 `docker pull` prints, and the refusal is written to the audit log.
 
+Policy covers the layers too, not only the manifest. A blob is served from a
+repository only if it belongs there: pushed or mounted into it, or named by a
+manifest served through it; otherwise the answer is `BLOB_UNKNOWN`. And it is
+refused when the repository is quarantined, or when every manifest in that
+repository that names it is refused. A layer shared with an allowed image is
+still served. So a blocked image cannot be reassembled by fetching its layers
+by digest, under its own name or any other.
+
 ## Caching and upstream rate limits
 
 - **Tags are revalidated with HEAD.** A cached tag is served as-is for
@@ -255,8 +265,8 @@ A refused pull returns the standard `DENIED` error with the reason, which
 - **Digests never expire.** A digest is immutable, so `image@sha256:…` is
   never revalidated.
 - **Serve-stale.** When the upstream is down, times out or returns 429, the
-  cached copy of the tag is served. The response carries a `Warning` header
-  saying so.
+  cached copy of the tag is served. The response carries
+  `X-Minireg-Cache: stale` and `Warning: 110 - "Response is Stale"`.
 - **Negative caching.** When the upstream says an image or tag doesn't exist,
   that answer is remembered for a short while (default 60 seconds). A typo
   in a CI matrix then doesn't turn into a stream of upstream requests.
@@ -291,6 +301,12 @@ Layers shared between images stay on disk until nothing references them.
 Garbage collection runs with the regular housekeeping and waits a grace
 period before deleting anything, so an upload in progress is never collected
 from under a client.
+
+Housekeeping also reconciles the files with the database (the `orphans`
+step). A blob file that has had no database row for 6 hours is given its row
+back if a manifest still names it, so the budget counts it again, and deleted
+if nothing does. Either outcome is logged as a `blob store drift` warning. An
+occasional one is harmless; a steady stream points at failing database writes.
 
 ## Upstream security
 
@@ -342,3 +358,12 @@ issued them, so revoking an API token takes effect at once.
 - **`unauthorized` on push**: the password must be an API token with
   `docker:push`, and the repository must be under `local/` and inside the
   token's prefixes.
+- **`manifest unknown` for an image that exists**: the client's `Accept`
+  header does not include the manifest's media type. Usually an older or
+  minimal client that lists only single-platform manifest types, asking for a
+  multi-platform index. The error message names the type. Pull by a
+  platform's digest, or have the client accept index types. docker,
+  containerd and podman send all of them.
+- **`blob unknown` for a layer of an image you can see**: blobs are served
+  only through a repository whose manifests name them. Pull the manifest
+  through the same repository name first.

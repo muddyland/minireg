@@ -260,7 +260,12 @@ the ones that matter for that job.
 
 - Artifact URLs come out of upstream metadata, so fetches are restricted to
   the upstream's own host plus an allowlist, never to a private or link-local
-  address, and re-checked on every redirect hop.
+  address, and re-checked on every redirect hop. Metadata and search requests
+  follow the same rules, and every connection is pinned to the address that
+  was checked, so DNS rebinding cannot redirect it.
+- Disabling an upstream removes what it alone supplied at once, artifacts
+  included; and when a higher tier answers for a name, versions cached from a
+  lower tier that it does not list are dropped.
 - Credentials go only to the upstream's own origin, so a 302 to object storage
   cannot carry a GitLab token off-site.
 - A response naming a different package than the one requested is discarded.
@@ -270,7 +275,9 @@ the ones that matter for that job.
 **Credentials do not widen**
 
 - A token can never mint a token with scopes it does not itself hold; the same
-  applies to approving a CLI login.
+  applies to approving a CLI login. Listing and revoking tokens needs a
+  session or an admin-scoped token, so a leaked read-only token cannot
+  enumerate or revoke the others.
 - Argon2id password hashing; API tokens stored as SHA-256 of the secret half
   and shown exactly once. Upstream credentials encrypted at rest, never
   returned by the API.
@@ -282,6 +289,9 @@ the ones that matter for that job.
   an in-process counter rather than failing open if the cache is unreachable.
 - OIDC links to an existing local account only on a provider-verified email,
   and the login flow is bound to the browser that started it.
+- Writes authenticated by the session cookie are refused when the browser
+  marks them cross-site. HTML responses carry a Content-Security-Policy, and
+  HSTS is sent when `PUBLIC_URL` is https.
 - The CLI authenticates by OAuth device flow, so no password reaches the
   terminal and SSO works unchanged. The approval page does not accept a
   pre-filled code, which is what makes phishing one worthwhile.

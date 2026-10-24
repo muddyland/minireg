@@ -95,6 +95,35 @@ curl -s https://registry.example.com/npm/lodash | jq -r '.versions["4.17.21"].di
 If that host or port is not what your clients use, fix `PUBLIC_URL` and
 restart.
 
+### pip finds no versions at all (pip older than 22.2)
+
+```
+ERROR: Could not find a version that satisfies the requirement requests (from versions: none)
+```
+
+pip before 22.2 — Ubuntu 22.04 ships 22.0.2 — accepts a simple page only
+when it is labelled `text/html`. Earlier releases of this registry labelled it
+`application/vnd.pypi.simple.v1+html`, which such a pip discards without
+complaint, so every project appeared to have no versions. The registry now
+answers `text/html` unless a client asks for the PEP 691 type by name, so
+upgrading the registry fixes it. To see what a client gets:
+
+```bash
+curl -sI https://registry.example.com/pypi/simple/requests/ | grep -i content-type
+```
+
+If that says `text/html` and pip still sees nothing, check for a caching proxy
+in front that ignores `Vary: Accept`.
+
+### An internal upstream stopped resolving after an upgrade
+
+Metadata requests now obey `UPSTREAM_ALLOW_PRIVATE_ADDRESSES` and
+`UPSTREAM_ALLOW_PLAINTEXT_HTTP`, as artifact downloads already did. An
+upstream on a private address or plain `http://` shows as unhealthy, and the
+log has a line such as `upstream gitlab: refused …: 'gitlab.internal'
+resolves to a private or link-local address`. Set the flag that applies. See
+[Upstream trust](configuration.md#upstream-trust).
+
 ### npm ignores the registry
 
 A closer `.npmrc` wins. `npm config list` shows which file provided each
@@ -144,6 +173,14 @@ publishes fail; if `proxy_read_timeout` is short, large downloads truncate. See
 ---
 
 ## Publishing fails
+
+### npm: `400` with `integrity mismatch` or `shasum mismatch`
+
+The `dist` the client declared does not describe the tarball it uploaded:
+something changed the package between `npm pack` and the upload. Pack and
+publish again from a clean tree. The registry refuses rather than correcting
+it, because a lockfile written against the declared digest would fail later
+with `EINTEGRITY`.
 
 ### `409 Conflict`
 
@@ -225,14 +262,29 @@ This reads like a wrong client secret and usually is not. Some providers
 (Kanidm) accept only HTTP Basic at the token endpoint, and answer a
 body-posted secret with the same 401 as a bad one. minireg reads
 `token_endpoint_auth_methods_supported` from the discovery document and uses
-Basic unless the provider says otherwise, so the error message names the method
-it used — check that line before rotating anything.
+Basic unless the provider says otherwise. The browser shows only a generic
+"single sign-on failed"; the server log line `OIDC callback failed:` and the
+`auth.login.failed` audit entry carry the provider's response and name the
+method that was used — check that before rotating anything.
 
 ### SSO redirect fails
 
 The redirect URI must be exactly
 `{PUBLIC_URL}/api/auth/oidc/callback` and registered at the provider verbatim,
 including scheme and any port.
+
+### `403 cross-site request refused`
+
+A write (`POST`, `PUT`, `PATCH`, `DELETE`) carried the session cookie but did
+not come from the registry's own pages: the browser marked it cross-site, or
+its `Origin` or `Referer` is not `PUBLIC_URL`. If it came from the web UI
+itself, `PUBLIC_URL` does not match the address in the browser's address bar.
+If it came from a script, use an API token instead of a session cookie.
+
+### `403` listing or revoking tokens with a token
+
+Listing, creating and revoking tokens needs a browser session or an
+admin-scoped token. A `read` or `publish` token is refused there on purpose.
 
 ### CLI login never completes
 
@@ -249,7 +301,9 @@ including scheme and any port.
 
 Check Valkey. `/api/health/detailed` reports it. Without Valkey there is no
 metadata cache and no request coalescing, so every request hits Postgres and
-concurrent cold requests each hit the upstream.
+concurrent cold requests each hit the upstream. An outage does not add a
+timeout to every request: the app backs off from Valkey for 2–30 seconds at a
+time and reconnects on its own, and the log says `cache unreachable`.
 
 ### First request for a package is slow
 
@@ -305,6 +359,17 @@ from vulnerabilities where cve_id = 'CVE-2024-12345';
 A version that was scanned and found clean and one that could not be scanned
 are different states, and the admin UI shows which. Only the second is
 affected by **Block versions that could not be scanned**.
+
+### Versions disappeared after an upstream change
+
+Disabling or deleting an upstream removes every cached version only it
+supplied — see
+[Changing, disabling and deleting upstreams](configuration.md#changing-disabling-and-deleting-upstreams).
+The `admin.upstream.updated` or `admin.upstream.deleted` audit entry records
+`retired_versions`. Re-enable it and they are fetched again on demand.
+
+Versions also go when a higher tier starts answering for a name and does not
+list them. The log line is `pruned N version(s) of …`.
 
 ### Package count jumped into the hundreds of thousands
 

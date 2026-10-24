@@ -43,8 +43,8 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 | `DB_POOL_SIZE` | `20` | Per process. With N replicas, Postgres needs `N × (pool + overflow)` connections. |
 | `DB_MAX_OVERFLOW` | `20` | Burst above the pool. |
 | `DB_ECHO` | `false` | Logs every SQL statement. Debugging only. |
-| `REDIS_URL` | `redis://redis:6379/0` | Optional. Valkey or Redis, same protocol. Without it the registry still works, just slower. |
-| `META_CACHE_TTL` | `60` | Seconds a rendered packument / index page stays fresh. |
+| `REDIS_URL` | `redis://redis:6379/0` | Optional. Valkey or Redis, same protocol. Without it the registry still works, just slower. When it is unreachable the app stops asking it for 2 s at a time, doubling up to 30 s, instead of paying a timeout on every call, and reconnects by itself. |
+| `META_CACHE_TTL` | `60` | Seconds a rendered packument / index page stays fresh. After that, the refresh is a conditional request (`If-None-Match` / `If-Modified-Since`) to the upstream that served the document; a `304` just extends freshness, and only versions that changed are rewritten. |
 | `META_NEGATIVE_CACHE_TTL` | `30` | How long a "not found" is remembered. |
 | `SEARCH_CACHE_TTL` | `120` | Search result caching. |
 
@@ -53,7 +53,7 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 | Variable | Default | Notes |
 |---|---|---|
 | `STORAGE_PATH` | `/data/packages` | Content-addressed blob store. |
-| `STORAGE_QUOTA_BYTES` | `0` | `0` disables the cap. |
+| `STORAGE_QUOTA_BYTES` | `0` | Cap on the package blob store; `0` disables it. Above it, cached upstream artifacts are evicted, least recently used first. See [Limits](#limits). |
 | `CACHE_ARTIFACTS` | `true` | Turning this off makes every download a passthrough fetch. |
 | `STREAM_CHUNK_SIZE` | `262144` | Read/write chunk size for artifact streaming. |
 | `ARTIFACT_DOWNLOAD_TIMEOUT_SECONDS` | `900` | Wall-clock deadline for one upstream artifact download. The upstream read timeout is per chunk, so without this a trickling upstream could hold the download (and every client waiting on it) indefinitely. |
@@ -109,11 +109,17 @@ Artifact URLs come out of upstream metadata, so they are chosen by whoever
 controls the upstream. Fetches are restricted to the upstream's own host plus
 this allowlist, and never to a private or link-local address.
 
+Metadata requests (packuments, simple pages, index files, search) follow the
+same rules. Redirects are followed by hand and every hop is checked again,
+the upstream's credentials are dropped once a hop leaves its origin, and the
+connection is pinned to the address that was checked, so a DNS answer that
+changes in between cannot redirect it.
+
 | Variable | Default | Notes |
 |---|---|---|
 | `UPSTREAM_ARTIFACT_HOSTS` | the three public registries' CDNs | Comma-separated. Add a host when an upstream serves files from its own CDN. |
-| `UPSTREAM_ALLOW_PRIVATE_ADDRESSES` | `false` | Set for a self-hosted GitLab on an internal address. |
-| `UPSTREAM_ALLOW_PLAINTEXT_HTTP` | `false` | Allows `http://` upstreams and artifact URLs. |
+| `UPSTREAM_ALLOW_PRIVATE_ADDRESSES` | `false` | Set for an upstream on an internal address, such as a self-hosted GitLab. Applies to metadata and search as well as artifacts. |
+| `UPSTREAM_ALLOW_PLAINTEXT_HTTP` | `false` | Allows `http://` upstreams, for metadata and artifacts alike. |
 
 Per upstream, **Reserved names** claims glob patterns such as `@corp/*`. When
 any upstream claims a pattern, matching names are only ever resolved from
@@ -150,7 +156,7 @@ Full guide: [Container images](containers.md).
 | `MAX_PUBLISH_BYTES` | `268435456` | Rejected on `Content-Length` before the body is read. |
 | `MAX_METADATA_BYTES` | `100663296` | Largest upstream packument or index document. |
 | `MAX_ARTIFACT_BYTES` | `2147483648` | Largest artifact streamed from an upstream. |
-| `STORAGE_QUOTA_BYTES` | `0` | Stops caching new upstream artifacts above this. Publishes are exempt. `0` disables. |
+| `STORAGE_QUOTA_BYTES` | `0` | When a download would take the blob store over this, the least recently accessed cached upstream artifacts are evicted down to 90% of it. The same runs in the hourly housekeeping. Never evicted: files published here and anything read in the last 10 minutes. An evicted artifact is fetched again on its next request. A download fails only when nothing evictable is left. Publishes are exempt. `0` disables. |
 | `DB_POOL_TIMEOUT_SECONDS` | `10` | Wait for a pooled connection before failing. |
 | `DB_STATEMENT_TIMEOUT_SECONDS` | `30` | Server-side cap per query. |
 | `DB_IDLE_TRANSACTION_TIMEOUT_SECONDS` | `60` | Postgres `idle_in_transaction_session_timeout`: a transaction left open and idle this long is terminated, so an abandoned one cannot hold row locks forever. |
@@ -235,6 +241,39 @@ The usual arrangement:
 An upstream that fails 5 times consecutively is quarantined and skipped, with a
 probe every 2 minutes so recovery is automatic. The **Health** column shows the
 current state and the last error.
+
+Cached versions follow the current answer. When a tier answers for a name,
+versions cached earlier from a lower tier that are not in that answer are
+removed. Once an internal upstream is back from an outage, say, what a public
+tier answered in the meantime does not linger, which closes a
+dependency-confusion window. Versions from an upstream that is merely
+unreachable are kept and served, as before.
+
+### Changing, disabling and deleting upstreams
+
+> **Disabling an upstream is not a pause.** Disabling or deleting one removes
+> at once every cached version and artifact that only that upstream supplied.
+> They stop being served immediately, including to clients installing
+> straight from a lockfile, and their files are deleted from disk at the next
+> garbage collection. Re-enabling does not restore them: packages are fetched
+> again on their next request.
+
+Versions another upstream also supplied keep that upstream's files. Locally
+published packages are never touched. The audit entry records how many
+versions were removed (`retired_versions`).
+
+That is what you want for a compromised upstream. For an outage, leave it
+enabled: an unreachable upstream's versions keep being served, and after five
+failures it is skipped automatically anyway.
+
+Creating an upstream, or changing anything that affects routing (URL, tier,
+priority, enabled, reserved names, authentication, GitLab project or group,
+TLS verification), marks every cached package in that ecosystem stale and
+clears its rendered documents and remembered "not found" answers. Each
+package re-resolves against the new configuration on its next request, so
+expect a burst of upstream traffic afterwards. Renaming, the timeout,
+**Include in search**, **Mirror local publishes** and the package page URL
+do not have this effect.
 
 ### Authentication
 
@@ -380,6 +419,12 @@ touch the local account.
 An OIDC login whose email matches an existing local account links to it rather
 than creating a duplicate.
 
+When a new SSO account's `preferred_username` is already taken, it gets a
+numeric suffix (`alice-2`) rather than failing, and the existing account is
+left alone. SSO errors shown in the browser are generic. The provider's
+actual response is in the server log and in the `auth.login.failed` audit
+entry.
+
 ### API tokens
 
 **API tokens → New token.** Shown once at creation; only a SHA-256 of the
@@ -394,6 +439,10 @@ secret is stored.
 A token can never exceed its owner's permissions — a non-admin requesting an
 `admin` token is refused, and the CLI login flow silently drops scopes the
 approver does not hold.
+
+Listing, creating and revoking tokens needs a browser session or an
+admin-scoped token. A leaked `read` or `publish` token can therefore neither
+mint a wider one nor enumerate or revoke its owner's other tokens.
 
 Tokens created by `minireg login` are named after the requesting machine, so
 revoking a lost laptop is a matter of finding its hostname in the list.
