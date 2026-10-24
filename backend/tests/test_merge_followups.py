@@ -101,3 +101,83 @@ async def test_package_page_for_an_uncached_package_loads_lean(app_client):  # n
     body = response.json()
     assert body["name"] == "leftpad"
     assert {v["version"] for v in body["versions"]} == {"1.0.0", "1.1.0"}
+
+
+# --------------------------------------------------------------------------- #
+# Package upstreams honour HTTP(S)_PROXY / NO_PROXY again
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def https_proxy_env(monkeypatch):
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("NO_PROXY", "gitlab.internal.test")
+
+
+def test_proxy_for_follows_the_environment(https_proxy_env):
+    from app.upstreams import netguard
+
+    assert netguard.proxy_for("https://registry.npmjs.org/leftpad") == "http://proxy.internal:3128"
+    assert netguard.proxy_for("https://gitlab.internal.test/api") is None
+    assert netguard.proxy_for("http://plain.example/x") is None
+
+
+async def test_pinned_client_routes_proxied_urls_through_the_proxy(https_proxy_env):
+    import httpx
+
+    from app.upstreams import netguard
+
+    client = netguard.pinned_client(
+        netguard.PinnedBackend(),
+        verify=True,
+        timeout=httpx.Timeout(5),
+        max_connections=4,
+        max_keepalive=2,
+    )
+    try:
+        proxied = client._transport_for_url(httpx.URL("https://registry.npmjs.org/x"))
+        direct = client._transport_for_url(httpx.URL("https://gitlab.internal.test/x"))
+        assert proxied is not client._transport
+        assert direct is client._transport
+    finally:
+        await client.aclose()
+
+
+async def test_guard_allows_a_proxied_name_it_cannot_resolve(https_proxy_env, monkeypatch):
+    from app.config import settings
+    from app.upstreams import netguard
+
+    monkeypatch.setattr(settings, "upstream_allow_private_addresses", False)
+
+    async def no_dns(host, port):
+        raise OSError("no resolver in a proxy-only network")
+
+    monkeypatch.setattr(netguard, "resolve_host", no_dns)
+    backend = netguard.PinnedBackend()
+    await netguard.guard_url(
+        "https://registry.npmjs.org/leftpad",
+        upstream_url="https://registry.npmjs.org",
+        backend=backend,
+    )
+    assert backend.pins == {}  # the proxy resolves it; nothing to pin
+
+
+async def test_guard_still_refuses_a_proxied_name_that_resolves_privately(
+    https_proxy_env, monkeypatch
+):
+    from app.config import settings
+    from app.upstreams import netguard
+
+    monkeypatch.setattr(settings, "upstream_allow_private_addresses", False)
+
+    async def private(host, port):
+        return ["10.1.2.3"]
+
+    monkeypatch.setattr(netguard, "resolve_host", private)
+    with pytest.raises(netguard.BlockedUrl):
+        await netguard.guard_url(
+            "https://registry.npmjs.org/leftpad",
+            upstream_url="https://registry.npmjs.org",
+            backend=netguard.PinnedBackend(),
+        )

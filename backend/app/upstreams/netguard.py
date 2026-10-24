@@ -111,6 +111,35 @@ async def resolve_host(host: str, port: int) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+# Environment proxies
+# --------------------------------------------------------------------------- #
+def environment_proxies() -> list[tuple[object, str | None]]:
+    """``(URLPattern, proxy URL or None)`` from HTTP(S)_PROXY / ALL_PROXY /
+    NO_PROXY, most specific first -- the same table and order httpx builds
+    for a client with ``trust_env``. ``None`` means "connect directly".
+
+    A pinned client takes a custom transport, and httpx ignores the
+    environment for those; without this, a deployment whose only egress is
+    a proxy lost every package upstream.
+    """
+    from httpx._utils import URLPattern, get_environment_proxies
+
+    return sorted(
+        ((URLPattern(pattern), proxy) for pattern, proxy in get_environment_proxies().items()),
+        key=lambda item: item[0],
+    )
+
+
+def proxy_for(url: str) -> str | None:
+    """The proxy the environment routes ``url`` through, or None."""
+    target = httpx.URL(url)
+    for pattern, proxy in environment_proxies():
+        if pattern.matches(target):  # type: ignore[attr-defined]
+            return proxy
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # DNS pinning
 # --------------------------------------------------------------------------- #
 class PinnedBackend(AsyncNetworkBackend):
@@ -204,8 +233,21 @@ def pinned_client(
     transport._pool = pool
     with contextlib.suppress(Exception):
         asyncio.get_running_loop().create_task(old.aclose())
+    # URLs the environment sends through a proxy go through it, as they did
+    # before pinning; the proxy resolves those names, so there is nothing to
+    # pin (guard_url skips it for them). NO_PROXY entries map to None and
+    # fall through to the pinned transport.
+    mounts: dict[str, httpx.AsyncBaseTransport | None] = {}
+    for pattern, proxy in environment_proxies():
+        if proxy:
+            mounts[pattern.pattern] = httpx.AsyncHTTPTransport(  # type: ignore[attr-defined]
+                verify=verify, http2=True, proxy=proxy
+            )
+        else:
+            mounts[pattern.pattern] = transport  # type: ignore[attr-defined]
     return httpx.AsyncClient(
         transport=transport,
+        mounts=mounts or None,
         timeout=timeout,
         follow_redirects=False,
         headers=headers or {},
@@ -325,6 +367,19 @@ async def guard_url(
     if settings.upstream_allow_private_addresses:
         return
     literal = _literal(host)
+    if literal is None and proxy_for(url):
+        # The proxy resolves this name, not us, and may be the only thing
+        # that can: there is nothing to pin. Still refuse a name that
+        # resolves privately here, and allow one we cannot resolve.
+        try:
+            local = await resolve_host(host, 443)
+        except OSError:
+            return
+        if any(not is_public_address(a) for a in local):
+            raise BlockedUrl(
+                f"'{host}' resolves to a private or link-local address; refusing to fetch"
+            )
+        return
     if literal is not None:
         addresses = [literal]
     else:
