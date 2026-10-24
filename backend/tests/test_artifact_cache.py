@@ -698,3 +698,31 @@ class TestUpstreamChecks:
             row = await session.get(PackageFile, file_id)
             with pytest.raises(artifacts.ArtifactError, match="disabled"):
                 await artifacts.ensure_cached(session, row)
+
+
+async def test_blobs_from_a_disabled_upstream_are_not_evicted(store, monkeypatch):
+    """Disabling an upstream is a pause: its cached copies cannot be fetched
+    again while it is paused, so quota pressure must not take them."""
+    from app.models import Ecosystem, Upstream, UpstreamKind
+
+    long_ago = datetime.now(UTC) - timedelta(days=30)
+    paused = await store_cached(store, b"P" * 4000, url="https://x/p", accessed=long_ago)
+    live = await store_cached(
+        store, b"Q" * 4000, url="https://x/q", accessed=long_ago + timedelta(days=1)
+    )
+    async with db_module.session_scope() as session:
+        upstream = Upstream(
+            name="paused", ecosystem=Ecosystem.npm, kind=UpstreamKind.npm,
+            url="https://paused.test", tier=1, enabled=False,
+        )
+        session.add(upstream)
+        await session.flush()
+        await session.execute(
+            update(PackageFile)
+            .where(PackageFile.blob_sha256 == paused)
+            .values(upstream_id=upstream.id)
+        )
+    monkeypatch.setattr(artifacts.settings, "storage_quota_bytes", 5000)
+    await artifacts.enforce_quota()
+    assert store.exists(paused)
+    assert not store.exists(live)

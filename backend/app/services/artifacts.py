@@ -40,7 +40,7 @@ from pathlib import Path
 
 import aiofiles
 import httpx
-from sqlalchemy import delete, exists, func, select, tuple_, update
+from sqlalchemy import delete, exists, func, or_, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
@@ -793,11 +793,18 @@ async def _stored_bytes(session: AsyncSession) -> int:
 
 
 def _has_local_reference():
-    """A blob backs a locally published file when any PackageFile pointing at
-    it has no upstream URL: published files exist nowhere else, so they are
-    never evicted, while a cached upstream copy can always be fetched again."""
+    """A blob is kept when any PackageFile pointing at it could not be
+    fetched again: a locally published file (no upstream URL) exists nowhere
+    else, and one cached from a disabled upstream cannot be refetched while
+    the upstream is paused -- disabling must not quietly turn into losing
+    the cache under quota pressure. Everything else is a cached upstream
+    copy that can be fetched again on its next request."""
+    disabled_source = exists().where(
+        Upstream.id == PackageFile.upstream_id, Upstream.enabled.is_(False)
+    )
     return exists().where(
-        PackageFile.blob_sha256 == Blob.sha256, PackageFile.upstream_url.is_(None)
+        PackageFile.blob_sha256 == Blob.sha256,
+        or_(PackageFile.upstream_url.is_(None), disabled_source),
     )
 
 
