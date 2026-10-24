@@ -872,7 +872,50 @@ def _is_requirements_name(name: str) -> bool:
     Every one of them is installed by someone, so every one of them is audited:
     a CVE in a test-only dependency still runs in CI with CI's credentials.
     """
-    return name.startswith("requirements") and name.endswith(".txt")
+    return name.startswith("requirements") and (name.endswith(".txt") or name.endswith(".lock"))
+
+
+#: ``{input file: lock compiled from it}``, from pip-compile headers. A
+#: ranged requirements.txt beside the lock pip-compile built from it is
+#: covered by that lock, not an unaudited gap.
+COMPILED_INTO: dict[Path, Path] = {}
+
+_PIP_COMPILE_RE = re.compile(r"^#\s+pip-compile\b(?P<args>.*)$")
+
+
+def _compiled_inputs(lock: Path) -> list[Path]:
+    """Input files named on the ``pip-compile`` command line in ``lock``'s
+    header, that exist beside it. Reads only the leading comment block."""
+    inputs: list[Path] = []
+    header: list[str] = []
+    try:
+        with lock.open(encoding="utf-8", errors="replace") as fh:
+            pending = ""
+            for line in fh:
+                if not line.startswith("#"):
+                    break
+                text = line.rstrip()
+                if pending:
+                    # A command wrapped with trailing backslashes.
+                    text = pending + " " + text.lstrip("#").strip()
+                    pending = ""
+                if text.endswith("\\"):
+                    pending = text[:-1].rstrip()
+                    continue
+                header.append(text)
+    except OSError:
+        return inputs
+    for line in header:
+        match = _PIP_COMPILE_RE.match(line)
+        if not match:
+            continue
+        for token in match.group("args").split():
+            if token.startswith("-") or "=" in token or "/" in token:
+                continue
+            candidate = lock.parent / token
+            if candidate.is_file() and candidate.resolve() != lock.resolve():
+                inputs.append(candidate.resolve())
+    return inputs
 
 
 def parse_requirements(
@@ -1055,7 +1098,9 @@ def discover(root: Path) -> list[tuple[Path, str, list[dict]]]:
     # The fixed names first (requirements.txt among them), then any other
     # requirements*.txt in a stable order.
     extra = sorted(
-        p.name for p in root.glob("requirements*.txt")
+        p.name
+        for pattern in ("requirements*.txt", "requirements*.lock")
+        for p in root.glob(pattern)
         if p.is_file() and p.name not in known
     )
     entries = [*LOCKFILES, *((name, "pypi", parse_requirements) for name in extra)]
@@ -1065,6 +1110,13 @@ def discover(root: Path) -> list[tuple[Path, str, list[dict]]]:
         if parser is parse_requirements and (root / name).is_file()
     }
     claimed: dict[Path, Path] = {}
+    for name, _e, parser in entries:
+        lock = root / name
+        if parser is parse_requirements and lock.is_file() and (
+            name.endswith(".lock") or name.endswith("-lock.txt")
+        ):
+            for source in _compiled_inputs(lock):
+                COMPILED_INTO.setdefault(source, lock)
 
     found = []
     for filename, ecosystem, parser in entries:
@@ -1130,7 +1182,8 @@ def cmd_audit(args):
     if not sources:
         die(
             f"no dependency file found in {root}\n"
-            f"  looked for: {', '.join(name for name, _, _ in LOCKFILES)}, requirements*.txt"
+            f"  looked for: {', '.join(name for name, _, _ in LOCKFILES)}, "
+            "requirements*.txt, requirements*.lock"
         )
 
     total_findings = []
@@ -1144,6 +1197,14 @@ def cmd_audit(args):
         unpinned = UNPINNED.get(path, [])
         for note in REQUIREMENT_NOTES.get(path, []):
             info(dim(f"{rel}: {note}"))
+
+        covered_by = COMPILED_INTO.get(path.resolve())
+        if not packages and covered_by is not None:
+            info(
+                f"{dim('skipping')} {bold(rel)} "
+                f"{dim(f'— compiled into {covered_by.name}, which is audited')}"
+            )
+            continue
 
         if not packages:
             # Recognised the file, got nothing auditable out of it. Say so --
@@ -1231,7 +1292,7 @@ def cmd_audit(args):
                     + (" (offline mode)" if args.offline else "")
                 )
             )
-        if unpinned:
+        if unpinned and covered_by is None:
             info(
                 dim(
                     f"  {len(unpinned)} unpinned requirement(s) in {rel} were not audited"

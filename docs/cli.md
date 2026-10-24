@@ -231,7 +231,7 @@ Two things distinguish this from `npm audit` / `pip-audit`:
 | `poetry.lock` | PyPI |
 | `uv.lock` | PyPI |
 | `Pipfile.lock` | PyPI |
-| `requirements.lock`, `requirements-lock.txt` | PyPI (pip-compile output kept beside a ranged `requirements.txt`) |
+| `requirements.lock`, `requirements-lock.txt`, `requirements*.lock` — `requirements-dev.lock`, … | PyPI (pip-compile output kept beside a ranged `requirements*.txt`) |
 | `requirements.txt` | PyPI (pinned `==` entries only) |
 | `requirements*.txt` — `requirements-dev.txt`, `requirements-test.txt`, … | PyPI (pinned `==` entries only) |
 | `Cargo.lock` | cargo (crates.io entries only) |
@@ -239,6 +239,14 @@ Two things distinguish this from `npm audit` / `pip-audit`:
 Every lockfile found in the directory is audited, so a project with npm, Python
 and Rust dependencies is covered in one run. Each `requirements*.txt` is
 reported on its own: a CVE in a test-only dependency still runs in CI.
+
+A ranged `requirements*.txt` that a lock in the same directory was compiled
+from is reported as covered — `skipping requirements.txt — compiled into
+requirements.lock, which is audited` — rather than as an unaudited gap. The
+link is read from the `pip-compile` command line in the lock's header, so it
+holds for any lock pip-compile wrote (`-o requirements-dev.lock
+requirements-dev.txt`). A ranged file with no such lock is still reported as
+skipped, with the ranges it could not audit.
 
 `-r other.txt` (or `--requirement other.txt`) includes are followed when the
 file sits in the same directory. An included file that is itself audited — the

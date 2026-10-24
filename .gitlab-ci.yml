@@ -83,7 +83,9 @@ test:backend:
     - pip install --quiet --require-hashes -r backend/requirements.lock
     - cd backend
     - pip install --quiet --no-deps -e "."
-    - pip install --quiet -r requirements-dev.txt
+    # Hashed and constrained to requirements.lock, so the tools CI runs are
+    # the ones `minireg audit backend` checked.
+    - pip install --quiet --require-hashes -r requirements-dev.lock
   variables:
     # The app refuses to start in production with a placeholder SECRET_KEY, so
     # anything that imports app.main needs a real one. pytest gets these from

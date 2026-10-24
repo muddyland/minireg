@@ -203,8 +203,8 @@ cd backend
 python -m venv .venv
 .venv/bin/pip install --require-hashes -r requirements.lock   # what ships
 .venv/bin/pip install --no-deps -e .
-.venv/bin/pip install -r requirements-dev.txt                 # test + lint tools
-.venv/bin/python -m pytest          # 798 tests
+.venv/bin/pip install --require-hashes -r requirements-dev.lock  # test + lint tools
+.venv/bin/python -m pytest          # run from backend/
 
 # Frontend
 cd frontend

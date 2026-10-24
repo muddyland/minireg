@@ -1288,6 +1288,37 @@ class TestLockfileDiscovery:
         backend = pathlib.Path(__file__).resolve().parents[1]
         found = {path.name for path, _eco, _pkgs in cli.discover(backend)}
         assert "requirements.lock" in found
+        # The test tooling is locked too, so CI's own dependencies are audited.
+        assert "requirements-dev.lock" in found
+        assert cli.COMPILED_INTO[(backend / "requirements.txt").resolve()].name == "requirements.lock"
+        assert (
+            cli.COMPILED_INTO[(backend / "requirements-dev.txt").resolve()].name
+            == "requirements-dev.lock"
+        )
+
+    def test_a_ranged_input_beside_its_lock_is_reported_as_covered(self, tmp_path):
+        (tmp_path / "requirements-test.txt").write_text("pytest>=8\n")
+        (tmp_path / "requirements-test.lock").write_text(
+            "#\n"
+            "# Regenerate with:\n"
+            "#    pip-compile --generate-hashes \\\n"
+            "#      -c /tmp/constraints.txt \\\n"
+            "#      -o requirements-test.lock requirements-test.txt\n"
+            "pytest==9.1.1 \\\n"
+            "    --hash=sha256:aaaa\n"
+        )
+        found = {path.name: pkgs for path, _eco, pkgs in cli.discover(tmp_path)}
+        assert found["requirements-test.lock"] == [{"name": "pytest", "version": "9.1.1"}]
+        assert found["requirements-test.txt"] == []
+        assert (
+            cli.COMPILED_INTO[(tmp_path / "requirements-test.txt").resolve()]
+            == tmp_path / "requirements-test.lock"
+        )
+
+    def test_a_ranged_file_with_no_lock_is_still_a_gap(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("requests>=2\n")
+        cli.discover(tmp_path)
+        assert (tmp_path / "requirements.txt").resolve() not in cli.COMPILED_INTO
 
 
 class TestAuditChunking:

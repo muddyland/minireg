@@ -1,9 +1,13 @@
-# Test and lint tooling, kept separate from requirements.lock so the runtime
-# dependency set installs pinned and hashed while the tools stay flexible.
+# Test and lint tooling: the input to requirements-dev.lock, which is what CI
+# installs (hashed, and constrained to requirements.lock's versions). Edit the
+# ranges here, then regenerate the lock with the command in its header.
 #
 #   pip install --require-hashes -r requirements.lock
 #   pip install --no-deps -e .
-#   pip install -r requirements-dev.txt
+#   pip install --require-hashes -r requirements-dev.lock
+#
+# The ranges alone have no single version to audit, so before the lock
+# existed `minireg audit backend` could not check CI's own tooling.
 #
 # Installing `-e .[dev]` on its own instead would resolve the unbounded ranges
 # in pyproject.toml and quietly test against different versions than the image
