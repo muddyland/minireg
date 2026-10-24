@@ -34,6 +34,7 @@ from .base import (
     UpstreamNotFound,
     UpstreamProvider,
 )
+from .revalidation import Validators, check_not_modified
 
 log = logging.getLogger(__name__)
 
@@ -151,9 +152,22 @@ class CargoProvider(UpstreamProvider):
         )
 
     # -- fetch -------------------------------------------------------------- #
-    async def fetch_package(self, name: str) -> RemotePackage:
+    async def fetch_package(
+        self, name: str, *, validators: Validators | None = None
+    ) -> RemotePackage:
+        """Fetch one index file; conditional when ``validators`` is given.
+
+        The sparse protocol was designed around this: cargo itself sends
+        ``If-None-Match`` / ``If-Modified-Since`` for every index file it
+        already holds, and crates.io answers 304 for the overwhelming
+        majority of them.
+        """
         url = self.index_url(name)
-        resp = await self.request("GET", url, headers={"accept": "text/plain"})
+        headers = {"accept": "text/plain", **(validators.headers() if validators else {})}
+        resp = await self.request("GET", url, headers=headers)
+        check_not_modified(resp, validators)
+        if resp.status_code == 304:
+            raise UpstreamError(f"{self.name}: unsolicited HTTP 304")
         if resp.status_code == 404:
             raise UpstreamNotFound(f"{self.name}: {name} not found")
         if resp.status_code in (401, 403):
@@ -202,6 +216,7 @@ class CargoProvider(UpstreamProvider):
                 )
             )
 
+        self.response_validators = Validators.from_response(self.id, resp)
         return RemotePackage(
             name=display_name,
             versions=versions,
