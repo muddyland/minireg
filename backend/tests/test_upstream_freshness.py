@@ -580,7 +580,10 @@ class TestIncrementalPersist:
 # --------------------------------------------------------------------------- #
 class TestUpstreamChangesInvalidate:
     @respx.mock
-    async def test_disabling_an_upstream_stops_serving_what_it_alone_supplied(self, app_client):  # noqa: F811
+    async def test_disabling_pauses_and_deleting_removes(self, app_client):  # noqa: F811
+        """Disabling is a routine toggle (maintenance, a flaky index, a token
+        rotation) and must not destroy what re-enabling cannot restore.
+        Deleting the upstream is what removes what it alone supplied."""
         ah = auth(app_client, "admin")
         bad, _good = await add(
             npm_upstream("bad", "https://upstream.test", tier=1),
@@ -598,19 +601,56 @@ class TestUpstreamChangesInvalidate:
             )
         )
         assert versions_in(await app_client.get("/npm/leftpad")) == {"1.0.0", "6.6.6"}
-        # Cache the compromised tarball.
         tgz = await app_client.get("/npm/leftpad/-/leftpad-6.6.6.tgz")
         assert tgz.status_code == 200
 
         resp = await app_client.patch(f"/api/admin/upstreams/{bad}", json={"enabled": False}, headers=ah)
         assert resp.status_code == 200
 
-        # Gone at once -- the lockfile path asks for the tarball directly.
-        assert (await app_client.get("/npm/leftpad/-/leftpad-6.6.6.tgz")).status_code == 404
-        # And the next metadata request refetches from what is left.
-        assert versions_in(await app_client.get("/npm/leftpad")) == {"1.0.0"}
+        # Paused: the cached tarball and the version both survive, including
+        # the refresh the disable triggered (answered by the lower tier).
+        assert (await app_client.get("/npm/leftpad/-/leftpad-6.6.6.tgz")).status_code == 200
+        assert versions_in(await app_client.get("/npm/leftpad")) == {"1.0.0", "6.6.6"}
         assert good_route.call_count == 1
+        assert await stored_versions("leftpad") == {"1.0.0", "6.6.6"}
+
+        # Deleting it removes what it alone supplied, at once.
+        resp = await app_client.delete(f"/api/admin/upstreams/{bad}", headers=ah)
+        assert resp.status_code == 200
+        assert (await app_client.get("/npm/leftpad/-/leftpad-6.6.6.tgz")).status_code == 404
+        assert versions_in(await app_client.get("/npm/leftpad")) == {"1.0.0"}
         assert await stored_versions("leftpad") == {"1.0.0"}
+
+    @respx.mock
+    async def test_an_empty_higher_tier_answer_does_not_displace(self, app_client):  # noqa: F811
+        """A tier that answers 200 with no files says nothing about lower
+        tiers; pruning on it would purge every cached lower-tier file."""
+        _internal, public = await add(
+            pypi_upstream("internal", "https://a.upstream.test/simple", tier=1),
+            pypi_upstream("public", "https://b.upstream.test/simple", tier=2),
+        )
+        internal_route = respx.get("https://a.upstream.test/simple/widget/").mock(
+            return_value=httpx.Response(404)
+        )
+        respx.get("https://b.upstream.test/simple/widget/").mock(
+            return_value=httpx.Response(
+                200,
+                json=pypi_page("widget", [("widget-1.0.tar.gz", "https://b.upstream.test/w.tar.gz")]),
+                headers=PYPI_JSON,
+            )
+        )
+        accept = {"accept": "application/vnd.pypi.simple.v1+json"}
+        assert (await app_client.get("/pypi/simple/widget/", headers=accept)).status_code == 200
+        assert await stored_files("widget") == {"widget-1.0.tar.gz"}
+
+        # The internal index now answers 200 with an empty page.
+        internal_route.mock(
+            return_value=httpx.Response(200, json=pypi_page("widget", []), headers=PYPI_JSON)
+        )
+        await expire("widget", Ecosystem.pypi)
+        assert (await app_client.get("/pypi/simple/widget/", headers=accept)).status_code == 200
+        assert await stored_files("widget") == {"widget-1.0.tar.gz"}
+        assert public is not None
 
     @respx.mock
     async def test_deleting_an_upstream_keeps_local_versions(self, app_client):  # noqa: F811
@@ -641,7 +681,7 @@ class TestUpstreamChangesInvalidate:
         assert await stored_versions("mixed") == {"1.0.0"}
 
     @respx.mock
-    async def test_disabling_one_index_keeps_the_others_files(self, app_client):  # noqa: F811
+    async def test_deleting_one_index_keeps_the_others_files(self, app_client):  # noqa: F811
         a, b = await add(
             pypi_upstream("a", "https://a.upstream.test/simple", priority=1),
             pypi_upstream("b", "https://b.upstream.test/simple", priority=2),
@@ -672,9 +712,15 @@ class TestUpstreamChangesInvalidate:
             "widget-1.0-py3-none-any.whl", "widget-1.0.tar.gz", "widget-2.0.tar.gz"
         }
 
+        # Disabling b is a pause: nothing is removed.
         await app_client.patch(
             f"/api/admin/upstreams/{b}", json={"enabled": False}, headers=auth(app_client, "admin")
         )
+        assert await stored_files("widget") == {
+            "widget-1.0-py3-none-any.whl", "widget-1.0.tar.gz", "widget-2.0.tar.gz"
+        }
+        # Deleting b removes only what b alone supplied.
+        await app_client.delete(f"/api/admin/upstreams/{b}", headers=auth(app_client, "admin"))
         assert await stored_files("widget") == {"widget-1.0-py3-none-any.whl"}
         assert await stored_versions("widget", Ecosystem.pypi) == {"1.0"}
         async with db_module.session_scope() as session:

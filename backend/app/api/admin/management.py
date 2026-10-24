@@ -590,13 +590,11 @@ async def update_upstream(
     upstream.last_error = None
 
     routing_changes = set(changes) - _PRESENTATION_FIELDS
-    retired = 0
     if routing_changes:
-        if changes.get("enabled") is False:
-            # Disabling is what an operator does to a compromised upstream:
-            # what it alone supplied stops being served now, artifacts
-            # included, not after each package's TTL runs out.
-            retired = await retire_upstream_content(session, upstream)
+        # Disabling is a pause: fetches stop, what is cached keeps being
+        # served. Removing what an upstream alone supplied is what deleting
+        # it does (delete_upstream), because a one-click toggle used for
+        # maintenance must never destroy data re-enabling cannot restore.
         await mark_ecosystem_stale(
             session,
             upstream.ecosystem,
@@ -614,7 +612,6 @@ async def update_upstream(
         detail={
             "name": upstream.name,
             "changes": changes,
-            **({"retired_versions": retired} if retired else {}),
         },
     )
     await session.commit()

@@ -198,7 +198,15 @@ async function reindex(upstream) {
 }
 
 async function remove(upstream) {
-  if (!confirm(`Delete upstream "${upstream.name}"? Cached packages are kept.`)) return
+  if (
+    !confirm(
+      `Delete upstream "${upstream.name}"?\n\n` +
+        'Versions and cached files that only this upstream supplied are removed now, and ' +
+        'installs pinned to them will fail. Locally published packages are kept.\n\n' +
+        'To pause it without losing anything, disable it instead.'
+    )
+  )
+    return
   error.value = null
   message.value = null
   busy.value = upstream.id

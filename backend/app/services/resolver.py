@@ -145,11 +145,25 @@ async def live_sources(
     for ``name`` right now.
 
     Health is deliberately ignored: a quarantined upstream is unavailable,
-    not gone, and what it supplied keeps being served. Only configuration --
-    disabled, deleted, or no longer claiming the name -- makes a source dead.
+    not gone, and what it supplied keeps being served. Disabled upstreams
+    count too, at their configured tier. Only deletion or no longer claiming
+    the name makes a source dead.
     """
     upstreams = claimants_for(await load_upstreams(session, ecosystem), name, ecosystem)
-    return {u.id: u.tier for u in upstreams}
+    live = {u.id: u.tier for u in upstreams}
+    # A disabled upstream is paused, not gone: what it supplied keeps being
+    # served from the cache until an operator deletes the upstream. Treating
+    # disable as removal turned a routine toggle (maintenance, a flaky index,
+    # a token rotation) into permanent loss of every version only it served,
+    # which re-enabling could not bring back for anything upstream had since
+    # dropped.
+    everyone = claimants_for(
+        await load_upstreams(session, ecosystem, enabled_only=False), name, ecosystem
+    )
+    for upstream in everyone:
+        if not upstream.enabled:
+            live.setdefault(upstream.id, upstream.tier)
+    return live
 
 
 def group_by_tier(upstreams: list[Upstream]) -> list[tuple[int, list[Upstream]]]:

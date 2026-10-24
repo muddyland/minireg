@@ -522,14 +522,14 @@ async def prune_unsourced(
 ) -> bool:
     """Drop upstream versions and files nothing may serve any more.
 
-    Versions used to be permanent once persisted. Disabling a compromised
+    Versions used to be permanent once persisted. Deleting a compromised
     upstream left every version it had supplied in the packument and the
     simple page, and an internal tier that recovered from an outage never
     displaced what a public tier had answered in the meantime. A non-local
     version or file goes when its source upstream is
 
-    * no longer a live source for this name -- disabled, deleted, or no
-      longer claiming it (``resolver.live_sources``); or
+    * no longer a source for this name -- deleted, or no longer claiming it
+      (``resolver.live_sources``; a disabled upstream is paused, not gone); or
     * ranked below the tier that just answered, and absent from that answer
       (``answer``/``answered_tier``, given only after a successful resolve).
 
@@ -548,6 +548,12 @@ async def prune_unsourced(
     from .resolver import live_sources
 
     live = await live_sources(session, ecosystem, package.normalized_name)
+    if answer is not None and not answer.versions:
+        # A tier that answers 200 with nothing (an empty simple page, a
+        # proxy with no copy yet) says nothing about what lower tiers hold;
+        # displacing on it would purge every cached lower-tier file.
+        answer = None
+        answered_tier = None
     present_versions: set[str] | None = None
     present_files: set[str] | None = None
     if answer is not None:
