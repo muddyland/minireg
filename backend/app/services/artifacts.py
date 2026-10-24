@@ -574,7 +574,7 @@ async def _tail_peer(key: str, promised: int) -> AsyncIterator[bytes]:
             async for chunk in _from_blob(sha, promised):
                 yield chunk
             return
-        partials = store.partials_for(key)
+        partials = store.partials_for(key, live_within=PEER_STALL_SECONDS)
         if partials:
             token, path = partials[0]
             break

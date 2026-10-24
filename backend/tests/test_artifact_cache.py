@@ -726,3 +726,20 @@ async def test_blobs_from_a_disabled_upstream_are_not_evicted(store, monkeypatch
     await artifacts.enforce_quota()
     assert store.exists(paused)
     assert not store.exists(live)
+
+
+def test_a_crashed_downloads_partial_is_not_tailed(store):
+    """A partial with no marker that stopped growing belongs to a process
+    that died; a reader must pick the live one, not wait out the stall."""
+    store.partial_dir.mkdir(parents=True, exist_ok=True)
+    dead = store.partial_dir / "file-7.deadtoken"
+    live = store.partial_dir / "file-7.livetoken"
+    dead.write_bytes(b"half")
+    live.write_bytes(b"growing")
+    old = time.time() - artifacts.PEER_STALL_SECONDS - 60
+    os.utime(dead, (old, old))
+
+    picked = store.partials_for("file-7", live_within=artifacts.PEER_STALL_SECONDS)
+    assert [token for token, _ in picked] == ["livetoken"]
+    # Without the filter both are listed, newest first.
+    assert [token for token, _ in store.partials_for("file-7")] == ["livetoken", "deadtoken"]

@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -187,18 +188,34 @@ class BlobStore:
         except OSError:
             return None
 
-    def partials_for(self, key: str) -> list[tuple[str, Path]]:
-        """``(token, path)`` of every unfinished partial file for ``key``."""
-        found = []
+    def partials_for(self, key: str, *, live_within: float | None = None) -> list[tuple[str, Path]]:
+        """``(token, path)`` of every unfinished partial file for ``key``,
+        most recently written first.
+
+        ``live_within`` drops partials not written to for that many seconds:
+        a process that crashed mid-download leaves its partial behind with no
+        marker, and a reader that picked it would wait out the whole stall
+        timeout instead of the live download beside it.
+        """
+        found: list[tuple[float, str, Path]] = []
+        now = time.time()
         with contextlib.suppress(OSError):
             for entry in self.partial_dir.glob(f"{key}.*"):
                 name = entry.name
                 if name.endswith(".done"):
                     continue
                 token = name[len(key) + 1 :]
-                if not self.marker_path(key, token).exists():
-                    found.append((token, entry))
-        return found
+                if self.marker_path(key, token).exists():
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                if live_within is not None and now - mtime > live_within:
+                    continue
+                found.append((mtime, token, entry))
+        found.sort(key=lambda item: item[0], reverse=True)
+        return [(token, entry) for _, token, entry in found]
 
     def finished_for(self, key: str) -> str | None:
         """sha256 of a successful fill of ``key`` whose blob is still stored."""
