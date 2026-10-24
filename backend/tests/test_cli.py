@@ -12,6 +12,7 @@ import pathlib
 import sys
 from datetime import UTC, datetime, timedelta
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
@@ -1347,3 +1348,175 @@ class TestAuditChunking:
         assert [f["name"] for f in merged["findings"]] == ["a", "b"]  # worst first
         assert merged["unscanned_total"] == 1
         assert merged["checked"] == 520
+
+
+def _found(root):
+    return {path.name: [p["name"] for p in pkgs] for path, _eco, pkgs in cli.discover(root)}
+
+
+class TestEveryRequirementsFileIsAudited:
+    """requirements-dev.txt and friends used to be ignored outright, so a CVE
+    in a test-only dependency -- which still runs in CI, with CI's
+    credentials -- never showed up in an audit."""
+
+    def test_dev_requirements_are_reported_separately(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("requests==2.31.0\n")
+        (tmp_path / "requirements-dev.txt").write_text("pytest==8.0.0\n")
+        (tmp_path / "requirements_test.txt").write_text("coverage==7.4.0\n")
+        assert _found(tmp_path) == {
+            "requirements.txt": ["requests"],
+            "requirements-dev.txt": ["pytest"],
+            "requirements_test.txt": ["coverage"],
+        }
+
+    def test_requirements_txt_is_still_reported_first(self, tmp_path):
+        (tmp_path / "requirements-dev.txt").write_text("pytest==8.0.0\n")
+        (tmp_path / "requirements.txt").write_text("requests==2.31.0\n")
+        names = [path.name for path, _eco, _pkgs in cli.discover(tmp_path)]
+        assert names == ["requirements.txt", "requirements-dev.txt"]
+
+    def test_an_audited_include_is_not_counted_twice(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("requests==2.31.0\n")
+        dev = tmp_path / "requirements-dev.txt"
+        dev.write_text("-r requirements.txt\npytest==8.0.0\n")
+        found = _found(tmp_path)
+        assert found["requirements.txt"] == ["requests"]
+        assert found["requirements-dev.txt"] == ["pytest"]
+        assert any("requirements.txt" in note for note in cli.REQUIREMENT_NOTES[dev])
+
+    def test_other_includes_are_merged_once(self, tmp_path):
+        (tmp_path / "common.txt").write_text("urllib3==2.2.0\n")
+        (tmp_path / "requirements-dev.txt").write_text("-r common.txt\npytest==8.0.0\n")
+        (tmp_path / "requirements-test.txt").write_text(
+            "--requirement=common.txt\ncoverage==7.4.0\n"
+        )
+        found = _found(tmp_path)
+        assert found["requirements-dev.txt"] == ["urllib3", "pytest"]
+        assert found["requirements-test.txt"] == ["coverage"]
+        assert "common.txt" not in found
+
+    def test_include_cycles_and_outside_files_are_safe(self, tmp_path):
+        project = tmp_path / "project"
+        project.mkdir()
+        (tmp_path / "outside.txt").write_text("evil==1.0\n")
+        (project / "a.txt").write_text("-r requirements.txt\nidna==3.6\n")
+        req = project / "requirements.txt"
+        req.write_text("-r a.txt\n-r ../outside.txt\nrequests==2.31.0\nrequests==2.31.0\n")
+        assert cli.parse_requirements(req) == [
+            {"name": "idna", "version": "3.6"},
+            {"name": "requests", "version": "2.31.0"},
+        ]
+        assert any("outside.txt" in note for note in cli.REQUIREMENT_NOTES[req])
+
+    def test_a_single_file_argument_merges_its_includes(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("requests==2.31.0\n")
+        dev = tmp_path / "requirements-dev.txt"
+        dev.write_text("-r requirements.txt\npytest==8.0.0\n")
+        assert [p["name"] for p in cli.parse_requirements(dev)] == ["requests", "pytest"]
+
+
+def _cli_env(tmp_path, monkeypatch, token):
+    monkeypatch.delenv("MINIREG_TOKEN", raising=False)
+    monkeypatch.delenv("MINIREG_URL", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cli.save_config({"registry": "http://reg", "token": token})
+
+
+class TestRejectedTokenMessage:
+    """A stored token the server refuses has expired or been revoked. Saying
+    "not logged in" sent people hunting for a missing config file."""
+
+    def _setup(self, tmp_path, monkeypatch, token="stored-token"):
+        _cli_env(tmp_path, monkeypatch, token)
+
+        def rejecting_api(*_a, **_k):
+            raise cli.ApiError(401, "invalid token")
+
+        monkeypatch.setattr(cli, "api", rejecting_api)
+
+    def _run(self, capsys, argv):
+        args = cli.build_parser().parse_args(argv)
+        with pytest.raises(SystemExit) as exc:
+            args.func(args)
+        assert exc.value.code == 1
+        return capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["search", "lodash", "--ecosystem", "npm"],
+            ["info", "lodash", "--ecosystem", "npm"],
+            ["configure", "npm"],
+            ["whoami"],
+        ],
+    )
+    def test_stored_token_is_called_expired_not_missing(
+        self, tmp_path, monkeypatch, capsys, argv
+    ):
+        self._setup(tmp_path, monkeypatch)
+        err = self._run(capsys, argv)
+        assert "invalid, expired or revoked" in err
+        assert "minireg login" in err
+        assert "not logged in" not in err
+
+    def test_audit_says_the_same(self, tmp_path, monkeypatch, capsys):
+        self._setup(tmp_path, monkeypatch)
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "requirements.txt").write_text("requests==2.31.0\n")
+        err = self._run(capsys, ["audit", str(project)])
+        assert "invalid, expired or revoked" in err
+
+    def test_an_env_token_is_named(self, tmp_path, monkeypatch, capsys):
+        self._setup(tmp_path, monkeypatch)
+        monkeypatch.setenv("MINIREG_TOKEN", "from-ci")
+        err = self._run(capsys, ["search", "x", "--ecosystem", "npm"])
+        assert "MINIREG_TOKEN" in err
+
+    def test_no_token_at_all_is_still_not_logged_in(self, tmp_path, monkeypatch, capsys):
+        self._setup(tmp_path, monkeypatch, token=None)
+        err = self._run(capsys, ["configure", "npm"])
+        assert "not logged in" in err
+
+
+class TestInfoLooksInEveryEcosystem:
+    """`minireg info requests` answered "not found in npm" and left the user
+    to guess the flag."""
+
+    def _setup(self, tmp_path, monkeypatch, found_in):
+        _cli_env(tmp_path, monkeypatch, "tok")
+        calls = []
+
+        def fake_api(_registry, path, *_a, **_k):
+            calls.append(path)
+            ecosystem = path.split("/")[3]
+            if ecosystem != found_in:
+                raise cli.ApiError(404, "package not found")
+            return {"name": "requests", "ecosystem": ecosystem, "versions": []}
+
+        monkeypatch.setattr(cli, "api", fake_api)
+        return calls
+
+    def test_falls_back_to_pypi_and_says_so(self, tmp_path, monkeypatch, capsys):
+        calls = self._setup(tmp_path, monkeypatch, found_in="pypi")
+        args = cli.build_parser().parse_args(["info", "requests"])
+        assert cli.cmd_info(args) == 0
+        assert [c.split("/")[3] for c in calls] == ["npm", "pypi"]
+        captured = capsys.readouterr()
+        assert "found in pypi" in captured.err
+        assert "requests" in captured.out
+
+    def test_explicit_ecosystem_miss_hints_at_the_others(self, tmp_path, monkeypatch, capsys):
+        calls = self._setup(tmp_path, monkeypatch, found_in="cargo")
+        args = cli.build_parser().parse_args(["info", "requests", "--ecosystem", "npm"])
+        with pytest.raises(SystemExit):
+            cli.cmd_info(args)
+        assert len(calls) == 1
+        assert "--ecosystem pypi|cargo" in capsys.readouterr().err
+
+    def test_not_found_anywhere(self, tmp_path, monkeypatch, capsys):
+        self._setup(tmp_path, monkeypatch, found_in="nowhere")
+        args = cli.build_parser().parse_args(["info", "nothing-here"])
+        with pytest.raises(SystemExit):
+            cli.cmd_info(args)
+        assert "not found in npm, pypi or cargo" in capsys.readouterr().err

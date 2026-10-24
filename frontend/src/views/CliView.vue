@@ -152,12 +152,17 @@ minireg audit --json              # machine readable</pre>
           <EcosystemBadge ecosystem="pypi" label="poetry.lock" />
           <EcosystemBadge ecosystem="pypi" label="uv.lock" />
           <EcosystemBadge ecosystem="pypi" label="Pipfile.lock" />
-          <EcosystemBadge ecosystem="pypi" label="requirements.txt" />
+          <EcosystemBadge ecosystem="pypi" label="requirements.lock" />
+          <EcosystemBadge ecosystem="pypi" label="requirements-lock.txt" />
+          <EcosystemBadge ecosystem="pypi" label="requirements*.txt" />
           <EcosystemBadge ecosystem="cargo" label="Cargo.lock" />
         </div>
         <p class="field-hint">
           Only pinned versions can be audited — a range like <code>&gt;=4.0</code> has no single
-          version to check, so it is skipped and counted as unscanned.
+          version to check, so it is skipped and reported as unpinned. Every
+          <code>requirements*.txt</code> (<code>-dev</code>, <code>-test</code>, …) is reported on
+          its own, and <code>-r other.txt</code> includes in the same directory are followed
+          without counting a package twice.
         </p>
       </div>
     </div>
