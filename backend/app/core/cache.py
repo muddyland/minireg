@@ -254,3 +254,26 @@ async def rate_limit(
         return int(count) <= limit, max(0, limit - int(count))
     except Exception:
         return _local_rate_limit(key, limit, window) if fail_closed else (True, limit)
+
+
+async def cache_get_bytes(key: str) -> bytes | None:
+    """Raw cached bytes, for callers that serve them as-is.
+
+    A document stored serialised and returned serialised is never parsed back
+    into Python objects on a hit, which for a rendered packument was most of
+    the cost of serving it.
+    """
+    if _redis is None:
+        return None
+    try:
+        raw = await _redis.get(key)
+    except Exception:
+        return None
+    return bytes(raw) if raw is not None else None
+
+
+async def cache_set_bytes(key: str, value: bytes, ttl: int) -> None:
+    if _redis is None:
+        return
+    with contextlib.suppress(Exception):
+        await _redis.set(key, value, ex=ttl)

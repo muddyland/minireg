@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 import logging
+import tarfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from ..config import settings
 from ..core.naming import is_valid_npm_name, is_valid_semver, npm_tarball_filename
+from .storage import Digests
 
 log = logging.getLogger(__name__)
 
@@ -207,3 +210,113 @@ def publish_ok_response(name: str, version: str | None = None) -> dict:
         "rev": f"{int(datetime.now(UTC).timestamp())}-{version or 'meta'}",
         "success": True,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Tarball checks that run before a single byte is stored
+# --------------------------------------------------------------------------- #
+def digest_tarball(data: bytes) -> Digests:
+    """Every digest the publish path checks or records, from bytes in memory."""
+    digests = Digests()
+    digests.update(data)
+    return digests
+
+
+def verify_declared_digests(version: str, meta: dict, digests: Digests) -> None:
+    """Reject a publish whose ``dist`` disagrees with its own tarball.
+
+    ``shasum`` and ``integrity`` are both optional, and the values we serve
+    are always recomputed from the stored bytes. A declared value that does
+    not match is still refused rather than silently corrected: it means the
+    client packed one thing and uploaded another, and the user should hear
+    about it at publish time, not when a lockfile written against the
+    declared digest fails with EINTEGRITY.
+    """
+    declared = meta.get("dist") or {}
+    if not isinstance(declared, dict):
+        return
+
+    shasum = declared.get("shasum")
+    actual_sha1 = digests.sha1.hexdigest()
+    if isinstance(shasum, str) and shasum and shasum.lower() != actual_sha1:
+        raise PublishError(
+            f"shasum mismatch for {version}: declared {shasum}, got {actual_sha1}"
+        )
+
+    integrity = declared.get("integrity")
+    if not isinstance(integrity, str) or not integrity.strip():
+        return
+    actual = {
+        "sha512": digests.sha512.digest(),
+        "sha256": digests.sha256.digest(),
+        "sha1": digests.sha1.digest(),
+    }
+    for token in integrity.split():
+        algorithm, sep, rest = token.partition("-")
+        if not sep or algorithm not in actual:
+            # An algorithm we do not compute (sha384) proves nothing either way.
+            continue
+        encoded = rest.split("?", 1)[0]
+        try:
+            claimed = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            claimed = b""
+        if claimed != actual[algorithm]:
+            expected = "sha512-" + base64.b64encode(actual["sha512"]).decode()
+            raise PublishError(
+                f"integrity mismatch for {version}: declared {token}, got {expected}"
+            )
+
+
+#: Lifecycle scripts that make npm run code at install time.
+INSTALL_SCRIPTS = ("preinstall", "install", "postinstall")
+#: Most tar members we look at for ``binding.gyp`` before giving up.
+_MAX_TAR_MEMBERS = 10_000
+
+
+def tarball_has_binding_gyp(data: bytes) -> bool:
+    """Whether the package root holds ``binding.gyp``.
+
+    npm runs ``node-gyp rebuild`` for such a package even with no install
+    script declared, and the public registry counts it as one. The tarball is
+    already in memory; this reads member headers in stream mode and stops at
+    the first hit. A tarball we cannot read answers False -- the metadata
+    flag is not the place to refuse a publish.
+    """
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r|*") as archive:
+            for count, member in enumerate(archive):
+                if count >= _MAX_TAR_MEMBERS:
+                    return False
+                parts = [p for p in member.name.split("/") if p and p != "."]
+                # npm packs everything under one top-level directory,
+                # conventionally `package/`.
+                if len(parts) == 2 and parts[1] == "binding.gyp" and member.isfile():
+                    return True
+    except (tarfile.TarError, OSError, EOFError, ValueError):
+        return False
+    return False
+
+
+def has_install_script(meta: dict, data: bytes) -> bool:
+    scripts = meta.get("scripts")
+    if isinstance(scripts, dict) and any(
+        isinstance(scripts.get(name), str) and scripts[name].strip()
+        for name in INSTALL_SCRIPTS
+    ):
+        return True
+    return tarball_has_binding_gyp(data)
+
+
+def annotate_install_script(meta: dict, data: bytes) -> None:
+    """Set ``hasInstallScript`` the way the public registry does.
+
+    Computed, never taken from the client: it is the flag the abbreviated
+    packument uses to tell an installer that this version runs code, so a
+    publisher must not be able to clear it. Absent rather than false when
+    there is nothing to run, matching registry.npmjs.org.
+    """
+    if has_install_script(meta, data):
+        meta["hasInstallScript"] = True
+    else:
+        meta.pop("hasInstallScript", None)

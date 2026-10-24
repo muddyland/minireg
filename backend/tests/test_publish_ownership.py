@@ -280,19 +280,30 @@ class TestVersionsAreNotReusable:
 
 
 class TestPublishIntegrity:
-    async def test_integrity_is_recomputed_not_trusted(self, env):
+    async def test_wrong_declared_integrity_is_refused(self, env):
         client, tokens = env
         body = publish_body("internal-lib", "1.0.0")
         body["versions"]["1.0.0"]["dist"] = {"integrity": "sha512-" + "A" * 86}
         response = await as_user(client, tokens["alice"]).put("/npm/internal-lib", json=body)
+        # A wrong SRI string would make the version permanently uninstallable
+        # with EINTEGRITY; it is refused like a wrong shasum, not stored.
+        assert response.status_code == 400
+        assert "integrity mismatch" in response.json()["error"]
+        assert (await client.get("/npm/internal-lib")).status_code == 404
+
+    async def test_integrity_served_is_recomputed(self, env):
+        import hashlib
+
+        client, tokens = env
+        tarball = b"tarball-for-internal-lib-1.0.0"
+        sri = "sha512-" + base64.b64encode(hashlib.sha512(tarball).digest()).decode()
+        body = publish_body("internal-lib", "1.0.0", tarball=tarball)
+        body["versions"]["1.0.0"]["dist"] = {"integrity": sri}
+        response = await as_user(client, tokens["alice"]).put("/npm/internal-lib", json=body)
         assert response.status_code in (200, 201)
 
         document = (await client.get("/npm/internal-lib")).json()
-        served = document["versions"]["1.0.0"]["dist"]["integrity"]
-        # The client's claim is discarded: a wrong SRI string would make the
-        # version permanently uninstallable with EINTEGRITY.
-        assert served != "sha512-" + "A" * 86
-        assert served.startswith("sha512-")
+        assert document["versions"]["1.0.0"]["dist"]["integrity"] == sri
 
     async def test_dist_tag_naming_a_missing_version_is_dropped(self, env):
         client, tokens = env
