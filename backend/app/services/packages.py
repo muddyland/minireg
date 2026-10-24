@@ -595,6 +595,15 @@ async def prune_unsourced(
     if not doomed_versions and not doomed_files:
         return False
 
+    # Validators bound to an upstream whose rows were just removed would let
+    # a later 304 from it "confirm" a document missing those rows.
+    removed_sources = {f.upstream_id for _, f in doomed_files} | {
+        v.upstream_id for v in doomed_versions
+    } | {f.upstream_id for v in doomed_versions for f in v.files}
+    bound = Validators.decode(package.cached_etag)
+    if bound is not None and bound.upstream_id in removed_sources:
+        package.cached_etag = None
+
     for version_row, file_row in doomed_files:
         await purge_file(session, file_row)
         version_row.files.remove(file_row)
@@ -786,7 +795,8 @@ async def _settle(
 async def retire_upstream_content(session: AsyncSession, upstream: Upstream) -> int:
     """Remove every cached version and file whose only source is ``upstream``.
 
-    Called when an upstream is disabled or deleted. Marking packages stale is
+    Called when an upstream is deleted (disabling is a pause and keeps
+    everything). Marking packages stale is
     not enough on its own: a client installing from a lockfile asks for the
     tarball directly and never re-reads the metadata, so a compromised
     upstream's cached artifacts would keep being served. Locally published
@@ -823,8 +833,16 @@ async def retire_upstream_content(session: AsyncSession, upstream: Upstream) -> 
             )
         ).scalars()
     )
+    affected: set[int] = set()
     for start in range(0, len(doomed), 500):
         chunk = doomed[start : start + 500]
+        affected.update(
+            (
+                await session.execute(
+                    select(PackageVersion.package_id).where(PackageVersion.id.in_(chunk)).distinct()
+                )
+            ).scalars()
+        )
         await session.execute(
             sa_delete(PackageVulnerability).where(PackageVulnerability.version_id.in_(chunk))
         )
@@ -846,6 +864,46 @@ async def retire_upstream_content(session: AsyncSession, upstream: Upstream) -> 
             .where(PackageFile.version_id == PackageVersion.id)
             .scalar_subquery()
         )
+        .execution_options(synchronize_session=False)
+    )
+    # Tags and latest_version must not name what was just removed; the next
+    # refresh (the ecosystem is marked stale) re-derives them.
+    affected_ids = sorted(affected)
+    for start in range(0, len(affected_ids), 500):
+        chunk = affected_ids[start : start + 500]
+        await session.execute(
+            sa_delete(DistTag)
+            .where(
+                DistTag.package_id.in_(chunk),
+                ~select(PackageVersion.id)
+                .where(
+                    PackageVersion.package_id == DistTag.package_id,
+                    PackageVersion.version == DistTag.version,
+                )
+                .exists(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await session.execute(
+            sa_update(Package)
+            .where(
+                Package.id.in_(chunk),
+                ~select(PackageVersion.id)
+                .where(
+                    PackageVersion.package_id == Package.id,
+                    PackageVersion.version == Package.latest_version,
+                )
+                .exists(),
+            )
+            .values(latest_version=None)
+            .execution_options(synchronize_session=False)
+        )
+    # A 304 from this upstream's validators would otherwise "confirm" a
+    # document whose versions were just removed.
+    await session.execute(
+        sa_update(Package)
+        .where(Package.cached_etag.startswith(bound_prefix(uid), autoescape=True))
+        .values(cached_etag=None)
         .execution_options(synchronize_session=False)
     )
     if doomed:

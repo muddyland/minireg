@@ -680,6 +680,43 @@ class TestUpstreamChangesInvalidate:
         assert resp.status_code == 200
         assert await stored_versions("mixed") == {"1.0.0"}
 
+    async def test_deleting_an_upstream_clears_its_tags_latest_and_validators(self, app_client):  # noqa: F811
+        """What named the removed versions must go with them, or a dist-tag
+        points at nothing and a 304 from stale validators "confirms" a
+        document whose versions are gone."""
+        from app.models import DistTag
+        from app.upstreams.revalidation import Validators
+
+        (uid,) = await add(npm_upstream("only", "https://upstream.test"))
+        async with db_module.session_scope() as session:
+            package = Package(
+                ecosystem=Ecosystem.npm, name="gone", normalized_name="gone",
+                is_local=False, keywords=[], latest_version="2.0.0",
+                cached_etag=Validators(upstream_id=uid, etag='"abc"').encode(),
+            )
+            session.add(package)
+            await session.flush()
+            session.add(
+                PackageVersion(
+                    package_id=package.id, version="2.0.0", normalized_version="2.0.0",
+                    upstream_id=uid, metadata_json={"name": "gone", "version": "2.0.0"},
+                )
+            )
+            session.add(DistTag(package_id=package.id, tag="latest", version="2.0.0"))
+
+        resp = await app_client.delete(f"/api/admin/upstreams/{uid}", headers=auth(app_client, "admin"))
+        assert resp.status_code == 200
+        async with db_module.session_scope() as session:
+            row = (
+                await session.execute(
+                    select(Package.latest_version, Package.cached_etag).where(Package.name == "gone")
+                )
+            ).one()
+            tags = (await session.execute(select(DistTag.tag))).scalars().all()
+        assert row.latest_version is None
+        assert row.cached_etag is None
+        assert tags == []
+
     @respx.mock
     async def test_deleting_one_index_keeps_the_others_files(self, app_client):  # noqa: F811
         a, b = await add(
