@@ -173,15 +173,20 @@ async def ensure_documents(session: AsyncSession, package: Package) -> None:
     }
     if not missing:
         return
-    rows = await session.execute(
-        select(PackageVersion.id, PackageVersion.metadata_json).where(
-            PackageVersion.package_id == package.id
+    # Only the versions actually missing: after a refresh that rewrote one
+    # version of playwright, selecting every row would pull 5,600 documents
+    # to fill in one.
+    ids = list(missing)
+    for start in range(0, len(ids), 1000):
+        rows = await session.execute(
+            select(PackageVersion.id, PackageVersion.metadata_json).where(
+                PackageVersion.id.in_(ids[start : start + 1000])
+            )
         )
-    )
-    for version_id, metadata in rows:
-        row = missing.get(version_id)
-        if row is not None:
-            set_committed_value(row, "metadata_json", metadata if metadata is not None else {})
+        for version_id, metadata in rows:
+            set_committed_value(
+                missing[version_id], "metadata_json", metadata if metadata is not None else {}
+            )
 
 
 def _expired(cached_at: datetime | None) -> bool:

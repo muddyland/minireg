@@ -590,17 +590,6 @@ async def update_upstream(
     upstream.last_error = None
 
     routing_changes = set(changes) - _PRESENTATION_FIELDS
-    if routing_changes:
-        # Disabling is a pause: fetches stop, what is cached keeps being
-        # served. Removing what an upstream alone supplied is what deleting
-        # it does (delete_upstream), because a one-click toggle used for
-        # maintenance must never destroy data re-enabling cannot restore.
-        await mark_ecosystem_stale(
-            session,
-            upstream.ecosystem,
-            forget_validators_of=upstream.id if routing_changes & _ORIGIN_FIELDS else None,
-        )
-
     await audit.record_audit(
         session,
         audit.UPSTREAM_UPDATED,
@@ -614,8 +603,23 @@ async def update_upstream(
             "changes": changes,
         },
     )
+    # Commit the Upstream row on its own before touching packages. Marking
+    # the ecosystem stale locks every package row in it; a concurrent
+    # metadata fetch holds its package row and then writes health onto this
+    # Upstream row. Holding both here, in the opposite order, is a deadlock
+    # Postgres resolves by failing one side.
     await session.commit()
     if routing_changes:
+        # Disabling is a pause: fetches stop, what is cached keeps being
+        # served. Removing what an upstream alone supplied is what deleting
+        # it does (delete_upstream), because a one-click toggle used for
+        # maintenance must never destroy data re-enabling cannot restore.
+        await mark_ecosystem_stale(
+            session,
+            upstream.ecosystem,
+            forget_validators_of=upstream.id if routing_changes & _ORIGIN_FIELDS else None,
+        )
+        await session.commit()
         await invalidate_ecosystem_cache(upstream.ecosystem)
     return upstream_payload(upstream)
 

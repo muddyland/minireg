@@ -151,7 +151,9 @@ async def _refresh_if_stale(
     ).first()
     if row is not None and not packages.is_stale(row):
         return None
-    return await packages.fetch_package(session, ECOSYSTEM, name)
+    # Callers reload the row lean and read only ``from_upstream``; loading
+    # the packument here would put it in the identity map for nothing.
+    return await packages.fetch_package(session, ECOSYSTEM, name, with_documents=False)
 
 
 async def _lean_package(

@@ -8,6 +8,7 @@ import respx
 from app.api import cargo, npm, pypi
 
 from .test_integration import app_client, auth  # noqa: F401
+from .test_npm_protocol import audited  # noqa: F401
 from .test_proxy import mock_npm_upstream
 
 
@@ -181,3 +182,51 @@ async def test_guard_still_refuses_a_proxied_name_that_resolves_privately(
             upstream_url="https://registry.npmjs.org",
             backend=netguard.PinnedBackend(),
         )
+
+
+@respx.mock
+async def test_stale_dist_tag_refresh_does_not_select_the_packument(audited):  # noqa: F811
+    """A stale dist-tag request refreshes from upstream, but the handler
+    only reads tags: the refresh must not load the stored packument."""
+    import httpx
+    from sqlalchemy import update
+
+    from app import db as db_module
+    from app.models import Ecosystem, Package, Upstream, UpstreamKind
+
+    from .test_npm_protocol import VERSION_COUNT
+    from .test_query_footprint import SqlRecorder
+
+    async with db_module.session_scope() as session:
+        session.add(
+            Upstream(
+                name="mock-npm", ecosystem=Ecosystem.npm, kind=UpstreamKind.npm,
+                url="https://upstream.test", tier=1, enabled=True,
+            )
+        )
+        await session.execute(
+            update(Package).where(Package.name == "playwright").values(cached_at=None)
+        )
+    versions = {
+        f"1.0.{i}": {
+            "name": "playwright",
+            "version": f"1.0.{i}",
+            "dist": {"tarball": f"https://upstream.test/playwright/-/playwright-1.0.{i}.tgz",
+                     "shasum": "0" * 40},
+        }
+        for i in range(VERSION_COUNT)
+    }
+    respx.get("https://upstream.test/playwright").mock(
+        return_value=httpx.Response(
+            200,
+            json={"name": "playwright", "dist-tags": {"latest": f"1.0.{VERSION_COUNT - 1}"},
+                  "versions": versions},
+        )
+    )
+    with SqlRecorder() as sql:
+        tags = await audited.get(
+            "/npm/-/package/playwright/dist-tags", headers=auth(audited, "reader")
+        )
+    assert tags.status_code == 200, tags.text
+    assert not sql.selects_touching("cached_document"), sql.selects_touching("cached_document")
+    assert not sql.selects_touching("metadata_json"), sql.selects_touching("metadata_json")
