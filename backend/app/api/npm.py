@@ -737,7 +737,7 @@ async def get_tarball(
         "content-length": str(size),
         # Artifacts are immutable, so let clients and proxies keep them forever.
         "cache-control": "public, max-age=31536000, immutable",
-        "etag": f'"{file_row.blob_sha256}"',
+        **_artifact_etag(file_row),
     }
     return StreamingResponse(
         chunks, media_type=content_type or "application/octet-stream", headers=headers
@@ -1712,3 +1712,14 @@ async def _blocked_from_rows(policy: PolicyEngine, normalized: str, rows) -> set
         if verdict.blocked:
             blocked.add(version_row.version)
     return blocked
+
+
+def _artifact_etag(file_row) -> dict[str, str]:
+    """ETag for an immutable artifact, or nothing while its digest is unknown.
+
+    A response streamed while the upstream download is still running has no
+    ``blob_sha256`` yet; sending ``etag: "None"`` would let a client cache
+    every such response under one validator.
+    """
+    digest = file_row.blob_sha256 or file_row.sha256
+    return {"etag": f'"{digest}"'} if digest else {}
