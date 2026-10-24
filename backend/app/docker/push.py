@@ -40,7 +40,7 @@ from ..models import (
 from . import manifest as mf
 from .auth import RegistryIdentity
 from .errors import RegistryError
-from .naming import Target, is_digest
+from .naming import Target, is_digest, is_tag
 from .registry import get_repo, link, set_tag, store_manifest
 from .store import get_oci_store
 
@@ -136,13 +136,24 @@ async def mount_blob(
 ) -> bool:
     """Cross-repository mount. Allowed only from a repository the caller can
     already read, and only for a blob that repository really holds."""
-    from .registry import blob_in_repo
+    from .policy import load_policy
+    from .registry import blob_in_repo, blob_pull_verdict
 
     if source is None or not get_oci_store().exists(digest):
         return False
     if source.quarantined:
         return False
     if not await blob_in_repo(session, source, digest):
+        return False
+    # A mount is a pull from the source: a layer that could not be fetched
+    # from there (every image naming it is blocked) must not be copied into
+    # the caller's own repository and fetched from that instead. Refusing
+    # makes the client upload the blob, which it can only do if it has it.
+    # Only a firm refusal counts: "not scanned yet" (a base image pushed a
+    # moment ago) is no reason to re-upload, and the image the layer lands
+    # in is scanned and judged on its own.
+    verdict = await blob_pull_verdict(session, source, digest, await load_policy(session))
+    if not verdict.allowed and verdict.code == "DENIED":
         return False
     await record_local_blob(session, digest, get_oci_store().size_of(digest) or 0)
     await add_repo_blob(session, repo, digest)
@@ -162,6 +173,14 @@ async def put_manifest(
 ) -> DockerManifest:
     from .registry import blob_in_repo
 
+    if not is_digest(reference) and not is_tag(reference):
+        # The spec's tag grammar. A tag outside it could never be pulled back
+        # (GET answers MANIFEST_UNKNOWN for one), and may not even be a name
+        # other tools can print safely.
+        raise RegistryError(
+            "TAG_INVALID",
+            f"invalid tag {reference[:140]!r}: tags match [a-zA-Z0-9_][a-zA-Z0-9._-]{{0,127}}",
+        )
     parsed = mf.parse(body, content_type)
     missing = []
     for ref in parsed.refs:

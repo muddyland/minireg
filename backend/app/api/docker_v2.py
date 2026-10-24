@@ -156,6 +156,13 @@ async def _token(request: Request, session: AsyncSession) -> Response:
         "expires_in": ttl,
         "issued_at": datetime.now(UTC).isoformat(),
     }
+    if request.method == "POST":
+        # The OAuth2 grant reports what was granted (RFC 6749 section 5.1,
+        # and the distribution token spec's POST response), which can be
+        # less than what was asked for.
+        body["scope"] = " ".join(
+            f"repository:{a['name']}:{','.join(a['actions'])}" for a in access
+        )
     await session.commit()
     return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
@@ -353,6 +360,16 @@ async def _get_manifest(
     _check_quarantine(ident, repo)
     served = await reg.get_manifest(session, target, repo, reference, head=head)
     manifest = served.manifest
+    if not _accepts(request.headers.get("accept"), manifest.media_type):
+        # The spec: a manifest in a format the client did not list is, for
+        # that client, not there. Serving it anyway hands an old client a
+        # document it cannot parse (an index to one that only reads
+        # single-platform manifests). No conversion or platform selection.
+        raise RegistryError(
+            "MANIFEST_UNKNOWN",
+            f"manifest {reference[:140]} is {manifest.media_type}, which the request's "
+            "Accept header does not include",
+        )
 
     if not ident.scanner:
         policy = await load_policy(session)
@@ -402,9 +419,37 @@ async def _get_manifest(
             "X-Minireg-Cache": served.source,
         }
     )
+    if served.source == "stale":
+        # The upstream could not be asked; this is the last good answer.
+        # X-Minireg-Cache says so to us, Warning says so to everything else.
+        headers["Warning"] = '110 - "Response is Stale"'
     if head:
         return Response(status_code=200, headers=headers)
     return Response(served.body, status_code=200, headers=headers, media_type=manifest.media_type)
+
+
+def _accepts(header: str | None, media_type: str) -> bool:
+    """Does an Accept header admit this media type?
+
+    No header, an empty one, ``*/*`` or ``application/*`` admit anything.
+    docker, containerd and podman list all four manifest types, so they are
+    unaffected; a client that lists only single-platform types is told an
+    index is not there rather than handed one. ``q=0`` excludes a type.
+    """
+    if not header or not header.strip():
+        return True
+    wanted = media_type.lower()
+    major = wanted.split("/", 1)[0]
+    for item in header.split(","):
+        kind, *params = (p.strip() for p in item.split(";"))
+        kind = kind.lower()
+        if not kind:
+            continue
+        if any(p.replace(" ", "").lower() in ("q=0", "q=0.0", "q=0.00", "q=0.000") for p in params):
+            continue
+        if kind in ("*/*", f"{major}/*", wanted):
+            return True
+    return False
 
 
 async def _maybe_scan(session: AsyncSession, repo: DockerRepository, manifest: DockerManifest, policy) -> None:
@@ -592,6 +637,20 @@ async def _get_blob(
                 }
             ),
         )
+
+    if not ident.scanner:
+        # The bytes of a layer are the image; they carry the verdicts of the
+        # manifests that name them. (HEAD only confirms existence, which a
+        # push needs, and is checked for membership in head_blob.)
+        verdict = await reg.blob_pull_verdict(session, repo, digest, await load_policy(session))
+        if not verdict.allowed:
+            bump("docker.blob.denied")
+            _log_download(
+                request, ident, target, reference=None, digest=digest, kind="file",
+                status=403 if verdict.code == "DENIED" else 503, started=started,
+            )
+            headers = {"Retry-After": str(verdict.retry_after)} if verdict.retry_after else None
+            raise RegistryError(verdict.code, verdict.reason or "blocked by policy", headers=headers)
 
     byte_range = _parse_range(request.headers.get("range"))
     blob = await reg.open_blob(session, target, repo, digest, byte_range=byte_range)
