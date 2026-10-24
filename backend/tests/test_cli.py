@@ -1552,3 +1552,33 @@ class TestInfoShowsBlockedVersions:
         assert "Blocked versions" in out
         assert "1.0.1" in out and "highest CVSS 9.8" in out
         assert "1.0.2" not in out.split("Blocked versions", 1)[1]
+
+
+class TestVersionNotes:
+    @pytest.mark.parametrize(
+        ("candidate", "current", "newer"),
+        [
+            ("1.4.0", "1.3.0", True),
+            ("1.3.0", "1.4.0", False),
+            ("1.10.0", "1.9.0", True),
+            ("1.4.0", "1.4.0", False),
+            ("2.0.0rc1", "1.9.9", True),
+            ("garbage", "1.0.0", False),
+        ],
+    )
+    def test_is_newer(self, candidate, current, newer):
+        assert cli._is_newer(candidate, current) is newer
+
+    def test_no_note_when_this_cli_is_newer_than_the_registrys(self, monkeypatch, capsys):
+        # A registry not yet upgraded must not tell a newer CLI to "update".
+        monkeypatch.setattr(cli, "_server_cli_version", "1.3.0")
+        monkeypatch.setattr(cli, "__version__", "1.4.0")
+        cli.warn_if_outdated()
+        assert "minireg update" not in capsys.readouterr().err
+
+    def test_note_when_the_registry_is_newer(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli, "_server_cli_version", "1.5.0")
+        monkeypatch.setattr(cli, "__version__", "1.4.0")
+        cli.warn_if_outdated()
+        captured = capsys.readouterr()
+        assert "minireg update" in captured.err + captured.out

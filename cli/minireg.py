@@ -1824,6 +1824,11 @@ def cmd_update(args):
     if latest == __version__ and not args.force:
         print(f"  {green('✓')} already up to date")
         return 0
+    if not _is_newer(latest, __version__) and not args.force:
+        # Never downgrade unasked: the registry may simply not be upgraded yet.
+        print(f"  {green('✓')} this CLI is newer than the registry's; nothing to do "
+              "(--force installs the registry's version)")
+        return 0
     if args.check:
         print(f"  {yellow('an update is available')} — run: minireg update")
         return 1
@@ -1871,6 +1876,28 @@ def cmd_update(args):
     return 0
 
 
+def _is_newer(candidate: str, current: str) -> bool:
+    """Whether release ``candidate`` is later than ``current``. Compares the
+    leading numeric fields; anything unparsable counts as not newer, so a
+    malformed header never nags."""
+
+    def key(version: str) -> tuple[int, ...] | None:
+        parts = []
+        for field in version.strip().split("."):
+            digits = ""
+            for ch in field:
+                if not ch.isdigit():
+                    break
+                digits += ch
+            if not digits:
+                break
+            parts.append(int(digits))
+        return tuple(parts) or None
+
+    a, b = key(candidate), key(current)
+    return a is not None and b is not None and a > b
+
+
 def warn_if_outdated():
     """One line, after the command has done its work.
 
@@ -1878,7 +1905,9 @@ def warn_if_outdated():
     request of its own and never fires for a command that did not talk to the
     registry.
     """
-    if not _server_cli_version or _server_cli_version == __version__:
+    if not _server_cli_version or not _is_newer(_server_cli_version, __version__):
+        # Equal, or this CLI is newer than the deployed one (a development
+        # build, or a registry not yet upgraded): "update" would downgrade.
         return
     info(
         dim(
