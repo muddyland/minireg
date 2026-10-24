@@ -1,13 +1,16 @@
 # minireg
 
-A caching **npm**, **PyPI** and **cargo** package registry with tiered
-upstreams, OIDC single sign-on, CVE-based blocking, an admin UI, and a CLI.
+A caching **npm**, **PyPI** and **cargo** package registry and an **OCI
+container registry**, with tiered upstreams, OIDC single sign-on, CVE-based
+blocking, an admin UI, and a CLI.
 
 The npm and PyPI APIs are implemented to spec, including publishing, so the
 real clients work unmodified: `npm install`, `npm publish`, `pip install`,
 `twine upload`, `uv`, and `poetry`. Cargo is supported as a **read-only
 mirror** — see [Spec compliance](#spec-compliance) for why publishing is not
-part of it.
+part of it. Container images are served on `/v2/` to the OCI distribution
+spec, so `docker pull`, `docker push`, Podman and containerd work too — see
+[Container images](docs/containers.md).
 
 ```bash
 cp .env.example .env     # set SECRET_KEY and PUBLIC_URL, then chmod 600 .env
@@ -53,6 +56,7 @@ documentation, matching the version actually running.
 | **[Using the registry](docs/usage.md)** | npm, pip, uv, poetry, twine, CI |
 | **[The CLI](docs/cli.md)** | Install, login, configure, audit |
 | **[Package policy](docs/policy.md)** | Block rules, version ranges, CVE thresholds |
+| **[Container images](docs/containers.md)** | Pulling, pushing, the Docker Hub mirror, Trivy scanning, image policy |
 | **[Operations](docs/operations.md)** | Monitoring, backups, scaling, tuning |
 | **[Troubleshooting](docs/troubleshooting.md)** | When something does not work |
 | **[API reference](docs/api.md)** | Every endpoint |
@@ -86,6 +90,12 @@ documentation, matching the version actually running.
   Enforced on metadata, downloads, and publishes, without exception.
 - **Audits everything.** Every login and admin action is recorded; every
   package request is logged with user, IP, size, and cache outcome.
+- **Serves container images.** An OCI distribution registry on `/v2/`: a
+  pull-through cache for Docker Hub, ghcr.io, Quay, registry.k8s.io or any
+  OCI registry (and a Docker Hub mirror for `daemon.json`), plus hosting for
+  images you push under `local/`. Every image is scanned with Trivy by the
+  separate scanner worker, which also records a CycloneDX SBOM, and the
+  image policy can refuse pulls by severity or known-exploited CVEs.
 - **Ships a CLI** that configures your package managers, audits a project's
   lockfile against the same CVE data the registry blocks with, and can rewrite
   your dependency declarations to versions that clear the findings.
@@ -193,13 +203,18 @@ cd backend
 python -m venv .venv
 .venv/bin/pip install --require-hashes -r requirements.lock   # what ships
 .venv/bin/pip install --no-deps -e .
-.venv/bin/pip install -r requirements-dev.txt                 # test + lint tools
-.venv/bin/python -m pytest          # 798 tests
+.venv/bin/pip install --require-hashes -r requirements-dev.lock  # test + lint tools
+.venv/bin/python -m pytest          # run from backend/
 
 # Frontend
 cd frontend
 npm install && npm run dev          # proxies to :8000
+npm ci && npm run build             # writes ../backend/app/static
 ```
+
+The backend serves the UI from `backend/app/static`, which is gitignored and
+built only by the Dockerfile. Run `npm run build` before starting the backend
+with `uvicorn` on its own, or it serves whatever bundle was last built there.
 
 Two directories matter. `pytest` must run from `backend/`, because
 `asyncio_mode` lives in `backend/pyproject.toml` and losing it makes every
@@ -245,7 +260,13 @@ the ones that matter for that job.
 
 - Artifact URLs come out of upstream metadata, so fetches are restricted to
   the upstream's own host plus an allowlist, never to a private or link-local
-  address, and re-checked on every redirect hop.
+  address, and re-checked on every redirect hop. Metadata and search requests
+  follow the same rules, and every direct connection is pinned to the address
+  that was checked, so DNS rebinding cannot redirect it.
+- Deleting an upstream removes what it alone supplied at once, artifacts
+  included (disabling one is a pause); and when a higher tier answers for a
+  name with versions, versions cached from a lower tier that it does not list
+  are dropped.
 - Credentials go only to the upstream's own origin, so a 302 to object storage
   cannot carry a GitLab token off-site.
 - A response naming a different package than the one requested is discarded.
@@ -255,7 +276,9 @@ the ones that matter for that job.
 **Credentials do not widen**
 
 - A token can never mint a token with scopes it does not itself hold; the same
-  applies to approving a CLI login.
+  applies to approving a CLI login. Listing and revoking tokens needs a
+  session or an admin-scoped token, so a leaked read-only token cannot
+  enumerate or revoke the others.
 - Argon2id password hashing; API tokens stored as SHA-256 of the secret half
   and shown exactly once. Upstream credentials encrypted at rest, never
   returned by the API.
@@ -267,6 +290,9 @@ the ones that matter for that job.
   an in-process counter rather than failing open if the cache is unreachable.
 - OIDC links to an existing local account only on a provider-verified email,
   and the login flow is bound to the browser that started it.
+- Writes authenticated by the session cookie are refused when the browser
+  marks them cross-site. HTML responses carry a Content-Security-Policy, and
+  HSTS is sent when `PUBLIC_URL` is https.
 - The CLI authenticates by OAuth device flow, so no password reaches the
   terminal and SSO works unchanged. The approval page does not accept a
   pre-filled code, which is what makes phishing one worthwhile.

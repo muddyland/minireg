@@ -10,6 +10,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import api from '@/api/client'
 import CodeBlock from '@/components/CodeBlock.vue'
+import { errorMessage } from '@/utils/errors'
 import { useAuthStore } from '@/stores/auth'
 import {
   SEVERITIES,
@@ -109,13 +110,19 @@ async function loadFindings() {
     findingsShown.value = 0
     return
   }
-  const data = await api.dockerFindings(digest.value, {
-    severity: filters.severity || undefined,
-    fixable: filters.fixable === '' ? undefined : filters.fixable,
-    kev: filters.kev === '' ? undefined : filters.kev,
-    q: filters.q || undefined,
-    limit: 500,
-  })
+  let data
+  try {
+    data = await api.dockerFindings(digest.value, {
+      severity: filters.severity || undefined,
+      fixable: filters.fixable === '' ? undefined : filters.fixable,
+      kev: filters.kev === '' ? undefined : filters.kev,
+      q: filters.q || undefined,
+      limit: 500,
+    })
+  } catch (err) {
+    sectionError.value = errorMessage(err, 'Could not load the findings.')
+    return
+  }
   findings.value = data.findings
   findingsShown.value = data.total
 }
@@ -211,7 +218,7 @@ async function rescan(full) {
     delete cache[digest.value]
     await loadTab()
   } catch (err) {
-    emit('error', err.detail || 'Could not queue a rescan.')
+    emit('error', errorMessage(err, 'Could not queue a rescan.'))
   }
 }
 
@@ -244,7 +251,7 @@ watch(filters, loadFindings)
             class="dot"
             :class="trivySeverityClass(worstOf(p.manifest.severity_counts))"
             :title="`worst finding: ${worstOf(p.manifest.severity_counts).toLowerCase()}`"
-          />
+          ><span class="sr-only">worst finding: {{ worstOf(p.manifest.severity_counts).toLowerCase() }}</span></span>
         </button>
         <span v-if="attestations" class="faint small" title="BuildKit provenance / SBOM attestations: recorded, not scanned">
           + {{ attestations }} attestation{{ attestations > 1 ? 's' : '' }}
@@ -348,7 +355,7 @@ watch(filters, loadFindings)
         </button>
       </div>
 
-      <div v-if="sectionError" class="alert alert-error small">{{ sectionError }}</div>
+      <div v-if="sectionError" class="alert alert-error small" role="alert">{{ sectionError }}</div>
 
       <!-- vulnerabilities -->
       <section v-if="tab === 'vulns'">
@@ -359,23 +366,23 @@ watch(filters, loadFindings)
         </div>
         <template v-else>
           <div class="row mb td-filters">
-            <select v-model="filters.severity">
+            <select v-model="filters.severity" aria-label="Severity">
               <option value="">Any severity</option>
               <option value="CRITICAL">Critical</option>
               <option value="CRITICAL,HIGH">High and above</option>
               <option value="MEDIUM">Medium</option>
               <option value="LOW">Low</option>
             </select>
-            <select v-model="filters.fixable">
+            <select v-model="filters.fixable" aria-label="Fix available">
               <option value="">Fixed or not</option>
               <option :value="true">Has a fix</option>
               <option :value="false">No fix yet</option>
             </select>
-            <select v-model="filters.kev">
+            <select v-model="filters.kev" aria-label="Known exploited">
               <option value="">Exploited or not</option>
               <option :value="true">Known exploited (KEV) only</option>
             </select>
-            <input v-model.lazy="filters.q" type="search" placeholder="CVE or package…" class="grow" />
+            <input v-model.lazy="filters.q" type="search" placeholder="CVE or package…" aria-label="Filter findings by CVE or package" class="grow" />
             <span class="faint small nowrap">{{ findingsShown }} shown</span>
           </div>
           <div v-if="!findings.length" class="empty small">No findings match.</div>
@@ -449,7 +456,7 @@ watch(filters, loadFindings)
             <template v-if="entry.packages.generated_at"> · {{ relativeTime(entry.packages.generated_at) }}</template>
           </div>
           <div class="row mb td-filters">
-            <input v-model="pkgQuery" type="search" placeholder="Package name or purl…" class="grow" />
+            <input v-model="pkgQuery" type="search" placeholder="Package name or purl…" aria-label="Filter packages by name or purl" class="grow" />
             <div class="eco-filter" style="margin-top: 0">
               <button class="eco-chip" :class="{ active: !pkgType }" @click="pkgType = ''">All</button>
               <button
@@ -484,7 +491,7 @@ watch(filters, loadFindings)
                           class="sev-mini"
                           :class="trivySeverityClass(sev)"
                           :title="sev.toLowerCase()"
-                        >{{ sev[0] }} {{ pkgFindings(c)[sev] }}</span>
+                        ><span aria-hidden="true">{{ sev[0] }}</span><span class="sr-only">{{ sev.toLowerCase() }}</span> {{ pkgFindings(c)[sev] }}</span>
                         <a href="#" class="small" @click.prevent="filters.q = c.name; tab = 'vulns'">view</a>
                       </span>
                     </template>
@@ -632,7 +639,7 @@ watch(filters, loadFindings)
                 <td class="nowrap">
                   <span class="pkg-vulns">
                     <span v-for="sev in SEVERITIES.filter((x) => s.severity_counts?.[x])" :key="sev" class="sev-mini" :class="trivySeverityClass(sev)">
-                      {{ sev[0] }} {{ s.severity_counts[sev] }}
+                      <span aria-hidden="true">{{ sev[0] }}</span><span class="sr-only">{{ sev.toLowerCase() }}</span> {{ s.severity_counts[sev] }}
                     </span>
                   </span>
                   <span v-if="!s.finding_count" class="faint small">none</span>

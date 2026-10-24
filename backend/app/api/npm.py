@@ -20,6 +20,7 @@ Routes implemented (npm registry API):
     GET    /{pkg}/{version}                     version document
     GET    /{pkg}/-/{filename}                  tarball
     PUT    /{pkg}                               publish / deprecate
+    PUT    /{pkg}/-rev/{rev}                    unpublish versions (packument edit)
     DELETE /{pkg}/-rev/{rev}                    unpublish package
     DELETE /{pkg}/-/{filename}/-rev/{rev}       unpublish version
 """
@@ -27,6 +28,7 @@ Routes implemented (npm registry API):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from datetime import UTC, datetime
@@ -37,9 +39,10 @@ from fastapi import APIRouter, Depends, Header, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer, selectinload
 
 from ..config import settings
-from ..core.cache import cache_get_json, cache_set_json
+from ..core.cache import cache_get_bytes, cache_get_json, cache_set_bytes, cache_set_json
 from ..core.deps import (
     Identity,
     client_ip,
@@ -47,7 +50,7 @@ from ..core.deps import (
     rate_limited_read,
     resolve_identity,
 )
-from ..core.naming import max_semver, npm_path_to_name, semver_key
+from ..core.naming import max_semver, npm_path_to_name, npm_tarball_filename, semver_key
 from ..db import get_session
 from ..models import DistTag, Ecosystem, Package, PackageFile, PackageVersion
 from ..services import artifacts, audit, npm_publish, npm_render, ownership, packages
@@ -59,6 +62,12 @@ log = logging.getLogger(__name__)
 router = APIRouter(tags=["npm"])
 
 ECOSYSTEM = Ecosystem.npm
+
+#: Largest rendered packument kept in Valkey. The cache runs with a fixed
+#: memory cap and allkeys-lru, so one multi-megabyte document evicts hundreds
+#: of herd-guard locks and rate-limit counters. Bigger documents are rendered
+#: from the database on each request instead.
+PACKUMENT_CACHE_MAX_BYTES = 1024 * 1024
 
 
 def json_response(payload: Any, status_code: int = 200, headers: dict | None = None) -> Response:
@@ -72,8 +81,118 @@ def json_response(payload: Any, status_code: int = 200, headers: dict | None = N
 
 
 def npm_error(message: str, status_code: int) -> JSONResponse:
-    """npm surfaces the ``error`` field to the user verbatim."""
+    """npm surfaces the ``error`` field to the user verbatim.
+
+    Every 404 carries registry.npmjs.org's exact body, ``{"error": "Not
+    found"}``, whatever went missing; tools match on it. The specific reason
+    rides along in ``detail``.
+    """
+    if status_code == status.HTTP_404_NOT_FOUND:
+        body: dict[str, str] = {"error": "Not found"}
+        if message and message != "Not found":
+            body["detail"] = message
+        return JSONResponse(body, status_code=status_code)
     return JSONResponse({"error": message}, status_code=status_code)
+
+
+def strong_etag(body: bytes) -> str:
+    return '"' + hashlib.sha256(body).hexdigest() + '"'
+
+
+def etag_matches(if_none_match: str | None, etag: str) -> bool:
+    """RFC 9110 If-None-Match: weak comparison, ``*`` matches anything."""
+    if not if_none_match:
+        return False
+    wanted = etag.removeprefix("W/")
+    for candidate in if_none_match.split(","):
+        candidate = candidate.strip()
+        if candidate == "*" or candidate.removeprefix("W/") == wanted:
+            return True
+    return False
+
+
+def document_response(
+    request: Request, body: bytes, *, content_type: str, vary_accept: bool = False
+) -> Response:
+    """Serve already-serialised JSON with a strong ETag, or a 304."""
+    etag = strong_etag(body)
+    headers = {"etag": etag}
+    if vary_accept:
+        # The abbreviated and full packument share a URL.
+        headers["vary"] = "Accept"
+    if etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return Response(content=body, media_type=content_type, headers=headers)
+
+
+# --------------------------------------------------------------------------- #
+# Lean package lookups
+#
+# `packages.get_package_row` / `fetch_package` select the Package entity, and
+# with it `cached_document` -- the whole upstream packument, 37 MB for vite.
+# The routes below need a handful of columns, so they never touch it unless a
+# refresh from upstream is genuinely due (which has to parse the document
+# anyway).
+# --------------------------------------------------------------------------- #
+async def _refresh_if_stale(
+    session: AsyncSession, name: str, normalized: str
+) -> packages.PackageLookup | None:
+    """Run the upstream refresh only when the local row is missing or stale.
+
+    Returns the lookup when one was made (callers read ``from_upstream``),
+    ``None`` when the local copy was fresh and nothing heavy was loaded.
+    """
+    row = (
+        await session.execute(
+            select(Package.is_local, Package.cached_at).where(
+                Package.ecosystem == ECOSYSTEM, Package.normalized_name == normalized
+            )
+        )
+    ).first()
+    if row is not None and not packages.is_stale(row):
+        return None
+    # Callers reload the row lean and read only ``from_upstream``; loading
+    # the packument here would put it in the identity map for nothing.
+    return await packages.fetch_package(session, ECOSYSTEM, name, with_documents=False)
+
+
+async def _lean_package(
+    session: AsyncSession,
+    normalized: str,
+    *,
+    with_versions: bool = False,
+    with_files: bool = False,
+) -> Package | None:
+    """The Package row without ``cached_document``; versions without
+    ``metadata_json``. Nothing loaded here may touch either attribute."""
+    options: list = [defer(Package.cached_document), selectinload(Package.dist_tags)]
+    if with_versions:
+        version_opts: list = [defer(PackageVersion.metadata_json)]
+        if with_files:
+            version_opts.append(selectinload(PackageVersion.files))
+        options.append(selectinload(Package.versions).options(*version_opts))
+    stmt = (
+        select(Package)
+        .options(*options)
+        .where(Package.ecosystem == ECOSYSTEM, Package.normalized_name == normalized)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def _version_columns(session: AsyncSession, package_id: int) -> list:
+    """What the policy engine reads per version, and nothing else."""
+    return list(
+        (
+            await session.execute(
+                select(
+                    PackageVersion.version,
+                    PackageVersion.max_cvss,
+                    PackageVersion.has_fix,
+                    PackageVersion.scanned_at,
+                ).where(PackageVersion.package_id == package_id)
+            )
+        ).all()
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -186,11 +305,14 @@ async def get_dist_tags(
     identity: Identity = Depends(rate_limited_read),
 ) -> Response:
     name = npm_path_to_name(package_name)
-    lookup = await packages.fetch_package(session, ECOSYSTEM, name)
-    if lookup.package is None:
+    normalized = packages.normalized_for(ECOSYSTEM, name)
+    await _refresh_if_stale(session, name, normalized)
+    package = await _lean_package(session, normalized)
+    if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
-    verdict = await PolicyEngine(session).evaluate(ECOSYSTEM, lookup.package.normalized_name)
+    policy = PolicyEngine(session)
+    verdict = await policy.evaluate(ECOSYSTEM, package.normalized_name)
     if verdict.blocked:
         return npm_error(verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
 
@@ -198,14 +320,11 @@ async def get_dist_tags(
     # be refused, so filter the same set the packument filters. `latest` is
     # re-pointed at the newest version that survives rather than dropped, which
     # is what lets `npm install pkg` degrade to an installable release.
-    blocked = await _blocked_versions(PolicyEngine(session), lookup.package)
-    tags = {
-        t.tag: t.version for t in lookup.package.dist_tags if t.version not in blocked
-    }
+    version_rows = await _version_columns(session, package.id)
+    blocked = await _blocked_from_rows(policy, package.normalized_name, version_rows)
+    tags = {t.tag: t.version for t in package.dist_tags if t.version not in blocked}
     if "latest" not in tags:
-        survivors = [
-            v.version for v in lookup.package.versions if v.version not in blocked
-        ]
+        survivors = [v.version for v in version_rows if v.version not in blocked]
         fallback = max_semver(survivors) if survivors else None
         if fallback:
             tags["latest"] = fallback
@@ -234,9 +353,7 @@ async def set_dist_tag(
             "dist-tag must not be a valid semver version", status.HTTP_400_BAD_REQUEST
         )
 
-    package = await packages.get_package_row(
-        session, ECOSYSTEM, name.lower(), load_files=False
-    )
+    package = await _lean_package(session, name.lower())
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -252,7 +369,7 @@ async def set_dist_tag(
 
     exists = (
         await session.execute(
-            select(PackageVersion).where(
+            select(PackageVersion.id).where(
                 PackageVersion.package_id == package.id, PackageVersion.version == version
             )
         )
@@ -296,7 +413,7 @@ async def delete_dist_tag(
         return npm_error("the 'latest' tag cannot be removed", status.HTTP_400_BAD_REQUEST)
 
     name = npm_path_to_name(package_name)
-    package = await packages.get_package_row(session, ECOSYSTEM, name.lower(), load_files=False)
+    package = await _lean_package(session, name.lower())
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -367,41 +484,156 @@ async def audit_bulk(
 
     from ..models import PackageVulnerability, Vulnerability
 
-    out: dict[str, list[dict]] = {}
+    # name as sent -> the versions installed
+    requested: dict[str, set[str]] = {}
     for name, versions in body.items():
-        if not isinstance(versions, list):
+        if not isinstance(name, str) or not isinstance(versions, list):
             continue
-        package = await packages.get_package_row(session, ECOSYSTEM, name.lower(), load_files=False)
-        if package is None:
-            continue
+        requested[name] = {v for v in versions if isinstance(v, str)}
+    if not requested:
+        return json_response({})
+
+    by_normalized: dict[str, list[str]] = {}
+    for name in requested:
+        by_normalized.setdefault(packages.normalized_for(ECOSYSTEM, name), []).append(name)
+
+    # Columns only, a bounded number of queries for any body size. This used
+    # to load the Package entity -- and with it the whole upstream packument
+    # -- once per name, for up to 4000 names: an `npm audit` of a large
+    # lockfile was enough to OOM the container.
+    package_ids: dict[int, str] = {}
+    for chunk in _chunks(list(by_normalized), AUDIT_QUERY_CHUNK):
+        for package_id, normalized in (
+            await session.execute(
+                select(Package.id, Package.normalized_name).where(
+                    Package.ecosystem == ECOSYSTEM, Package.normalized_name.in_(chunk)
+                )
+            )
+        ).all():
+            package_ids[package_id] = normalized
+    if not package_ids:
+        return json_response({})
+
+    # Every known affected version per (package, vulnerability), not just the
+    # installed ones: the advisory's `vulnerable_versions` has to describe the
+    # vulnerability, because arborist memoises advisories by id and tests each
+    # installed version against that one range.
+    affected: dict[tuple[int, str], set[str]] = {}
+    fixes: dict[tuple[int, str], set[str]] = {}
+    for chunk in _chunks(list(package_ids), AUDIT_QUERY_CHUNK):
         rows = (
             await session.execute(
-                select(Vulnerability, PackageVersion.version, PackageVulnerability.fixed_version)
-                .join(PackageVulnerability, PackageVulnerability.vulnerability_id == Vulnerability.id)
+                select(
+                    PackageVersion.package_id,
+                    PackageVersion.version,
+                    PackageVulnerability.vulnerability_id,
+                    PackageVulnerability.fixed_version,
+                )
                 .join(PackageVersion, PackageVersion.id == PackageVulnerability.version_id)
                 .where(
-                    PackageVersion.package_id == package.id,
-                    PackageVersion.version.in_(versions),
+                    PackageVersion.package_id.in_(chunk),
                     PackageVulnerability.suppressed.is_(False),
                 )
             )
         ).all()
-        advisories = [
-            {
-                "id": vuln.id,
-                "url": f"https://osv.dev/vulnerability/{vuln.id}",
-                "title": vuln.summary or vuln.cve_id,
-                "severity": vuln.severity_label or "unknown",
-                "vulnerable_versions": version,
-                "cwe": [],
-                "cvss": {"score": vuln.cvss_score or 0.0, "vectorString": vuln.cvss_vector},
-                **({"fixAvailable": {"version": fixed}} if fixed else {}),
-            }
-            for vuln, version, fixed in rows
-        ]
+        for package_id, version, vuln_id, fixed in rows:
+            affected.setdefault((package_id, vuln_id), set()).add(version)
+            if fixed:
+                fixes.setdefault((package_id, vuln_id), set()).add(fixed)
+
+    # Keep only vulnerabilities that hit at least one installed version.
+    hits: dict[str, list[tuple[str, set[str]]]] = {}  # request name -> [(vuln, versions)]
+    for (package_id, vuln_id), versions in affected.items():
+        for name in by_normalized[package_ids[package_id]]:
+            if versions & requested[name]:
+                hits.setdefault(name, []).append((vuln_id, versions))
+    if not hits:
+        return json_response({})
+
+    vuln_ids = sorted({vuln_id for entries in hits.values() for vuln_id, _ in entries})
+    details: dict[str, Any] = {}
+    for chunk in _chunks(vuln_ids, AUDIT_QUERY_CHUNK):
+        for row in (
+            await session.execute(
+                select(
+                    Vulnerability.id,
+                    Vulnerability.cve_id,
+                    Vulnerability.summary,
+                    Vulnerability.severity_label,
+                    Vulnerability.cvss_score,
+                    Vulnerability.cvss_vector,
+                ).where(Vulnerability.id.in_(chunk))
+            )
+        ).all():
+            details[row.id] = row
+
+    normalized_to_id = {normalized: pid for pid, normalized in package_ids.items()}
+    out: dict[str, list[dict]] = {}
+    for name, entries in hits.items():
+        package_id = normalized_to_id[packages.normalized_for(ECOSYSTEM, name)]
+        advisories = []
+        for vuln_id, versions in sorted(entries, key=lambda e: e[0]):
+            vuln = details.get(vuln_id)
+            if vuln is None:
+                continue
+            fixed = fixes.get((package_id, vuln_id))
+            fix_version = max_semver(sorted(fixed)) if fixed else None
+            advisories.append(
+                {
+                    "id": vuln.id,
+                    "url": f"https://osv.dev/vulnerability/{vuln.id}",
+                    "title": vuln.summary or vuln.cve_id,
+                    "severity": npm_severity(vuln.severity_label, vuln.cvss_score),
+                    "vulnerable_versions": " || ".join(sorted(versions, key=semver_key)),
+                    "cwe": [],
+                    "cvss": {"score": vuln.cvss_score or 0.0, "vectorString": vuln.cvss_vector},
+                    **({"fixAvailable": {"version": fix_version}} if fix_version else {}),
+                }
+            )
         if advisories:
             out[name] = advisories
     return json_response(out)
+
+
+#: Bound on the IN-list of each audit query; SQLite caps bound parameters.
+AUDIT_QUERY_CHUNK = 500
+
+#: Our labels are the CVSS qualitative scale (osv.SEVERITY_BANDS); npm's are
+#: info|low|moderate|high|critical, and it rejects anything else.
+_NPM_SEVERITY = {
+    "critical": "critical",
+    "high": "high",
+    "medium": "moderate",
+    "moderate": "moderate",
+    "low": "low",
+}
+
+
+def npm_severity(label: str | None, score: float | None) -> str:
+    """Map a stored severity onto npm's vocabulary.
+
+    * CVSS ``none`` (a score of 0.0) is npm's ``info``: rated, no impact.
+    * No label but a score: derived from the score.
+    * Neither: ``low``, not ``info``. An unrated record is still a CVE that
+      matched this version, and ``info`` is what ``npm audit --audit-level=low``
+      -- the usual CI setting -- ignores; reporting it at the lowest real
+      level keeps it visible without overstating it.
+    """
+    mapped = _NPM_SEVERITY.get((label or "").lower())
+    if mapped:
+        return mapped
+    if (label or "").lower() == "none":
+        return "info"
+    if score is not None:
+        from ..services.osv import severity_label
+
+        return _NPM_SEVERITY.get(severity_label(score) or "", "info")
+    return "low"
+
+
+def _chunks(items: list, size: int):
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 @router.post("/-/npm/v1/security/audits/quick")
@@ -459,6 +691,18 @@ async def get_tarball(
         )
         return npm_error(verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
 
+    # The bytes are content-addressed, so a client holding this digest holds
+    # exactly these bytes. Answer before fetching or streaming anything.
+    known_digest = file_row.blob_sha256 or file_row.sha256
+    if known_digest and etag_matches(request.headers.get("if-none-match"), f'"{known_digest}"'):
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={
+                "etag": f'"{known_digest}"',
+                "cache-control": "public, max-age=31536000, immutable",
+            },
+        )
+
     was_cached = bool(file_row.blob_sha256 and get_store().exists(file_row.blob_sha256))
     try:
         chunks, size, content_type = await artifacts.stream_artifact(session, file_row)
@@ -495,7 +739,7 @@ async def get_tarball(
         "content-length": str(size),
         # Artifacts are immutable, so let clients and proxies keep them forever.
         "cache-control": "public, max-age=31536000, immutable",
-        "etag": f'"{file_row.blob_sha256}"',
+        **_artifact_etag(file_row),
     }
     return StreamingResponse(
         chunks, media_type=content_type or "application/octet-stream", headers=headers
@@ -505,6 +749,191 @@ async def get_tarball(
 # --------------------------------------------------------------------------- #
 # Publish / unpublish
 # --------------------------------------------------------------------------- #
+def _apply_deprecations(
+    by_version: dict[str, PackageVersion],
+    submitted: dict[str, Any],
+    *,
+    missing_means_undeprecate: bool,
+) -> dict[str, str | None]:
+    """Copy ``deprecated`` from a submitted packument onto stored versions."""
+    changed: dict[str, str | None] = {}
+    for version, meta in submitted.items():
+        row = by_version.get(version)
+        if row is None or not isinstance(meta, dict):
+            continue
+        if "deprecated" not in meta and not missing_means_undeprecate:
+            continue
+        message = meta.get("deprecated")
+        # An empty string is npm's "undeprecate".
+        new = message if isinstance(message, str) and message else None
+        if new != row.deprecated:
+            row.deprecated = new
+            changed[version] = new
+        elif missing_means_undeprecate:
+            changed[version] = new
+    return changed
+
+
+async def _retire_version_row(
+    session: AsyncSession,
+    package: Package,
+    version_row: PackageVersion,
+    identity: Identity,
+) -> None:
+    """Tombstone one version, drop its bytes and its row.
+
+    The tombstone is what keeps the version number from being reused with
+    different content; the same mechanism both unpublish routes use.
+    """
+    primary = next((f for f in version_row.files if f.blob_sha256), None)
+    await ownership.retire_version(
+        session,
+        ECOSYSTEM,
+        package.normalized_name,
+        version_row.version,
+        version_row.normalized_version,
+        sha256=primary.blob_sha256 if primary else None,
+        integrity=primary.integrity if primary else None,
+        user=identity.user,
+        username=identity.username,
+    )
+    for file_row in version_row.files:
+        await artifacts.purge_file(session, file_row)
+    await session.delete(version_row)
+
+
+# Declared before the bare `PUT /{package_name:path}` publish route on
+# purpose: that pattern is greedy and would otherwise take this URL, then fail
+# name validation on "pkg/-rev/3-abc".
+@router.put("/{package_name:path}/-rev/{rev}")
+async def update_packument(
+    package_name: str,
+    rev: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    identity: Identity = Depends(rate_limited_publish),
+) -> Response:
+    """``npm unpublish pkg@1.2.3`` when other versions remain.
+
+    libnpmpublish GETs the packument, deletes the version (and any dist-tag
+    naming it) locally, PUTs the edited document here, then DELETEs the
+    tarball. Versions present in the store but absent from the body are
+    retired. ``deprecated`` edits arriving on this route are applied too.
+    The ``rev`` is not compared: our ``_rev`` is synthesised, not a CouchDB
+    revision, and authorisation is what guards the write.
+    """
+    name = npm_path_to_name(package_name)
+    try:
+        body = orjson.loads(await request.body())
+    except orjson.JSONDecodeError:
+        return npm_error("request body is not valid JSON", status.HTTP_400_BAD_REQUEST)
+    if not isinstance(body, dict):
+        return npm_error("request body must be a JSON object", status.HTTP_400_BAD_REQUEST)
+    declared = body.get("name") or body.get("_id")
+    if declared is not None and declared != name:
+        return npm_error(
+            f"package name '{declared}' does not match the request path '{name}'",
+            status.HTTP_400_BAD_REQUEST,
+        )
+    submitted = body.get("versions")
+    if not isinstance(submitted, dict):
+        # Treating a missing map as "no versions" would retire everything.
+        return npm_error("'versions' must be an object", status.HTTP_400_BAD_REQUEST)
+    if body.get("_attachments"):
+        return npm_error(
+            "publish new versions with PUT /{package}, not a revision update",
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    package = await _lean_package(session, name.lower(), with_versions=True, with_files=True)
+    if package is None:
+        return npm_error("package not found", status.HTTP_404_NOT_FOUND)
+
+    by_version = {v.version: v for v in package.versions}
+    removed = [by_version[v] for v in sorted(by_version, key=semver_key) if v not in submitted]
+    survivors = [v for v in by_version if v in submitted]
+    if removed and not survivors:
+        return npm_error(
+            "this update would remove every version; unpublish the package instead",
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    is_admin = identity.is_admin and identity.has_scope("admin")
+    try:
+        await ownership.authorize_mutation(
+            package,
+            user_id=identity.user_id,
+            is_admin=is_admin,
+            action="unpublish" if removed else "deprecate",
+        )
+    except ownership.PublishDenied as denied:
+        return npm_error(denied.reason, denied.status_code)
+    if any(not row.is_local for row in removed) and not is_admin:
+        return npm_error(
+            "only locally published versions can be unpublished", status.HTTP_403_FORBIDDEN
+        )
+
+    removed_versions = {row.version for row in removed}
+    for row in removed:
+        await _retire_version_row(session, package, row, identity)
+
+    changed = _apply_deprecations(
+        {v: by_version[v] for v in survivors}, submitted, missing_means_undeprecate=False
+    )
+
+    if removed_versions:
+        # A tag must never name a version that is gone. `latest` follows the
+        # client's choice when it names a survivor, else the newest survivor.
+        submitted_tags = body.get("dist-tags") if isinstance(body.get("dist-tags"), dict) else {}
+        wanted = submitted_tags.get("latest")
+        if not (isinstance(wanted, str) and wanted in survivors):
+            wanted = max_semver(survivors) or survivors[-1]
+        for tag_row in list(package.dist_tags):
+            if tag_row.version not in removed_versions:
+                continue
+            if tag_row.tag == "latest":
+                # Repointed in place: a delete plus an insert of the same
+                # (package, tag) trips the unique constraint, because the
+                # unit of work flushes inserts before deletes.
+                tag_row.version = wanted
+            else:
+                # delete-orphan cascade removes the row.
+                package.dist_tags.remove(tag_row)
+        latest_row = next((t for t in package.dist_tags if t.tag == "latest"), None)
+        if latest_row is None:
+            package.dist_tags.append(DistTag(package_id=package.id, tag="latest", version=wanted))
+            package.latest_version = wanted
+        else:
+            package.latest_version = latest_row.version
+
+    for version in sorted(removed_versions, key=semver_key):
+        await audit.record_audit(
+            session,
+            audit.PACKAGE_UNPUBLISHED,
+            actor_user_id=identity.user_id,
+            actor_username=identity.username,
+            target_type="package",
+            target_id=f"npm:{package.name}@{version}",
+            ip=client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            detail={"scope": "version", "via": "packument-update"},
+        )
+    if changed:
+        await audit.record_audit(
+            session,
+            "registry.deprecate",
+            actor_user_id=identity.user_id,
+            actor_username=identity.username,
+            target_type="package",
+            target_id=f"npm:{package.name}",
+            ip=client_ip(request),
+            detail={"changed": changed},
+        )
+    await session.commit()
+    await packages.invalidate_package_cache("npm", package.normalized_name)
+    return json_response({"ok": True, "id": package.name})
+
+
 @router.put("/{package_name:path}")
 async def publish(
     package_name: str,
@@ -621,6 +1050,10 @@ async def _handle_publish(
     store = get_store()
     published: list[str] = []
 
+    # Every check runs before any bytes reach the blob store. Storing first
+    # meant a refused publish (bad digest, CVE policy) left a file on disk
+    # with no Blob row, which garbage collection never looks for.
+    staged: list[tuple[str, dict, npm_publish.Attachment, Any]] = []
     for version, meta in parsed.versions.items():
         if version in existing:
             # npm's own wording; the CLI prints this to the user.
@@ -635,15 +1068,13 @@ async def _handle_publish(
                 f"no tarball attachment found for version {version}", status.HTTP_400_BAD_REQUEST
             )
 
-        stored = await store.put_bytes(attachment.data)
-
         # Verify against the digests the client declared, if any.
-        declared = (meta.get("dist") or {})
-        if declared.get("shasum") and declared["shasum"].lower() != stored.sha1:
-            return npm_error(
-                f"shasum mismatch for {version}: declared {declared['shasum']}, got {stored.sha1}",
-                status.HTTP_400_BAD_REQUEST,
-            )
+        digests = npm_publish.digest_tarball(attachment.data)
+        try:
+            npm_publish.verify_declared_digests(version, meta, digests)
+        except npm_publish.PublishError as exc:
+            return npm_error(exc.message, exc.status_code)
+        npm_publish.annotate_install_script(meta, attachment.data)
 
         # Inline CVE check before the version becomes visible.
         scan = await inline_scan(session, ECOSYSTEM, parsed.name, version)
@@ -677,6 +1108,10 @@ async def _handle_publish(
                 actor=actor,
             )
             return npm_error(cve_verdict.reason or "blocked by CVE policy", status.HTTP_403_FORBIDDEN)
+        staged.append((version, meta, attachment, scan))
+
+    for version, meta, attachment, scan in staged:
+        stored = await store.put_bytes(attachment.data)
 
         version_row = PackageVersion(
             package_id=package.id,
@@ -775,7 +1210,7 @@ async def _handle_publish(
 async def _handle_deprecate(
     session: AsyncSession, request: Request, identity: Identity, parsed: npm_publish.PublishRequest
 ) -> Response:
-    package = await packages.get_package_row(session, ECOSYSTEM, parsed.name.lower())
+    package = await _lean_package(session, parsed.name.lower(), with_versions=True)
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -789,16 +1224,8 @@ async def _handle_deprecate(
     except ownership.PublishDenied as denied:
         return npm_error(denied.reason, denied.status_code)
 
-    changed = {}
     by_version = {v.version: v for v in package.versions}
-    for version, meta in parsed.versions.items():
-        row = by_version.get(version)
-        if row is None:
-            continue
-        message = meta.get("deprecated")
-        # An empty string is npm's "undeprecate".
-        row.deprecated = message if isinstance(message, str) and message else None
-        changed[version] = row.deprecated
+    changed = _apply_deprecations(by_version, parsed.versions, missing_means_undeprecate=True)
 
     await audit.record_audit(
         session,
@@ -860,7 +1287,7 @@ async def unpublish_version(
     identity: Identity = Depends(rate_limited_publish),
 ) -> Response:
     name = npm_path_to_name(package_name)
-    package = await packages.get_package_row(session, ECOSYSTEM, name.lower())
+    package = await _lean_package(session, name.lower(), with_versions=True, with_files=True)
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -871,6 +1298,21 @@ async def unpublish_version(
                 target = (version_row, file_row)
                 break
     if target is None:
+        # `npm unpublish pkg@1.2.3` retires the version with a packument PUT
+        # first and only then deletes the tarball. By then the version is
+        # already gone; answering 404 here made the CLI report a failure for
+        # an unpublish that had succeeded.
+        if await _is_retired_tarball(session, package, filename):
+            try:
+                await ownership.authorize_mutation(
+                    package,
+                    user_id=identity.user_id,
+                    is_admin=identity.is_admin and identity.has_scope("admin"),
+                    action="unpublish",
+                )
+            except ownership.PublishDenied as denied:
+                return npm_error(denied.reason, denied.status_code)
+            return json_response({"ok": True})
         return npm_error("version not found", status.HTTP_404_NOT_FOUND)
 
     version_row, file_row = target
@@ -899,8 +1341,7 @@ async def unpublish_version(
         user=identity.user,
         username=identity.username,
     )
-    await artifacts.purge_file(session, file_row)
-    await session.delete(version_row)
+    await _retire_version_row(session, package, version_row, identity)
 
     await audit.record_audit(
         session,
@@ -917,6 +1358,20 @@ async def unpublish_version(
     return json_response({"ok": True})
 
 
+async def _is_retired_tarball(session: AsyncSession, package: Package, filename: str) -> bool:
+    from ..models import RetiredVersion
+
+    retired = (
+        await session.execute(
+            select(RetiredVersion.version).where(
+                RetiredVersion.ecosystem == ECOSYSTEM,
+                RetiredVersion.normalized_name == package.normalized_name,
+            )
+        )
+    ).scalars().all()
+    return any(npm_tarball_filename(package.name, v) == filename for v in retired)
+
+
 @router.delete("/{package_name:path}/-rev/{rev}")
 async def unpublish_package(
     package_name: str,
@@ -926,7 +1381,7 @@ async def unpublish_package(
     identity: Identity = Depends(rate_limited_publish),
 ) -> Response:
     name = npm_path_to_name(package_name)
-    package = await packages.get_package_row(session, ECOSYSTEM, name.lower())
+    package = await _lean_package(session, name.lower(), with_versions=True, with_files=True)
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -1037,20 +1492,31 @@ async def _version_response(
     session: AsyncSession,
     identity: Identity,
 ) -> Response:
-    lookup = await packages.fetch_package(session, ECOSYSTEM, name)
-    if lookup.package is None:
+    normalized = packages.normalized_for(ECOSYSTEM, name)
+    lookup = await _refresh_if_stale(session, name, normalized)
+    package = await _lean_package(session, normalized)
+    if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
-    package = lookup.package
+
+    async def load_version(wanted: str) -> PackageVersion | None:
+        # One version row, with its metadata: that is all the document needs.
+        return (
+            await session.execute(
+                select(PackageVersion)
+                .options(selectinload(PackageVersion.files))
+                .where(PackageVersion.package_id == package.id, PackageVersion.version == wanted)
+            )
+        ).scalar_one_or_none()
 
     resolved = version
-    if not any(v.version == version for v in package.versions):
+    version_row = await load_version(version)
+    if version_row is None:
         # A dist-tag is also accepted here, e.g. GET /lodash/latest.
         tag = next((t for t in package.dist_tags if t.tag == version), None)
         resolved = tag.version if tag else (package.latest_version if version == "latest" else None)
-    if resolved is None:
-        return npm_error("version not found", status.HTTP_404_NOT_FOUND)
-
-    version_row = next((v for v in package.versions if v.version == resolved), None)
+        if resolved is None:
+            return npm_error("version not found", status.HTTP_404_NOT_FOUND)
+        version_row = await load_version(resolved)
     if version_row is None:
         return npm_error("version not found", status.HTTP_404_NOT_FOUND)
 
@@ -1076,10 +1542,14 @@ async def _version_response(
             token_id=identity.token_id,
             ip=client_ip(request),
             user_agent=request.headers.get("user-agent"),
-            cache_hit=not lookup.from_upstream,
+            cache_hit=not (lookup is not None and lookup.from_upstream),
         )
     )
-    return json_response(npm_render.render_version_document(package, version_row))
+    return document_response(
+        request,
+        orjson.dumps(npm_render.render_version_document(package, version_row)),
+        content_type=npm_render.FULL_CONTENT_TYPE,
+    )
 
 
 async def _packument_response(
@@ -1098,8 +1568,13 @@ async def _packument_response(
     if name_verdict.blocked:
         return npm_error(name_verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
 
+    content_type = (
+        npm_render.ABBREVIATED_CONTENT_TYPE if abbreviated else npm_render.FULL_CONTENT_TYPE
+    )
     cache_id = packages.cache_key("npm", normalized, "abbrev" if abbreviated else "full")
-    cached = await cache_get_json(cache_id)
+    # Stored serialised and served as stored: a hit costs a hash for the ETag,
+    # not a parse and a re-encode of the whole document.
+    cached = await cache_get_bytes(cache_id)
     if cached is not None:
         audit.record_download(
             audit.DownloadEvent(
@@ -1113,12 +1588,7 @@ async def _packument_response(
                 cache_hit=True,
             )
         )
-        return json_response(
-            cached,
-            headers={"content-type": (
-                npm_render.ABBREVIATED_CONTENT_TYPE if abbreviated else npm_render.FULL_CONTENT_TYPE
-            )},
-        )
+        return document_response(request, cached, content_type=content_type, vary_accept=True)
 
     lookup = await packages.fetch_package(session, ECOSYSTEM, name)
     if lookup.package is None or not lookup.package.versions:
@@ -1150,7 +1620,13 @@ async def _packument_response(
             if remaining:
                 document["dist-tags"]["latest"] = remaining
 
-    await cache_set_json(cache_id, document, settings.meta_cache_ttl)
+    body = orjson.dumps(document)
+    del document
+    # Size-capped: the cache shares a fixed memory budget (allkeys-lru) with
+    # herd-guard locks and rate-limit counters, which a few large documents
+    # would evict. Large packuments are rendered per request instead.
+    if len(body) <= PACKUMENT_CACHE_MAX_BYTES:
+        await cache_set_bytes(cache_id, body, settings.meta_cache_ttl)
 
     audit.record_download(
         audit.DownloadEvent(
@@ -1166,12 +1642,7 @@ async def _packument_response(
             upstream_id=lookup.upstream.id if lookup.upstream else None,
         )
     )
-    return json_response(
-        document,
-        headers={"content-type": (
-            npm_render.ABBREVIATED_CONTENT_TYPE if abbreviated else npm_render.FULL_CONTENT_TYPE
-        )},
-    )
+    return document_response(request, body, content_type=content_type, vary_accept=True)
 
 
 async def _scan_new_versions(session: AsyncSession, package: Package) -> None:
@@ -1224,11 +1695,17 @@ async def _scan_new_versions(session: AsyncSession, package: Package) -> None:
 
 
 async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
+    return await _blocked_from_rows(policy, package.normalized_name, package.versions)
+
+
+async def _blocked_from_rows(policy: PolicyEngine, normalized: str, rows) -> set[str]:
+    """``rows`` are PackageVersion entities or column rows with ``version``,
+    ``max_cvss``, ``has_fix`` and ``scanned_at``."""
     blocked: set[str] = set()
-    for version_row in package.versions:
+    for version_row in rows:
         verdict = await policy.evaluate(
             ECOSYSTEM,
-            package.normalized_name,
+            normalized,
             version_row.version,
             max_cvss=version_row.max_cvss,
             has_fix=version_row.has_fix,
@@ -1237,3 +1714,14 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
         if verdict.blocked:
             blocked.add(version_row.version)
     return blocked
+
+
+def _artifact_etag(file_row) -> dict[str, str]:
+    """ETag for an immutable artifact, or nothing while its digest is unknown.
+
+    A response streamed while the upstream download is still running has no
+    ``blob_sha256`` yet; sending ``etag: "None"`` would let a client cache
+    every such response under one validator.
+    """
+    digest = file_row.blob_sha256 or file_row.sha256
+    return {"etag": f'"{digest}"'} if digest else {}

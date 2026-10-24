@@ -1,8 +1,9 @@
 <script setup>
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import { formatBytes, formatDate, severityClass } from '@/utils/format'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
@@ -17,11 +18,17 @@ async function load() {
   try {
     pkg.value = await api.packageDetail(route.params.ecosystem, route.params.name)
   } catch (err) {
-    error.value = err.detail || 'Could not load this package.'
+    error.value = errorMessage(err, 'Could not load this package.')
   } finally {
     loading.value = false
   }
 }
+
+// Versions refused by policy are left out of the metadata clients get, which
+// is why an install of one says "no matching version". Say so up front.
+const blockedVersions = computed(() =>
+  pkg.value && !pkg.value.blocked ? pkg.value.versions.filter((v) => v.blocked) : [],
+)
 
 onMounted(load)
 watch(() => [route.params.ecosystem, route.params.name], load)
@@ -29,7 +36,7 @@ watch(() => [route.params.ecosystem, route.params.name], load)
 
 <template>
   <div v-if="loading" class="empty">Loading…</div>
-  <div v-else-if="error" class="alert alert-error">{{ error }}</div>
+  <div v-else-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
   <template v-else-if="pkg">
     <div class="page-head">
@@ -50,6 +57,15 @@ watch(() => [route.params.ecosystem, route.params.name], load)
 
     <div v-if="pkg.blocked" class="alert alert-error">
       <strong>This package is blocked.</strong> {{ pkg.block_reason }}
+    </div>
+    <div v-else-if="blockedVersions.length" class="alert alert-warn">
+      <strong>
+        {{ blockedVersions.length }} of {{ pkg.versions.length }}
+        {{ pkg.versions.length === 1 ? 'version is' : 'versions are' }} blocked by policy.
+      </strong>
+      Clients do not see blocked versions, so installing one fails with "no matching version"
+      (npm <code>ETARGET</code>, pip "could not find a version"). The reason is listed per version
+      below; upgrade to a version marked ok.
     </div>
 
     <div class="grid grid-3 mb">
@@ -202,7 +218,11 @@ watch(() => [route.params.ecosystem, route.params.name], load)
                   <span v-else class="faint small">none known</span>
                 </td>
                 <td>
-                  <span v-if="version.yanked" class="badge badge-warn">yanked</span>
+                  <div v-if="version.blocked" class="block-cell">
+                    <span class="badge badge-danger">blocked</span>
+                    <span class="small dim">{{ version.block_reason }}</span>
+                  </div>
+                  <span v-else-if="version.yanked" class="badge badge-warn">yanked</span>
                   <span v-else-if="version.deprecated" class="badge badge-warn" :title="version.deprecated">
                     deprecated
                   </span>
@@ -231,4 +251,12 @@ watch(() => [route.params.ecosystem, route.params.name], load)
   gap: 3px;
 }
 .source-row:last-child { padding-bottom: 0; border-bottom: none; }
+
+.block-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  max-width: 320px;
+}
 </style>

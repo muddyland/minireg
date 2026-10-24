@@ -18,6 +18,14 @@ An `Authorization` header is **authoritative**: if one is present but does not
 authenticate, the request is anonymous. It never falls back to a session
 cookie, so a revoked token cannot appear to keep working for a browser session.
 
+A state-changing request (`POST`, `PUT`, `PATCH`, `DELETE`) authenticated by
+the session cookie is refused with `403` when the browser marks it
+cross-site: a `Sec-Fetch-Site` other than `same-origin` or `none`, or, from a
+browser that does not send that header, an `Origin` or `Referer` that is not
+`PUBLIC_URL`'s origin. Token and Basic authentication are unaffected. Scripts
+should authenticate with an API token, not a session cookie copied out of a
+browser.
+
 ---
 
 ## npm registry API
@@ -30,8 +38,9 @@ Mounted at `/npm`. Implements the npm registry API.
 | `GET` | `/npm/{package}/{version}` | Version document; a dist-tag is accepted in place of a version |
 | `GET` | `/npm/{package}/-/{filename}` | Tarball. `immutable` cache headers |
 | `PUT` | `/npm/{package}` | Publish, deprecate, undeprecate |
+| `PUT` | `/npm/{package}/-rev/{rev}` | Version unpublish, as `npm unpublish pkg@x.y.z` sends it: the edited packument. Versions missing from the body are removed; `deprecated` edits are applied |
 | `DELETE` | `/npm/{package}/-rev/{rev}` | Unpublish a package |
-| `DELETE` | `/npm/{package}/-/{filename}/-rev/{rev}` | Unpublish a version |
+| `DELETE` | `/npm/{package}/-/{filename}/-rev/{rev}` | Unpublish a version, releasing every file of that version |
 | `GET` | `/npm/-/package/{package}/dist-tags` | Read dist-tags |
 | `PUT` | `/npm/-/package/{package}/dist-tags/{tag}` | Set a dist-tag (body is a bare JSON string) |
 | `DELETE` | `/npm/-/package/{package}/dist-tags/{tag}` | Remove a dist-tag (`latest` cannot be removed) |
@@ -46,6 +55,38 @@ slash (`/npm/@babel/core`).
 The abbreviated packument is a strict subset: exactly four top-level keys
 (`name`, `modified`, `dist-tags`, `versions`) and only npm's permitted
 per-version fields.
+
+Packuments, version documents and tarballs carry a strong `ETag` and answer a
+matching `If-None-Match` with `304 Not Modified`. The full and abbreviated
+packument share a URL, so packuments also carry `Vary: Accept`. A tarball's
+ETag is its SHA-256, and is left off while the file is being fetched from its
+upstream for the first time. Rendered packuments are kept in Valkey for
+`META_CACHE_TTL`, except those over 1 MiB (`PACKUMENT_CACHE_MAX_BYTES`), which
+are rendered from the database on each request so that a few large documents
+cannot evict the locks and rate-limit counters sharing Valkey's memory.
+
+**Unpublish.** `npm unpublish pkg@x.y.z` sends the `PUT …/-rev/{rev}` and
+then the tarball `DELETE`; the `DELETE` answers `ok` when the version is
+already gone. All three unpublish routes need the same authorisation: the
+package's owner, or an admin using an admin-scoped credential. Only locally
+published versions can be unpublished, unless that admin is removing a cached
+upstream version. A removed version is tombstoned with its digests, so the
+number cannot be republished with different content. An update that would
+remove every version is refused with `400`; unpublish the package instead.
+
+**Publish.** A `dist.shasum` or `dist.integrity` the client declared that
+does not match the uploaded tarball is refused with `400`, naming the digest
+that was computed. The values served are always recomputed from the stored
+bytes. `hasInstallScript` is computed by the registry, never taken from the
+client: it is set when the manifest declares a `preinstall`, `install` or
+`postinstall` script, or the tarball has a `binding.gyp` at its root.
+
+**Audit.** The bulk advisory endpoint returns one advisory per vulnerability,
+whose `vulnerable_versions` lists every version this registry knows to be
+affected, not only the installed ones. Severities use npm's vocabulary:
+`medium` becomes `moderate`, a CVSS score of 0 becomes `info`, and a record
+with no score or label is reported as `low`, so `--audit-level=low` still
+catches it.
 
 ---
 
@@ -69,6 +110,16 @@ curl -H 'accept: application/vnd.pypi.simple.v1+json' .../pypi/simple/requests/
 curl -H 'accept: text/html' .../pypi/simple/requests/
 curl '.../pypi/simple/requests/?format=application/vnd.pypi.simple.v1+json'
 ```
+
+HTML is served as plain `text/html` unless the PEP 691 HTML type is asked for
+by name: an `Accept` of `text/html` or `*/*`, or no `Accept` at all, gets
+`text/html`, and only `application/vnd.pypi.simple.v1+html` (or
+`…latest+html`) gets that type back. pip before 22.2 accepts nothing but
+`text/html`. JSON negotiation is unchanged. Every simple page carries
+`Vary: Accept` and a strong `ETag`, and a matching `If-None-Match` gets `304`.
+
+`.metadata` sidecars are served byte for byte as they appear in the wheel, and
+the project page advertises each with the sha256 of exactly those bytes.
 
 Advertised API version is **1.1** (PEP 700). Implements PEP 503, 592, 629, 658,
 691, 700, and 714.
@@ -101,8 +152,60 @@ curl -O .../cargo/api/v1/crates/serde/1.0.197/download
 A version blocked by policy is rendered as `"yanked": true` — the only "do not
 select this" signal the index format has — and its download returns **403**.
 
+`config.json` and every index file carry a strong `ETag`. cargo revalidates
+with `If-None-Match` and gets `304` when nothing has changed.
+
 There is no publish, yank or owners surface. See
 [Using the registry](usage.md#why-cargo-is-read-only).
+
+---
+
+## Container registry (OCI)
+
+Mounted at `/v2`. Implements the OCI distribution spec 1.1, so `docker`,
+Podman, containerd, crane and skopeo work unmodified. Image names contain
+slashes, so one catch-all route dispatches on the path suffix. Every response
+carries `Docker-Distribution-API-Version: registry/2.0`, and every error is an
+OCI error body (`{"errors": [{"code": "DENIED", "message": …}]}`). The whole
+surface answers 404 `UNSUPPORTED` when `DOCKER_ENABLED=false`.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/v2/` | Version check. Always challenges an anonymous client, so `docker push` knows to log in |
+| `GET` `POST` | `/v2/token` | Docker token endpoint (GET) and OAuth2 password grant (POST, what `docker login` sends). Exchanges an API token for a short-lived registry bearer token. The POST response includes the granted `scope` |
+| `GET` | `/v2/_catalog` | Repository list. `n`, `last`; paginates with a `Link` header. Requires a login |
+| `GET` `HEAD` | `/v2/{name}/manifests/{reference}` | Manifest or index by tag or digest. Pull policy is enforced here: a refused image is `DENIED` with the reason. An `Accept` header that excludes the stored manifest's media type gets `MANIFEST_UNKNOWN` |
+| `PUT` | `/v2/{name}/manifests/{reference}` | Push a manifest (local namespace only). A tag outside `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}` is `TAG_INVALID` (400) |
+| `DELETE` | `/v2/{name}/manifests/{digest}` | Delete a pushed manifest |
+| `GET` `HEAD` | `/v2/{name}/blobs/{digest}` | Layer or config blob, only if it belongs to this repository (below). Fetched from the upstream and verified on first request |
+| `DELETE` | `/v2/{name}/blobs/{digest}` | Unlink a blob from a pushed repository |
+| `POST` | `/v2/{name}/blobs/uploads/` | Start an upload; supports monolithic (`?digest=`) and cross-repository mount (`?mount=&from=`) |
+| `GET` `PATCH` `PUT` `DELETE` | `/v2/{name}/blobs/uploads/{uuid}` | Upload status, append a chunk, complete (`?digest=`), cancel |
+| `GET` | `/v2/{name}/tags/list` | Tags. `n`, `last`; paginates with a `Link` header |
+| `GET` | `/v2/{name}/referrers/{digest}` | OCI referrers (signatures, SBOMs, attestations). `artifactType` filters |
+
+Authentication is the Docker token flow: the client sends Basic credentials
+(any username, an **API token** as the password) to `/v2/token` and gets a
+bearer token valid for `DOCKER_TOKEN_TTL_SECONDS`. Pulls need the `read`
+scope, or nothing when `ALLOW_ANONYMOUS_READ=true`. Pushes need the
+`docker:push` scope on an account allowed to publish, and are accepted only
+under `DOCKER_LOCAL_NAMESPACE/` (default `local/`); any write to a cached
+upstream repository is `DENIED`. On `DOCKER_MIRROR_HOSTNAME`, every name is a
+Docker Hub name and the surface is read-only.
+
+A blob is served from a repository only when it belongs there: pushed or
+mounted into it, or named by a manifest served through it. Anything else is
+`BLOB_UNKNOWN`, because the store is shared by content and would otherwise
+hand out any cached layer under any repository name. Pull policy follows the
+blob as well: it is `DENIED` when the repository is quarantined, or when every
+manifest in that repository that names it is refused. A blocked image cannot
+be reassembled layer by layer through another name.
+
+Every manifest response carries `X-Minireg-Cache`: `hit`, `revalidated`,
+`fetched` or `stale`. One served stale because the upstream could not be
+reached also carries `Warning: 110 - "Response is Stale"`.
+
+See [Container images](containers.md) for naming, the mirror, and policy.
 
 ---
 
@@ -122,6 +225,11 @@ There is no publish, yank or owners surface. See
 | `GET` | `/api/auth/oidc/status` | Whether SSO is enabled |
 | `GET` | `/api/auth/oidc/login` | Start the SSO flow |
 | `GET` | `/api/auth/oidc/callback` | SSO callback |
+
+Changing the password and listing, creating or revoking tokens need a
+primary credential: a session or account password, or a token with the
+`admin` scope. A leaked `read` or `publish` token gets `403` there, so it can
+neither mint a wider token nor enumerate or revoke its owner's others.
 
 ### Documentation
 
@@ -201,6 +309,46 @@ Records describing the same CVE are collapsed: the highest score wins, but the
 *lowest* fixed version is kept, because that is the smallest upgrade that
 resolves it.
 
+### Container images
+
+Read endpoints require a signed-in user; the rest require an admin unless
+noted. Repositories are addressed by a `name` query parameter, because image
+names contain slashes.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/api/docker/images` | user | List repositories. `q`, `scope` (`local`, `cached`, `quarantined`, `watched`), `limit`, `offset` |
+| `GET` | `/api/docker/repository` | user | One repository: tags, digests, scan status. `name` |
+| `GET` | `/api/docker/inspect` | user | Resolve a reference the way `docker pull` would and report its findings and whether a pull would be allowed. `ref`, `platform` (default `linux/amd64`), `findings`. Used by `minireg audit --image` and `minireg info --ecosystem docker` |
+| `GET` | `/api/docker/manifest/{digest}` | user | Manifest detail: layers, platforms, repositories that reference it, latest scan |
+| `GET` | `/api/docker/manifest/{digest}/findings` | user | Trivy findings. `severity` (comma-separated), `fixable`, `kev`, `q`, `limit`, `offset` |
+| `GET` | `/api/docker/manifest/{digest}/config` | user | Entrypoint, env, labels, ports and build history, each layer paired with its step |
+| `GET` | `/api/docker/manifest/{digest}/packages` | user | The SBOM as a package list |
+| `GET` | `/api/docker/manifest/{digest}/sbom` | user | The raw CycloneDX SBOM, as a download |
+| `GET` | `/api/docker/vulnerabilities` | user | Which images contain a CVE (or package, or severity). `cve`, `package`, `severity`, `kev`, `limit` |
+| `GET` | `/api/docker/client-config` | user | Copy-pasteable `docker login`, pull and mirror configuration |
+| `PATCH` | `/api/docker/repository` | admin | Pin, quarantine (with a reason) or watch tags. `name` |
+| `POST` | `/api/docker/repository/refresh` | admin | Revalidate one watched tag now. `name` |
+| `DELETE` | `/api/docker/repository` | admin | Forget a cached repository; files go at the next GC. Pushed repositories are refused (delete them through `/v2`). `name` |
+| `POST` | `/api/docker/manifest/{digest}/rescan` | admin | Queue a rescan. `full=true` re-pulls the layers instead of rescanning the stored SBOM |
+| `GET` `PUT` | `/api/docker/policy` | admin | Read or replace the image policy |
+| `GET` | `/api/docker/stats` | admin | Disk use against the budget, pulls in the last 24 hours, scan queue, counts of KEV, critical and push-blocked images, upstream rate-limit headroom, when each scanner was last seen |
+| `GET` | `/api/docker/presets` | admin | Well-known registries (Docker Hub, ghcr, Quay, …) and whether each is configured |
+| `POST` | `/api/docker/presets/{name}` | admin | Add a well-known registry as an upstream |
+| `POST` | `/api/docker/upstreams/{id}/index` | admin | List a GitLab container registry's repositories into search |
+
+The scanner worker uses its own routes, which accept **only** a token with
+exactly the `scanner` scope (an admin token is refused):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/docker/scanner/claim` | Claim the next scan job; `204` when there is none or scanning is off |
+| `POST` | `/api/docker/scanner/jobs/{id}/heartbeat` | Extend the job's lease while Trivy runs. `worker` |
+| `GET` | `/api/docker/scanner/jobs/{id}/sbom` | The stored SBOM, for an SBOM-only rescan |
+| `POST` | `/api/docker/scanner/jobs/{id}/result` | Upload the Trivy report (and SBOM) as multipart form data |
+| `POST` | `/api/docker/scanner/jobs/{id}/fail` | Report a failure; `permanent` skips the image instead of retrying |
+| `GET` | `/api/docker/scanner/config` | Where to fetch the Trivy database from (through the `ghcr` upstream when one exists) |
+
 ### Admin
 
 All require an admin identity and, for token auth, the `admin` scope.
@@ -268,6 +416,14 @@ npm endpoints return npm's shape, because the CLI prints the field verbatim:
 {"error": "You cannot publish over the previously published versions: 1.0.0"}
 ```
 
+Every npm `404` has registry.npmjs.org's body, `{"error": "Not found"}`,
+whatever is missing, because tools match on it. The specific reason, when
+there is one, is in `detail`:
+
+```json
+{"error": "Not found", "detail": "version not found"}
+```
+
 PyPI upload returns plain text, because twine prints the body verbatim.
 
 Every `/api/*` response carries `x-minireg-cli-version`, the CLI version this
@@ -282,9 +438,10 @@ Everything else returns FastAPI's shape:
 
 | Status | Meaning |
 |---|---|
+| `304` | Not modified: the `If-None-Match` ETag still matches |
 | `400` | Malformed request or failed validation |
 | `401` | No credential, or it did not authenticate |
-| `403` | Authenticated but not permitted, **or blocked by policy** |
+| `403` | Authenticated but not permitted, **or blocked by policy**, or a cross-site write carrying the session cookie |
 | `404` | Not found here or in any upstream |
 | `409` | Conflict — usually republishing an existing version |
 | `413` | Upload too large |

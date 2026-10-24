@@ -350,9 +350,94 @@ class ScanResult:
         return severity_label(self.max_score)
 
 
+#: Up to this many packages are invalidated one prefix-SCAN each; above it, a
+#: single SCAN over every rendered document is cheaper.
+_PER_PACKAGE_INVALIDATION_LIMIT = 8
+
+
+async def invalidate_rendered_documents(targets: set[tuple[str, str]]) -> None:
+    """Drop the cached rendered documents for ``(ecosystem, normalized_name)``.
+
+    Each per-package invalidation is a SCAN of the whole Redis keyspace, so a
+    background pass that changed hundreds of packages does one SCAN over
+    ``pkg:*`` instead and deletes only the keys belonging to those packages.
+    Nothing else is touched: invalidating everything on every pass would
+    defeat the cache.
+    """
+    if not targets:
+        return
+    from ..core.cache import redis_client
+    from .packages import cache_key, invalidate_package_cache
+
+    if len(targets) <= _PER_PACKAGE_INVALIDATION_LIMIT:
+        for ecosystem, name in targets:
+            await invalidate_package_cache(ecosystem, name)
+        return
+
+    client = redis_client()
+    if client is None:
+        return
+    prefixes = {f"{cache_key(ecosystem, name)}:" for ecosystem, name in targets}
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = await client.scan(cursor=cursor, match="pkg:*", count=1000)
+            doomed = []
+            for key in keys:
+                text = key.decode() if isinstance(key, bytes) else key
+                head, sep, _suffix = text.rpartition(":")
+                if sep and f"{head}:" in prefixes:
+                    doomed.append(key)
+            if doomed:
+                await client.delete(*doomed)
+            if cursor == 0:
+                break
+    except Exception:
+        log.warning("batched cache invalidation failed", exc_info=True)
+
+
 class OsvScanner:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+        #: ``(ecosystem, normalized_name)`` of every package whose stored
+        #: verdict :meth:`apply_to_version` changed. A caller that commits
+        #: in bulk -- the background refresh -- passes this to
+        #: :meth:`invalidate_changed` once the commit has landed.
+        self.changed_packages: set[tuple[str, str]] = set()
+        self._package_keys: dict[int, tuple[str, str] | None] = {}
+
+    async def _note_changed(self, version_row: PackageVersion) -> None:
+        package_id = version_row.package_id
+        if package_id not in self._package_keys:
+            # Two columns, never the Package entity: cached_document is the
+            # whole upstream packument.
+            row = (
+                await self.session.execute(
+                    select(Package.ecosystem, Package.name).where(Package.id == package_id)
+                )
+            ).first()
+            if row is None:
+                self._package_keys[package_id] = None
+            else:
+                from ..core.naming import normalize_name_for
+
+                ecosystem = getattr(row[0], "value", row[0])
+                self._package_keys[package_id] = (
+                    ecosystem,
+                    normalize_name_for(ecosystem, row[1]),
+                )
+        key = self._package_keys[package_id]
+        if key is not None:
+            self.changed_packages.add(key)
+
+    async def invalidate_changed(self) -> None:
+        """Drop rendered documents for every package whose verdict changed.
+
+        Call after the commit, or a request in between re-renders from the
+        old rows and caches the stale verdict again.
+        """
+        targets, self.changed_packages = self.changed_packages, set()
+        await invalidate_rendered_documents(targets)
 
     # -- OSV calls ---------------------------------------------------------- #
     async def _query_batch(self, queries: list[dict], timeout: float | None = None) -> list[dict]:
@@ -664,6 +749,10 @@ class OsvScanner:
             if version_row is not None and version_row.max_cvss != score:
                 version_row.max_cvss = score
                 versions_updated += 1
+                # The CVSS policy reads max_cvss, so the rendered documents
+                # for this package may now include or omit this version.
+                # The caller invalidates them after its commit.
+                await self._note_changed(version_row)
         await self.session.flush()
 
         # Fixed versions are derived from the same stored records, and were
@@ -779,6 +868,8 @@ class OsvScanner:
             if osv_id not in seen:
                 await self.session.delete(link)
                 changed = True
+        if changed:
+            await self._note_changed(version_row)
         return changed
 
     async def scan_and_apply(

@@ -81,13 +81,13 @@ onMounted(() => auth.loadOidcStatus())
             <NavIcon name="upstreams" /> Upstreams
           </router-link>
           <router-link class="nav-link" :to="{ name: 'policy' }">
-            <NavIcon name="shield" /> Policy
+            <NavIcon name="shield" /> Package policy
           </router-link>
           <router-link class="nav-link" :to="{ name: 'security' }">
             <NavIcon name="alert" /> Vulnerabilities
           </router-link>
           <router-link class="nav-link" :to="{ name: 'downloads' }">
-            <NavIcon name="downloads" /> Requests
+            <NavIcon name="downloads" /> Package requests
           </router-link>
         </template>
 
@@ -97,10 +97,10 @@ onMounted(() => auth.loadOidcStatus())
         </router-link>
         <template v-if="auth.isAdmin">
           <router-link class="nav-link" :to="{ name: 'docker-upstreams' }">
-            <NavIcon name="registry" /> Registries
+            <NavIcon name="registry" /> Container registries
           </router-link>
           <router-link class="nav-link" :to="{ name: 'image-policy' }">
-            <NavIcon name="shield" /> Policy &amp; scanning
+            <NavIcon name="shield" /> Image policy
           </router-link>
         </template>
 
@@ -150,8 +150,13 @@ onMounted(() => auth.loadOidcStatus())
           >
             <NavIcon name="help" :size="16" />
           </router-link>
-          <button class="btn btn-sm btn-ghost" :title="`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`" @click="toggleTheme">
-            {{ theme === 'dark' ? '☀' : '☾' }}
+          <button
+            class="btn btn-sm btn-ghost"
+            :title="`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`"
+            :aria-label="`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`"
+            @click="toggleTheme"
+          >
+            <span aria-hidden="true">{{ theme === 'dark' ? '☀' : '☾' }}</span>
           </button>
           <button class="btn btn-sm" @click="logout">Sign out</button>
         </div>

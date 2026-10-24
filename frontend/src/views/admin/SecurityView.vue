@@ -1,6 +1,7 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import { formatDate, severityClass } from '@/utils/format'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
@@ -13,6 +14,15 @@ const scanning = ref(false)
 
 const filters = ref({ ecosystem: '', severity: '', min_score: 0, max_score: 10, search: '' })
 const detail = ref(null)
+const detailError = ref(null)
+const opening = ref(null)
+const updating = ref(null)
+
+// "Accept risk" dialog.
+const acceptTarget = ref(null)
+const acceptReason = ref('')
+const acceptError = ref(null)
+const accepting = ref(false)
 
 async function load() {
   loading.value = true
@@ -28,25 +38,35 @@ async function load() {
     vulns.value = data.vulnerabilities
     total.value = data.total
   } catch (err) {
-    error.value = err.detail || 'Could not load vulnerabilities.'
+    error.value = errorMessage(err, 'Could not load vulnerabilities.')
   } finally {
     loading.value = false
   }
 }
 
 async function openDetail(vuln) {
-  detail.value = await api.vulnerabilityAffected(vuln.id)
+  error.value = null
+  detailError.value = null
+  opening.value = vuln.id
+  try {
+    detail.value = await api.vulnerabilityAffected(vuln.id)
+  } catch (err) {
+    error.value = errorMessage(err, `Could not load ${vuln.cve_id}.`)
+  } finally {
+    opening.value = null
+  }
 }
 
 async function scan(rescanAll = false) {
   scanning.value = true
   message.value = null
+  error.value = null
   try {
     const result = await api.triggerScan({ rescan_all: rescanAll, limit: 1000 })
     message.value = `Scanned ${result.scanned} versions; ${result.with_cves} have known CVEs.`
     await load()
   } catch (err) {
-    error.value = err.detail || 'Scan failed.'
+    error.value = errorMessage(err, 'Scan failed.')
   } finally {
     scanning.value = false
   }
@@ -55,6 +75,7 @@ async function scan(rescanAll = false) {
 async function rescore() {
   scanning.value = true
   message.value = null
+  error.value = null
   try {
     const result = await api.rescoreVulnerabilities()
     message.value =
@@ -62,18 +83,61 @@ async function rescore() {
       `${result.vulnerabilities_examined} CVEs; updated ${result.versions_updated} versions.`
     await load()
   } catch (err) {
-    error.value = err.detail || 'Rescore failed.'
+    error.value = errorMessage(err, 'Rescore failed.')
   } finally {
     scanning.value = false
   }
 }
 
-async function toggleSuppress(entry) {
-  const suppressing = !entry.suppressed
-  const reason = suppressing ? prompt('Reason for accepting this risk?') : null
-  if (suppressing && reason === null) return
-  await api.suppressVulnerability(entry.link_id, { suppressed: suppressing, reason })
+async function refreshDetail() {
   detail.value = await api.vulnerabilityAffected(detail.value.vulnerability.id)
+}
+
+// Accepting a risk asks for a reason in a dialog; un-accepting needs none.
+function toggleSuppress(entry) {
+  detailError.value = null
+  if (entry.suppressed) {
+    unsuppress(entry)
+    return
+  }
+  acceptTarget.value = entry
+  acceptReason.value = ''
+  acceptError.value = null
+}
+
+async function unsuppress(entry) {
+  updating.value = entry.link_id
+  try {
+    await api.suppressVulnerability(entry.link_id, { suppressed: false, reason: null })
+    await refreshDetail()
+  } catch (err) {
+    detailError.value = errorMessage(err, 'Could not withdraw the risk acceptance.')
+  } finally {
+    updating.value = null
+  }
+}
+
+async function confirmAccept() {
+  const entry = acceptTarget.value
+  acceptError.value = null
+  accepting.value = true
+  try {
+    await api.suppressVulnerability(entry.link_id, {
+      suppressed: true,
+      reason: acceptReason.value.trim() || null,
+    })
+  } catch (err) {
+    acceptError.value = errorMessage(err, 'Could not accept the risk.')
+    return
+  } finally {
+    accepting.value = false
+  }
+  acceptTarget.value = null
+  try {
+    await refreshDetail()
+  } catch (err) {
+    detailError.value = errorMessage(err, 'Risk accepted, but the list could not be refreshed.')
+  }
 }
 
 onMounted(load)
@@ -104,19 +168,19 @@ onMounted(load)
     </div>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
-  <div v-if="message" class="alert alert-ok">{{ message }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
+  <div v-if="message" class="alert alert-ok" role="status">{{ message }}</div>
 
   <div class="card mb">
     <div class="card-body">
       <div class="row">
-        <select v-model="filters.ecosystem" style="width: auto" @change="load">
+        <select v-model="filters.ecosystem" style="width: auto" aria-label="Ecosystem" @change="load">
           <option value="">All ecosystems</option>
           <option value="npm">npm</option>
           <option value="pypi">PyPI</option>
           <option value="cargo">cargo</option>
         </select>
-        <select v-model="filters.severity" style="width: auto" @change="load">
+        <select v-model="filters.severity" style="width: auto" aria-label="Severity" @change="load">
           <option value="">Any severity</option>
           <option value="critical">Critical (9.0–10)</option>
           <option value="high">High (7.0–8.9)</option>
@@ -124,12 +188,19 @@ onMounted(load)
           <option value="low">Low (0.1–3.9)</option>
         </select>
         <div class="row-tight">
-          <span class="small dim">CVSS</span>
-          <input v-model.number="filters.min_score" type="number" min="0" max="10" step="0.1" style="width: 72px" @change="load" />
-          <span class="small dim">–</span>
-          <input v-model.number="filters.max_score" type="number" min="0" max="10" step="0.1" style="width: 72px" @change="load" />
+          <label for="sec-min" class="small dim">CVSS</label>
+          <input id="sec-min" v-model.number="filters.min_score" type="number" min="0" max="10" step="0.1" style="width: 72px" @change="load" />
+          <label for="sec-max" class="small dim">to</label>
+          <input id="sec-max" v-model.number="filters.max_score" type="number" min="0" max="10" step="0.1" style="width: 72px" @change="load" />
         </div>
-        <input v-model="filters.search" type="search" placeholder="CVE id or summary…" style="flex: 1; min-width: 180px" @keyup.enter="load" />
+        <input
+          v-model="filters.search"
+          type="search"
+          placeholder="CVE id or summary…"
+          aria-label="CVE id or summary"
+          style="flex: 1; min-width: 180px"
+          @keyup.enter="load"
+        />
         <button class="btn" @click="load">Filter</button>
       </div>
     </div>
@@ -180,7 +251,9 @@ onMounted(load)
               <td class="num">{{ vuln.affected_versions }}</td>
               <td class="faint small nowrap">{{ formatDate(vuln.published) }}</td>
               <td class="num">
-                <button class="btn btn-sm" @click="openDetail(vuln)">Details</button>
+                <button class="btn btn-sm" :disabled="opening === vuln.id" @click="openDetail(vuln)">
+                  {{ opening === vuln.id ? 'Loading…' : 'Details' }}
+                </button>
               </td>
             </tr>
           </tbody>
@@ -189,18 +262,19 @@ onMounted(load)
     </div>
   </div>
 
-  <div v-if="detail" class="modal-backdrop" @click.self="detail = null">
-    <div class="modal" style="max-width: 760px">
+  <div v-if="detail" class="modal-backdrop" @click.self="detail = null" @keydown.esc="detail = null">
+    <div class="modal" style="max-width: 760px" role="dialog" aria-modal="true" aria-labelledby="vuln-title">
       <div class="modal-head">
         <div>
-          <h3 style="margin: 0">{{ detail.vulnerability.cve_id }}</h3>
+          <h3 id="vuln-title" style="margin: 0">{{ detail.vulnerability.cve_id }}</h3>
           <span v-if="detail.vulnerability.cvss_score !== null" class="sev" :class="severityClass(detail.vulnerability.cvss_score)">
             CVSS {{ detail.vulnerability.cvss_score.toFixed(1) }} ({{ detail.vulnerability.severity }})
           </span>
         </div>
-        <button class="btn btn-sm btn-ghost" @click="detail = null">✕</button>
+        <button class="btn btn-sm btn-ghost" aria-label="Close" @click="detail = null">✕</button>
       </div>
       <div class="modal-body">
+        <div v-if="detailError" class="alert alert-error" role="alert">{{ detailError }}</div>
         <p v-if="detail.vulnerability.summary"><strong>{{ detail.vulnerability.summary }}</strong></p>
         <p v-if="detail.vulnerability.details" class="dim small" style="white-space: pre-wrap">
           {{ detail.vulnerability.details.slice(0, 1200) }}
@@ -227,7 +301,7 @@ onMounted(load)
                   <span v-else class="badge badge-danger">reported</span>
                 </td>
                 <td class="num">
-                  <button class="btn btn-sm" @click="toggleSuppress(entry)">
+                  <button class="btn btn-sm" :disabled="updating === entry.link_id" @click="toggleSuppress(entry)">
                     {{ entry.suppressed ? 'Un-accept' : 'Accept risk' }}
                   </button>
                 </td>
@@ -250,5 +324,50 @@ onMounted(load)
         </template>
       </div>
     </div>
+  </div>
+
+  <div
+    v-if="acceptTarget"
+    class="modal-backdrop"
+    @click.self="acceptTarget = null"
+    @keydown.esc.stop="acceptTarget = null"
+  >
+    <form
+      class="modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="accept-title"
+      @submit.prevent="confirmAccept"
+    >
+      <div class="modal-head">
+        <h3 id="accept-title">Accept risk</h3>
+        <button type="button" class="btn btn-sm btn-ghost" aria-label="Close" @click="acceptTarget = null">✕</button>
+      </div>
+      <div class="modal-body">
+        <div v-if="acceptError" class="alert alert-error" role="alert">{{ acceptError }}</div>
+        <p class="small dim" style="margin-top: 0">
+          {{ detail?.vulnerability.cve_id }} in
+          <strong>{{ acceptTarget.package }}</strong> <span class="mono">{{ acceptTarget.version }}</span>
+        </p>
+        <div class="field">
+          <label for="accept-reason">Reason</label>
+          <input
+            id="accept-reason"
+            v-model="acceptReason"
+            placeholder="e.g. not reachable from our code paths"
+            autofocus
+          />
+          <p class="field-hint">
+            Recorded in the audit log. This hides the finding from <code>npm audit</code>; it does not lift a block.
+          </p>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="btn" @click="acceptTarget = null">Cancel</button>
+        <button type="submit" class="btn btn-primary" :disabled="accepting">
+          {{ accepting ? 'Saving…' : 'Accept risk' }}
+        </button>
+      </div>
+    </form>
   </div>
 </template>

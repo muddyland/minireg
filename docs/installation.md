@@ -68,6 +68,11 @@ docker compose exec minireg python -c "import os; os.remove('/data/initial-admin
 
 Open the `PUBLIC_URL` you configured and sign in.
 
+Running the backend from a checkout with `uvicorn` instead of the image? The
+web UI is served from `backend/app/static`, which is gitignored and only built
+by the Dockerfile, so rebuild it first (`cd frontend && npm ci && npm run
+build`) or you get a stale or missing UI. See the README's Development section.
+
 ---
 
 ## The one setting that must be right
@@ -86,9 +91,16 @@ fetch artifacts from an address that doesn't resolve.
 | Behind a TLS proxy | `https://registry.example.com` |
 | Non-standard port | `https://registry.example.com:8443` |
 
-Change it later and you must restart the app and purge the metadata cache
-(**Storage → Run garbage collection** is not enough; cached packuments expire on
-their own within `META_CACHE_TTL`, 60s by default).
+Change it later and you must restart the app. Packuments and simple pages
+already rendered into Valkey keep the old URLs until they expire, within
+`META_CACHE_TTL` (60s by default). Restarting the app does not clear them —
+Valkey is a separate container — and **Storage → Run garbage collection** does
+not either. To clear them at once, flush Valkey, which holds nothing but
+caches, locks and rate-limit counters:
+
+```bash
+docker compose exec redis valkey-cli FLUSHDB
+```
 
 ---
 
@@ -245,6 +257,42 @@ There is no TLS in the app itself. Over plain HTTP, API tokens travel in
 cleartext — `pip` in particular puts the token in the index URL. Use a proxy
 with TLS for anything beyond a trusted LAN.
 
+### The trusted-gateway log lines
+
+Two log lines watch for the mistake above.
+
+**At startup, an INFO line** says when `TRUSTED_PROXY_IPS` trusts the
+container's own gateway, which the default private ranges do:
+
+```
+TRUSTED_PROXY_IPS trusts 172.18.0.1, this container's gateway. Docker's port relay connects from that address, …
+```
+
+Docker's port relay connects from that gateway, so everything that reaches
+the published port arrives from a trusted address. That is the shipped layout
+and it is safe while only your reverse proxy can reach the port
+(`BIND_ADDRESS=127.0.0.1`). Nothing to do.
+
+**A WARNING, once per process,** the first time a request arrives from the
+gateway with no `X-Forwarded-For`:
+
+```
+A request arrived from 172.18.0.1, this container's gateway, with no X-Forwarded-For. …
+```
+
+A reverse proxy always adds that header, so this is a client reaching the
+published port directly. Such a client could have sent its own
+`X-Forwarded-For` and chosen the address used for its rate-limit bucket and
+the audit log. Fix it in one of three ways:
+
+- keep the app behind the proxy and bind the port to loopback
+  (`BIND_ADDRESS=127.0.0.1`);
+- narrow `TRUSTED_PROXY_IPS` to the proxy's own address;
+- with nothing in front, set `TRUSTED_PROXY_IPS=` (empty), as above.
+
+If the request was your own `curl` to the port from the Docker host, the
+warning is harmless.
+
 ---
 
 ## Hardened base image
@@ -291,6 +339,43 @@ type change) has to be handled manually — see
 [Operations](operations.md#backups).
 
 Back up the database before upgrading.
+
+### Upgrading to this release
+
+Operator-visible changes:
+
+- **Private-address upstreams need the flag for metadata too.**
+  `UPSTREAM_ALLOW_PRIVATE_ADDRESSES` and `UPSTREAM_ALLOW_PLAINTEXT_HTTP` now
+  govern packument, simple-page, index and search requests, not only artifact
+  downloads. An internal upstream on a private address or plain `http://`
+  that worked before stops resolving (it shows as unhealthy) until you set
+  the flag. Metadata redirects are also checked hop by hop now. See
+  [Upstream trust](configuration.md#upstream-trust).
+- **To stop serving what an upstream supplied, delete it; disabling is a
+  pause.** Deleting an upstream now removes, at once, the cached versions and
+  artifacts that it alone supplied. Disabling stops fetches from it and marks
+  the ecosystem stale, but keeps serving what is cached. See
+  [Changing, disabling and deleting upstreams](configuration.md#changing-disabling-and-deleting-upstreams).
+- **A higher tier now displaces lower-tier versions.** When a tier answers for
+  a name with at least one version, versions cached from a lower tier that it
+  does not list are removed, and the log says so.
+- **Outbound proxies are honoured again.** Package upstream traffic follows
+  `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`.
+- **Cross-site writes with the session cookie are refused** with `403`.
+  Scripts that drive the API with a cookie copied from a browser should use an
+  API token.
+- **Read-only tokens can no longer manage tokens.** Listing, creating and
+  revoking tokens needs a session or an admin-scoped token.
+- **`STORAGE_QUOTA_BYTES` now evicts** least-recently-used cached upstream
+  artifacts instead of failing downloads once the quota is reached.
+- **Docker clients that list only single-platform manifest types** in
+  `Accept` now get `MANIFEST_UNKNOWN` for a multi-platform index, instead of an
+  index they cannot parse. docker, containerd and podman are unaffected.
+- **Two new log lines about trusted proxies**: an INFO line at startup and a
+  one-time WARNING. See [The trusted-gateway log lines](#the-trusted-gateway-log-lines).
+- **The first refresh after the upgrade is a full fetch.** Conditional
+  revalidation only starts once a package has been refetched and its
+  validators stored.
 
 Python dependencies install from `backend/requirements.lock` with
 `--require-hashes`, so two builds of the same commit install byte-identical

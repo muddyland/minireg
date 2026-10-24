@@ -29,6 +29,11 @@ from ...models import (
     User,
 )
 from ...services import audit
+from ...services.packages import (
+    invalidate_ecosystem_cache,
+    mark_ecosystem_stale,
+    retire_upstream_content,
+)
 from ...services.policy import (
     KEY_ALLOWLIST_MODE,
     KEY_CVE_POLICY,
@@ -323,6 +328,35 @@ class UpstreamUpdate(BaseModel):
     extra: dict | None = None
 
 
+#: Upstream fields that change nothing about which upstream answers for a name
+#: or what it answers. Editing only these leaves cached metadata alone; any
+#: other change marks the ecosystem stale and drops its rendered documents.
+_PRESENTATION_FIELDS = frozenset(
+    {
+        "name",
+        "timeout_seconds",
+        "cache_artifacts",
+        "index_packages",
+        "allow_publish",
+        "web_url_template",
+        "extra",
+    }
+)
+#: Changes after which this upstream's conditional-request validators no
+#: longer describe anything we hold.
+_ORIGIN_FIELDS = frozenset(
+    {
+        "url",
+        "auth_type",
+        "credential",
+        "auth_header_name",
+        "gitlab_project_id",
+        "gitlab_group_id",
+        "verify_ssl",
+    }
+)
+
+
 def upstream_payload(upstream: Upstream) -> dict:
     return {
         "id": upstream.id,
@@ -490,7 +524,12 @@ async def create_upstream(
             "tier": upstream.tier,
         },
     )
+    # A new upstream can change who answers for any name in the ecosystem,
+    # and can answer names that are negative-cached as missing right now.
+    if upstream.enabled:
+        await mark_ecosystem_stale(session, upstream.ecosystem)
     await session.commit()
+    await invalidate_ecosystem_cache(upstream.ecosystem)
     return upstream_payload(upstream)
 
 
@@ -550,6 +589,7 @@ async def update_upstream(
     upstream.consecutive_failures = 0
     upstream.last_error = None
 
+    routing_changes = set(changes) - _PRESENTATION_FIELDS
     await audit.record_audit(
         session,
         audit.UPSTREAM_UPDATED,
@@ -558,9 +598,29 @@ async def update_upstream(
         target_type="upstream",
         target_id=str(upstream_id),
         ip=client_ip(request),
-        detail={"name": upstream.name, "changes": changes},
+        detail={
+            "name": upstream.name,
+            "changes": changes,
+        },
     )
+    # Commit the Upstream row on its own before touching packages. Marking
+    # the ecosystem stale locks every package row in it; a concurrent
+    # metadata fetch holds its package row and then writes health onto this
+    # Upstream row. Holding both here, in the opposite order, is a deadlock
+    # Postgres resolves by failing one side.
     await session.commit()
+    if routing_changes:
+        # Disabling is a pause: fetches stop, what is cached keeps being
+        # served. Removing what an upstream alone supplied is what deleting
+        # it does (delete_upstream), because a one-click toggle used for
+        # maintenance must never destroy data re-enabling cannot restore.
+        await mark_ecosystem_stale(
+            session,
+            upstream.ecosystem,
+            forget_validators_of=upstream.id if routing_changes & _ORIGIN_FIELDS else None,
+        )
+        await session.commit()
+        await invalidate_ecosystem_cache(upstream.ecosystem)
     return upstream_payload(upstream)
 
 
@@ -618,9 +678,16 @@ async def delete_upstream(
     if upstream is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="upstream not found")
     name = upstream.name
+    ecosystem = upstream.ecosystem
     purged = 0
-    if upstream.ecosystem == Ecosystem.docker:
+    retired = 0
+    if ecosystem == Ecosystem.docker:
         purged = await _docker_upstream_cache(session, upstream, purge=purge)
+    else:
+        # Before the delete: afterwards the foreign keys have nulled the
+        # provenance that says which rows were this upstream's.
+        retired = await retire_upstream_content(session, upstream)
+        await mark_ecosystem_stale(session, ecosystem)
     await session.delete(upstream)
 
     await audit.record_audit(
@@ -631,9 +698,14 @@ async def delete_upstream(
         target_type="upstream",
         target_id=str(upstream_id),
         ip=client_ip(request),
-        detail={"name": name, "purged_repositories": purged} if purged else {"name": name},
+        detail={
+            "name": name,
+            **({"purged_repositories": purged} if purged else {}),
+            **({"retired_versions": retired} if retired else {}),
+        },
     )
     await session.commit()
+    await invalidate_ecosystem_cache(ecosystem)
     return {"ok": True, "purged_repositories": purged}
 
 

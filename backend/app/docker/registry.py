@@ -605,6 +605,83 @@ async def blob_in_repo(session: AsyncSession, repo: DockerRepository, digest: st
     ).first() is not None
 
 
+#: How many referencing manifests a blob's pull verdict looks at. A base
+#: layer shared by every tag of a busy repository can be named by hundreds;
+#: the first allowed one settles it.
+_VERDICT_MANIFESTS = 50
+
+
+async def manifests_naming_blob(
+    session: AsyncSession, repo: DockerRepository, digest: str, *, limit: int = _VERDICT_MANIFESTS
+) -> list[DockerManifest]:
+    """Image manifests *of this repository* whose layers or config include
+    ``digest`` -- linked to it directly, or the children of a linked index."""
+    manifest_ids = select(DockerRepoManifest.manifest_id).where(
+        DockerRepoManifest.repository_id == repo.id
+    )
+    child_digests = select(DockerManifestRef.digest).where(
+        DockerManifestRef.manifest_id.in_(manifest_ids), DockerManifestRef.ref_type == "manifest"
+    )
+    child_ids = select(DockerManifest.id).where(DockerManifest.digest.in_(child_digests))
+    naming = select(DockerManifestRef.manifest_id).where(
+        DockerManifestRef.digest == digest,
+        DockerManifestRef.ref_type != "manifest",
+        or_(
+            DockerManifestRef.manifest_id.in_(manifest_ids),
+            DockerManifestRef.manifest_id.in_(child_ids),
+        ),
+    )
+    return list(
+        (
+            await session.execute(
+                select(DockerManifest)
+                .where(DockerManifest.id.in_(naming))
+                # Most recently served first: the manifest the client just
+                # pulled (only an allowed pull is recorded) settles it at once.
+                .order_by(DockerManifest.last_accessed_at.desc().nulls_last(), DockerManifest.id.desc())
+                .limit(limit)
+            )
+        ).scalars().all()
+    )
+
+
+async def blob_pull_verdict(
+    session: AsyncSession, repo: DockerRepository, digest: str, policy
+):
+    """May the bytes of ``digest`` be served from this repository?
+
+    A blob is only ever reached through a manifest, so it inherits the
+    manifests' verdicts: refused when the repository is quarantined, or when
+    every manifest here that names it is refused. One allowed manifest is
+    enough -- a base layer shared with a blocked image is still the base
+    layer of the allowed one.
+
+    Checking only the manifest GET left the layers open: anyone holding a
+    blocked image's manifest (from before the block, or from elsewhere) could
+    fetch every layer and its config by digest.
+
+    A blob no manifest here names yet -- one pushed or mounted ahead of its
+    manifest -- is judged by membership alone, which :func:`open_blob`
+    enforces.
+    """
+    from .policy import ALLOW, ImageVerdict, evaluate_pull
+
+    if repo.quarantined:
+        return ImageVerdict(
+            False,
+            f"repository {repo.name} is quarantined"
+            + (f": {repo.quarantine_reason}" if repo.quarantine_reason else ""),
+            source="quarantine",
+        )
+    refusal = None
+    for manifest in await manifests_naming_blob(session, repo, digest):
+        verdict = await evaluate_pull(session, repo, manifest, policy)
+        if verdict.allowed:
+            return verdict
+        refusal = refusal or verdict
+    return refusal or ALLOW
+
+
 async def _record_blob(digest: str, size: int, upstream_id: int | None, media_type: str | None) -> None:
     from ..db import session_scope
 
@@ -634,9 +711,15 @@ async def open_blob(
     byte_range: tuple[int, int | None] | None = None,
 ) -> BlobResponse:
     store = get_oci_store()
+    # Membership first, for cached upstream repositories too. The store is
+    # shared by content, so without this any repository name served any
+    # cached layer -- including the layers of an image blocked or quarantined
+    # under its own name. For an upstream repository the proof is a manifest
+    # we served from it (every manifest path links what it returns), so a
+    # client fetching the layers of the manifest it just pulled always has it.
+    if not await blob_in_repo(session, repo, digest):
+        raise RegistryError("BLOB_UNKNOWN", f"blob {digest} is not in {target.canonical}")
     if store.exists(digest):
-        if target.local and not await blob_in_repo(session, repo, digest):
-            raise RegistryError("BLOB_UNKNOWN", f"blob {digest} is not in {target.canonical}")
         size = store.size_of(digest) or 0
         await session.execute(
             update(DockerBlob).where(DockerBlob.digest == digest).values(last_accessed_at=datetime.now(UTC))
@@ -695,10 +778,12 @@ async def head_blob(
     session: AsyncSession, target: Target, repo: DockerRepository, digest: str
 ) -> int:
     store = get_oci_store()
+    # Membership as in open_blob: a HEAD must not confirm, or size, a blob
+    # this repository does not hold.
+    if not await blob_in_repo(session, repo, digest):
+        raise RegistryError("BLOB_UNKNOWN", f"blob {digest} is not in {target.canonical}")
     size = store.size_of(digest)
     if size is not None:
-        if target.local and not await blob_in_repo(session, repo, digest):
-            raise RegistryError("BLOB_UNKNOWN", f"blob {digest} is not in {target.canonical}")
         return size
     if target.local:
         raise RegistryError("BLOB_UNKNOWN", f"blob {digest} is not in {target.canonical}")

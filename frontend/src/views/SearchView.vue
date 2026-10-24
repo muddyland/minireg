@@ -1,8 +1,9 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
+import { errorMessage } from '@/utils/errors'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 import EcosystemIcon from '@/components/EcosystemIcon.vue'
 
@@ -24,6 +25,15 @@ function pickEcosystem(value) {
   run()
 }
 const includeUpstream = ref(false)
+// The server only fans out to upstreams for a query in one ecosystem; with
+// either missing the box did nothing, so it is disabled until both are set.
+const upstreamSearchReady = computed(() => !!query.value.trim() && !!ecosystem.value)
+const upstreamHint = computed(() => {
+  if (upstreamSearchReady.value) return 'slower: asks the upstream registries too'
+  if (!ecosystem.value && !query.value.trim()) return 'type a query and pick npm, PyPI or cargo first'
+  if (!ecosystem.value) return 'pick npm, PyPI or cargo first'
+  return 'type a query first'
+})
 const results = ref([])
 const total = ref(0)
 const loading = ref(false)
@@ -37,14 +47,14 @@ async function run() {
     const data = await api.search({
       q: query.value,
       ecosystem: ecosystem.value || undefined,
-      include_upstream: includeUpstream.value || undefined,
+      include_upstream: (includeUpstream.value && upstreamSearchReady.value) || undefined,
       limit: 50,
     })
     results.value = data.results
     total.value = data.total
     searched.value = true
   } catch (err) {
-    error.value = err.detail || 'Search failed.'
+    error.value = errorMessage(err, 'Search failed.')
   } finally {
     loading.value = false
   }
@@ -71,6 +81,7 @@ onMounted(run)
           v-model="query"
           type="search"
           placeholder="Package name or description…"
+          aria-label="Search packages"
           style="flex: 1; min-width: 220px"
         />
         <button class="btn btn-primary" type="submit" :disabled="loading">Search</button>
@@ -91,13 +102,20 @@ onMounted(run)
         </button>
       </div>
       <label class="check small dim" style="margin-top: 0.65rem">
-        <input v-model="includeUpstream" type="checkbox" @change="run" />
-        Also search configured upstreams (slower; requires an ecosystem filter)
+        <input
+          v-model="includeUpstream"
+          type="checkbox"
+          :disabled="!upstreamSearchReady"
+          aria-describedby="upstream-search-hint"
+          @change="run"
+        />
+        Also search configured upstreams
+        <span id="upstream-search-hint" class="faint">({{ upstreamHint }})</span>
       </label>
     </div>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
   <div v-if="loading" class="empty">Searching…</div>
   <div v-else-if="!results.length && searched" class="empty">
@@ -123,7 +141,7 @@ onMounted(run)
               <span v-if="pkg.blocked" class="badge badge-danger" :title="pkg.block_reason">blocked</span>
             </div>
           </div>
-          <span class="faint small nowrap">{{ pkg.download_count }} ⇩</span>
+          <span class="faint small nowrap">{{ pkg.download_count }} <span aria-hidden="true">⇩</span><span class="sr-only">downloads</span></span>
         </div>
 
         <p v-if="pkg.description" class="dim small" style="margin: 0.55rem 0 0">

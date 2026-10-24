@@ -112,7 +112,8 @@ async def package_detail(
 ) -> dict:
     """Read-only package view for the user-facing search UI."""
     normalized = normalize_name_for(ecosystem.value, name)
-    verdict = await PolicyEngine(session).is_name_blocked(ecosystem, normalized)
+    policy = PolicyEngine(session)
+    verdict = await policy.is_name_blocked(ecosystem, normalized)
 
     package = (
         await session.execute(
@@ -133,7 +134,8 @@ async def package_detail(
     ).scalar_one_or_none()
 
     if package is None:
-        lookup = await packages.fetch_package(session, ecosystem, name)
+        # This view renders neither the packument nor per-version metadata.
+        lookup = await packages.fetch_package(session, ecosystem, name, with_documents=False)
         package = lookup.package
     if package is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="package not found")
@@ -159,6 +161,22 @@ async def package_detail(
     # OSV often carries several records for one CVE (a GHSA and a PYSEC entry,
     # say); listing both makes a package look twice as vulnerable as it is.
     cves = {version_id: dedupe_by_cve(items) for version_id, items in cves.items()}
+
+    # The full per-version verdict, not just the name check: a version refused
+    # by the CVE policy or a version-range rule is missing from the metadata
+    # clients see, and this page is where users come to find out why their
+    # install said "no matching version". The engine memoises rules and
+    # settings, so this is one load plus in-memory checks per version.
+    version_verdicts = {}
+    for v in package.versions:
+        version_verdicts[v.id] = await policy.evaluate(
+            ecosystem,
+            package.normalized_name,
+            v.version,
+            max_cvss=v.max_cvss,
+            has_fix=v.has_fix,
+            scanned=bool(v.scanned_at),
+        )
 
     return {
         "ecosystem": ecosystem.value,
@@ -186,6 +204,10 @@ async def package_detail(
                 "requires_python": v.requires_python,
                 "max_cvss": v.max_cvss,
                 "cves": cves.get(v.id, []),
+                "blocked": version_verdicts[v.id].blocked,
+                "block_reason": (
+                    version_verdicts[v.id].reason if version_verdicts[v.id].blocked else None
+                ),
                 "files": [
                     {"filename": f.filename, "size": f.size, "cached": bool(f.blob_sha256)}
                     for f in v.files

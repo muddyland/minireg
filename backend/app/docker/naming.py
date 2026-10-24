@@ -42,16 +42,18 @@ MAX_NAME_LENGTH = 255
 HUB_UPSTREAM_NAME = "dockerhub"
 
 
+# fullmatch, not match: ``$`` also matches before a trailing newline, so
+# "v1\n" (a %0A in the URL) passed as a tag and "sha256:<hex>\n" as a digest.
 def is_digest(ref: str) -> bool:
-    return bool(DIGEST_RE.match(ref))
+    return bool(DIGEST_RE.fullmatch(ref))
 
 
 def is_tag(ref: str) -> bool:
-    return bool(TAG_RE.match(ref))
+    return bool(TAG_RE.fullmatch(ref))
 
 
 def valid_name(name: str) -> bool:
-    return 0 < len(name) <= MAX_NAME_LENGTH and bool(NAME_RE.match(name))
+    return 0 < len(name) <= MAX_NAME_LENGTH and bool(NAME_RE.fullmatch(name))
 
 
 # --------------------------------------------------------------------------- #

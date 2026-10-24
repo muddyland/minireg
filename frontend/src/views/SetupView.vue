@@ -11,6 +11,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import CodeBlock from '@/components/CodeBlock.vue'
 import EcosystemIcon from '@/components/EcosystemIcon.vue'
 import NavIcon from '@/components/NavIcon.vue'
@@ -85,7 +86,7 @@ onMounted(async () => {
   try {
     config.value = await api.clientConfig()
   } catch (err) {
-    error.value = err.detail || 'Could not load the client configuration.'
+    error.value = errorMessage(err, 'Could not load the client configuration.')
     return
   }
   try {
@@ -113,7 +114,7 @@ onMounted(async () => {
     </router-link>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
   <div v-else-if="!config" class="empty">Loading…</div>
 
   <template v-else>

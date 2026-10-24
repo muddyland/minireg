@@ -14,6 +14,8 @@ Warehouse's own rules that we reproduce:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 import re
 import zipfile
@@ -208,6 +210,27 @@ def parse_upload(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ContentDigests:
+    """The digests a PackageFile records, computed before anything is stored."""
+
+    sha256: str
+    sha1: str
+    md5: str
+    blake2b_256: str
+    size: int
+
+
+def compute_digests(content: bytes) -> ContentDigests:
+    return ContentDigests(
+        sha256=hashlib.sha256(content).hexdigest(),
+        sha1=hashlib.sha1(content).hexdigest(),
+        md5=hashlib.md5(content).hexdigest(),
+        blake2b_256=hashlib.blake2b(content, digest_size=32).hexdigest(),
+        size=len(content),
+    )
+
+
 def verify_digests(request: UploadRequest, stored) -> None:
     """Every digest the client declared must match what we received."""
     for label, declared, actual in (
@@ -227,7 +250,7 @@ def verify_digests(request: UploadRequest, stored) -> None:
 MAX_METADATA_BYTES = 4 * 1024 * 1024
 
 
-def _read_metadata_member(archive: zipfile.ZipFile) -> str | None:
+def _read_metadata_member(archive: zipfile.ZipFile) -> bytes | None:
     """Read `*.dist-info/METADATA` with a bound on the inflated size."""
     candidates = [
         info
@@ -245,7 +268,8 @@ def _read_metadata_member(archive: zipfile.ZipFile) -> str | None:
         data = handle.read(MAX_METADATA_BYTES + 1)
     if len(data) > MAX_METADATA_BYTES:
         return None
-    return data.decode("utf-8", "replace")
+    # The exact bytes: PEP 658 hashes them, so whatever is served must match.
+    return data
 
 
 def extract_wheel_metadata_from_path(path, filename: str) -> dict[str, Any] | None:
@@ -286,14 +310,59 @@ def extract_wheel_metadata(content: bytes, filename: str) -> dict[str, Any] | No
     return _parse_metadata(raw)
 
 
-def _parse_metadata(raw: str) -> dict[str, Any]:
+def _parse_metadata(raw_bytes: bytes) -> dict[str, Any]:
+    """Parse METADATA. ``_raw`` is a decoded copy for parsing and display only;
+    ``_raw_bytes`` is what gets stored and served."""
+    raw = raw_bytes.decode("utf-8", "replace")
     message = Parser().parsestr(raw)
-    metadata: dict[str, Any] = {"_raw": raw}
+    metadata: dict[str, Any] = {"_raw": raw, "_raw_bytes": raw_bytes}
     for key in message:
         values = message.get_all(key) or []
         normalized = key.lower().replace("-", "_")
         metadata[normalized] = values if len(values) > 1 else values[0]
     return metadata
+
+
+# --------------------------------------------------------------------------- #
+# PEP 658 sidecar storage
+# --------------------------------------------------------------------------- #
+# `PackageFile.core_metadata` is a JSON column. It holds the upstream's
+# advertisement (`{"sha256": ...}` or `{"available": true}`) until we have the
+# file, then `{"sha256": <digest of the exact bytes>, "_raw_b64": <the bytes>}`.
+# Rows written before byte-exact storage hold `{"_raw": <decoded text>, ...}`.
+
+
+def core_metadata_record(raw_bytes: bytes) -> dict[str, str]:
+    """What to store for METADATA we hold: the exact bytes and their digest."""
+    return {
+        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "_raw_b64": base64.b64encode(raw_bytes).decode("ascii"),
+    }
+
+
+def stored_metadata_bytes(value: Any) -> bytes | None:
+    """The METADATA bytes a ``core_metadata`` value holds, if any.
+
+    A legacy ``_raw`` row was decoded with replacement, so re-encoding it is
+    only trusted when it still matches the digest stored beside it, or when no
+    digest is stored (the renderer then advertises the digest of these same
+    bytes). Otherwise ``None``, and the caller re-extracts from the wheel.
+    """
+    if not isinstance(value, dict):
+        return None
+    encoded = value.get("_raw_b64")
+    if isinstance(encoded, str):
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except ValueError:
+            return None
+    legacy = value.get("_raw")
+    if isinstance(legacy, str):
+        data = legacy.encode("utf-8")
+        declared = value.get("sha256")
+        if not isinstance(declared, str) or declared.lower() == hashlib.sha256(data).hexdigest():
+            return data
+    return None
 
 
 def metadata_from_upload(request: UploadRequest) -> dict[str, Any]:

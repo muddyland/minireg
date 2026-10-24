@@ -73,9 +73,12 @@ class TestContentNegotiation:
             ("application/vnd.pypi.simple.v1+json", JSON_CONTENT_TYPE),
             ("application/vnd.pypi.simple.latest+json", JSON_CONTENT_TYPE),
             ("application/vnd.pypi.simple.v1+html", HTML_CONTENT_TYPE),
-            ("text/html", HTML_CONTENT_TYPE),
-            ("*/*", HTML_CONTENT_TYPE),
-            (None, HTML_CONTENT_TYPE),
+            ("application/vnd.pypi.simple.latest+html", HTML_CONTENT_TYPE),
+            # PEP 691: legacy and default requests get plain text/html, which
+            # is the only type pip < 22.2 accepts.
+            ("text/html", "text/html"),
+            ("*/*", "text/html"),
+            (None, "text/html"),
         ],
     )
     def test_accept_header(self, accept, expected):
@@ -90,9 +93,10 @@ class TestContentNegotiation:
         assert select_content_type("text/html", "application/vnd.pypi.simple.v1+json") == (
             JSON_CONTENT_TYPE
         )
-        assert select_content_type("application/vnd.pypi.simple.v1+json", "html") == (
-            HTML_CONTENT_TYPE
-        )
+        assert select_content_type("application/vnd.pypi.simple.v1+json", "html") == "text/html"
+        assert select_content_type(
+            "application/vnd.pypi.simple.v1+json", "application/vnd.pypi.simple.v1+html"
+        ) == HTML_CONTENT_TYPE
 
 
 class TestJsonProjectPage:

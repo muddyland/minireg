@@ -19,6 +19,7 @@ Routes:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from datetime import UTC, datetime
@@ -52,6 +53,36 @@ def json_response(payload, status_code: int = 200, content_type: str | None = No
         status_code=status_code,
         media_type=content_type or "application/json",
     )
+
+
+def _etag_matches(if_none_match: str | None, etag: str) -> bool:
+    """RFC 9110 weak comparison, which is what If-None-Match uses."""
+    if not if_none_match:
+        return False
+    if if_none_match.strip() == "*":
+        return True
+    candidates = (tag.strip() for tag in if_none_match.split(","))
+    return any(tag.removeprefix("W/") == etag for tag in candidates)
+
+
+def simple_response(request: Request, body: str | bytes, media_type: str) -> Response:
+    """A simple-API document with a strong ETag and ``Vary: Accept``.
+
+    The ETag hashes the exact bytes served together with the negotiated type,
+    so the HTML served as ``text/html`` and as the PEP 691 type, which share a
+    body, are still distinct representations. pip and uv revalidate cached
+    project pages with If-None-Match; matching gets a body-less 304.
+    """
+    data = body.encode("utf-8") if isinstance(body, str) else body
+    etag = '"' + hashlib.sha256(media_type.encode() + b"\n" + data).hexdigest() + '"'
+    headers = {"etag": etag, "vary": "Accept"}
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return Response(content=data, media_type=media_type, headers=headers)
+
+
+def simple_json_response(request: Request, payload) -> Response:
+    return simple_response(request, orjson.dumps(payload), pypi_render.JSON_CONTENT_TYPE)
 
 
 def upload_error(message: str, status_code: int) -> PlainTextResponse:
@@ -98,14 +129,10 @@ async def simple_index(
         if (await policy.evaluate(ECOSYSTEM, normalize_pypi_name(name), _name_level=True)).allowed
     ]
 
-    if pypi_render.wants_json(accept, format):
-        return json_response(
-            pypi_render.render_index_json(names), content_type=pypi_render.JSON_CONTENT_TYPE
-        )
-    return Response(
-        content=pypi_render.render_index_html(names),
-        media_type=pypi_render.HTML_CONTENT_TYPE,
-    )
+    content_type = pypi_render.select_content_type(accept, format)
+    if content_type == pypi_render.JSON_CONTENT_TYPE:
+        return simple_json_response(request, pypi_render.render_index_json(names))
+    return simple_response(request, pypi_render.render_index_html(names), content_type)
 
 
 @router.get("/simple/{project}/")
@@ -134,7 +161,8 @@ async def simple_project(
             name_verdict.reason or "package is blocked", status_code=status.HTTP_403_FORBIDDEN
         )
 
-    as_json = pypi_render.wants_json(accept, format)
+    content_type = pypi_render.select_content_type(accept, format)
+    as_json = content_type == pypi_render.JSON_CONTENT_TYPE
     cache_id = packages.cache_key("pypi", normalized, "json" if as_json else "html")
     cached = await cache_get_json(cache_id)
     if cached is not None:
@@ -151,8 +179,8 @@ async def simple_project(
             )
         )
         if as_json:
-            return json_response(cached, content_type=pypi_render.JSON_CONTENT_TYPE)
-        return Response(content=cached["html"], media_type=pypi_render.HTML_CONTENT_TYPE)
+            return simple_json_response(request, cached)
+        return simple_response(request, cached["html"], content_type)
 
     lookup = await packages.fetch_package(session, ECOSYSTEM, project)
     if lookup.package is None:
@@ -186,11 +214,11 @@ async def simple_project(
     if as_json:
         payload = pypi_render.render_project_json(package, excluded_versions=excluded)
         await cache_set_json(cache_id, payload, settings.meta_cache_ttl)
-        return json_response(payload, content_type=pypi_render.JSON_CONTENT_TYPE)
+        return simple_json_response(request, payload)
 
     html = pypi_render.render_project_html(package, excluded_versions=excluded)
     await cache_set_json(cache_id, {"html": html}, settings.meta_cache_ttl)
-    return Response(content=html, media_type=pypi_render.HTML_CONTENT_TYPE)
+    return simple_response(request, html, content_type)
 
 
 # --------------------------------------------------------------------------- #
@@ -288,7 +316,7 @@ async def get_file(
         headers={
             "content-length": str(size),
             "cache-control": "public, max-age=31536000, immutable",
-            "etag": f'"{file_row.blob_sha256}"',
+            **_artifact_etag(file_row),
             "content-disposition": f'attachment; filename="{filename}"',
         },
     )
@@ -316,11 +344,12 @@ async def _get_core_metadata(session: AsyncSession, project: str, filename: str)
             verdict.reason or "blocked", status_code=status.HTTP_403_FORBIDDEN
         )
 
-    stored = (file_row.core_metadata or {}).get("_raw")
-    if stored:
-        return PlainTextResponse(stored, media_type="text/plain")
+    stored = pypi_publish.stored_metadata_bytes(file_row.core_metadata)
+    if stored is not None:
+        return _metadata_response(stored)
 
-    # Not extracted yet: pull it out of the cached wheel. Read the METADATA
+    # Not extracted yet (or a legacy decoded copy that no longer matches the
+    # advertised digest): pull it out of the cached wheel. Read the METADATA
     # member straight from the blob on disk -- loading the whole wheel into
     # memory to reach a few kilobytes of text is how a handful of concurrent
     # `pip install torch` requests used to exhaust the container.
@@ -330,12 +359,41 @@ async def _get_core_metadata(session: AsyncSession, project: str, filename: str)
         get_store().blob_path(file_row.blob_sha256),
         file_row.filename,
     )
-    if not metadata or "_raw" not in metadata:
+    if not metadata or "_raw_bytes" not in metadata:
         return PlainTextResponse("Not Found", status_code=status.HTTP_404_NOT_FOUND)
 
-    file_row.core_metadata = {**(file_row.core_metadata or {}), "_raw": metadata["_raw"]}
+    raw: bytes = metadata["_raw_bytes"]
+    previous = file_row.core_metadata if isinstance(file_row.core_metadata, dict) else {}
+    record = pypi_publish.core_metadata_record(raw)
+    # Keep the upstream's flags but replace its digests and any legacy decoded
+    # copy: the advertisement must describe exactly the bytes served here.
+    file_row.core_metadata = {
+        **{k: v for k, v in previous.items() if k == "available"},
+        **record,
+    }
     await session.commit()
-    return PlainTextResponse(metadata["_raw"], media_type="text/plain")
+    if previous.get("sha256") != record["sha256"]:
+        # The rendered project pages advertise the old digest (or none).
+        await packages.invalidate_package_cache("pypi", package.normalized_name)
+    return _metadata_response(raw)
+
+
+def _metadata_response(raw: bytes) -> Response:
+    """Serve METADATA byte-for-byte; PEP 658 clients hash exactly these bytes.
+
+    The core metadata spec says UTF-8, and it is labelled so when it is; bytes
+    that do not decode are served unlabelled rather than with a false charset.
+    """
+    try:
+        raw.decode("utf-8")
+        media_type = "text/plain; charset=utf-8"
+    except UnicodeDecodeError:
+        media_type = "application/octet-stream"
+    return Response(
+        content=raw,
+        media_type=media_type,
+        headers={"etag": f'"{hashlib.sha256(raw).hexdigest()}"'},
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -513,9 +571,11 @@ async def upload(
                 status.HTTP_400_BAD_REQUEST,
             )
 
-    stored = await get_store().put_bytes(parsed.content)
+    # Every refusal comes before the bytes reach the blob store. Storing first
+    # left a file with no Blob row behind each refused upload.
+    digests = await asyncio.to_thread(pypi_publish.compute_digests, parsed.content)
     try:
-        pypi_publish.verify_digests(parsed, stored)
+        pypi_publish.verify_digests(parsed, digests)
     except pypi_publish.UploadError as exc:
         return upload_error(exc.message, exc.status_code)
 
@@ -566,9 +626,16 @@ async def upload(
         package.versions.append(version_row)
         await session.flush()
 
-    blob = await session.get(Blob, stored.sha256)
+    blob = await session.get(Blob, digests.sha256)
     if blob is None:
-        session.add(Blob(sha256=stored.sha256, size=stored.size, path=stored.path, refcount=1))
+        session.add(
+            Blob(
+                sha256=digests.sha256,
+                size=digests.size,
+                path=get_store().relative_path_for(digests.sha256),
+                refcount=1,
+            )
+        )
     else:
         blob.refcount += 1
 
@@ -578,17 +645,21 @@ async def upload(
         PackageFile(
             version_id=version_row.id,
             filename=parsed.filename,
-            blob_sha256=stored.sha256,
-            size=stored.size,
+            blob_sha256=digests.sha256,
+            size=digests.size,
             content_type=parsed.content_type,
-            sha256=stored.sha256,
-            sha1=stored.sha1,
-            md5=stored.md5,
-            blake2b_256=stored.blake2b_256,
+            sha256=digests.sha256,
+            sha1=digests.sha1,
+            md5=digests.md5,
+            blake2b_256=digests.blake2b_256,
             packagetype=parsed.filetype,
             python_version=parsed.pyversion,
             requires_python=parsed.requires_python,
-            core_metadata={"_raw": core_metadata["_raw"]} if core_metadata else None,
+            core_metadata=(
+                pypi_publish.core_metadata_record(core_metadata["_raw_bytes"])
+                if core_metadata
+                else None
+            ),
             upload_time=datetime.now(UTC),
             cached_at=datetime.now(UTC),
         )
@@ -627,13 +698,35 @@ async def upload(
             "ecosystem": "pypi",
         },
     )
-    await session.commit()
+    # The bytes land last, immediately before the commit that references them,
+    # and are removed again if that commit fails.
+    stored = await get_store().put_bytes(parsed.content)
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        if not stored.already_existed:
+            await _discard_unreferenced_blob(session, stored.sha256)
+        raise
     await packages.invalidate_package_cache("pypi", normalized)
 
     await _forward_to_publish_targets(session, parsed)
 
     # Warehouse returns a bare 200 on success; twine only checks the status.
     return PlainTextResponse("", status_code=status.HTTP_200_OK)
+
+
+async def _discard_unreferenced_blob(session: AsyncSession, sha256: str) -> None:
+    """Delete a blob file this request wrote, unless a Blob row now claims it
+    (a concurrent upload of the same bytes may have committed one)."""
+    try:
+        referenced = (
+            await session.execute(select(Blob.sha256).where(Blob.sha256 == sha256))
+        ).first()
+        if referenced is None:
+            get_store().delete(sha256)
+    except Exception:
+        log.warning("could not discard unreferenced blob %s", sha256, exc_info=True)
 
 
 async def _forward_to_publish_targets(
@@ -694,11 +787,16 @@ async def _scan_new_versions(session: AsyncSession, package: Package) -> None:
     except Exception:
         log.debug("inline scan batch failed for %s", package.name, exc_info=True)
         return
+    changed = False
     for version_row in targets:
         result = results.get((package.name, version_row.version))
         if result is not None:
-            await scanner.apply_to_version(version_row, result, package.name)
+            changed |= await scanner.apply_to_version(version_row, result, package.name)
     await session.commit()
+    if changed:
+        # The caller renders one representation; the other (HTML vs JSON)
+        # may already be cached with the old verdict baked in.
+        await packages.invalidate_package_cache("pypi", package.normalized_name)
 
 
 async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
@@ -715,3 +813,14 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
         if verdict.blocked:
             blocked.add(version_row.version)
     return blocked
+
+
+def _artifact_etag(file_row) -> dict[str, str]:
+    """ETag for an immutable artifact, or nothing while its digest is unknown.
+
+    A response streamed while the upstream download is still running has no
+    ``blob_sha256`` yet; sending ``etag: "None"`` would let a client cache
+    every such response under one validator.
+    """
+    digest = file_row.blob_sha256 or file_row.sha256
+    return {"etag": f'"{digest}"'} if digest else {}

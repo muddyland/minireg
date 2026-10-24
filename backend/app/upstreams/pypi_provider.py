@@ -22,6 +22,7 @@ from .base import (
     UpstreamNotFound,
     UpstreamProvider,
 )
+from .revalidation import Validators, check_not_modified
 
 log = logging.getLogger(__name__)
 
@@ -135,9 +136,18 @@ class PyPIProvider(UpstreamProvider):
             return None
         return template.format(normalized_name=normalize_pypi_name(name))
 
-    async def fetch_package(self, name: str) -> RemotePackage:
+    async def fetch_package(
+        self, name: str, *, validators: Validators | None = None
+    ) -> RemotePackage:
+        """Fetch the project page; conditional when ``validators`` is given
+        (see :class:`~.npm_provider.NpmProvider.fetch_package`)."""
         url = self.project_url(name)
-        resp = await self.request("GET", url, headers={"accept": SIMPLE_ACCEPT})
+        headers = {"accept": SIMPLE_ACCEPT, **(validators.headers() if validators else {})}
+        resp = await self.request("GET", url, headers=headers)
+        check_not_modified(resp, validators)
+        if resp.status_code == 304:
+            # An empty body would parse as a project with no files.
+            raise UpstreamError(f"{self.name}: unsolicited HTTP 304")
         if resp.status_code == 404:
             raise UpstreamNotFound(f"{self.name}: {name} not found")
         if resp.status_code >= 400:
@@ -149,6 +159,7 @@ class PyPIProvider(UpstreamProvider):
         else:
             files, versions_hint, raw = self._parse_html(resp.text, url)
 
+        self.response_validators = Validators.from_response(self.id, resp)
         return self._assemble(name, files, versions_hint, raw, resp.headers.get("etag"))
 
     # -- parsing ------------------------------------------------------------ #
