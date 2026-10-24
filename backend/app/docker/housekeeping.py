@@ -58,6 +58,7 @@ async def run_housekeeping() -> dict:
         ("watch", _watch),
         ("evict", _evict),
         ("gc", _gc),
+        ("orphans", _orphan_files),
         ("rescan", _rescans),
         ("kev", _kev),
     ):
@@ -249,6 +250,128 @@ async def _gc() -> dict:
     if removed_blobs or removed_manifests:
         bump("docker.gc.freed_bytes", freed)
     return {"manifests": removed_manifests, "blobs": removed_blobs, "freed_bytes": freed}
+
+
+#: A stored file younger than this is left alone by the orphan sweep: a
+#: manifest or upload is written to the store a moment before its row.
+ORPHAN_GRACE_SECONDS = 6 * 3600
+_ORPHAN_BATCH = 500
+
+
+def _stored_files(store, older_than: float) -> list[tuple[str, int]]:
+    """(digest, size) of every file in the blob tree last modified before
+    ``older_than``. Runs in a thread; the tree can hold a lot of files."""
+    out: list[tuple[str, int]] = []
+    root = store.blobs
+    if not root.is_dir():
+        return out
+    for shard in root.iterdir():
+        if not shard.is_dir():
+            continue
+        for entry in shard.iterdir():
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            name = entry.name
+            if len(name) != 64 or not entry.is_file() or st.st_mtime >= older_than:
+                continue
+            out.append((f"sha256:{name}", st.st_size))
+    return out
+
+
+async def _orphan_files() -> dict:
+    """Reconcile the blob tree with the tables.
+
+    A completed fill records its DockerBlob row afterwards, in a separate
+    transaction whose failure is suppressed (the client already has its
+    bytes). When that write fails the file stays on disk with no row: GC
+    walks rows, so it never deletes it, and usage() never counts it -- the
+    store drifts above what the budget believes it holds.
+
+    Each file is looked up by digest. Anything a table knows about -- a
+    blob row, a manifest, an SBOM, a scan report -- is left alone. A file
+    that a manifest still names gets its missing DockerBlob row back, so it
+    is counted and collected like any other blob. One that nothing names is
+    deleted.
+    """
+    import asyncio
+
+    store = get_oci_store()
+    cutoff = time.time() - ORPHAN_GRACE_SECONDS
+    files = await asyncio.to_thread(_stored_files, store, cutoff)
+    adopted = deleted = freed = 0
+    for start in range(0, len(files), _ORPHAN_BATCH):
+        batch = dict(files[start : start + _ORPHAN_BATCH])
+        digests = list(batch)
+        async with session_scope() as session:
+            known: set[str] = set()
+            for column in (
+                DockerBlob.digest,
+                DockerManifest.digest,
+                DockerManifest.sbom_digest,
+                DockerScan.report_digest,
+            ):
+                known.update(
+                    (await session.execute(select(column).where(column.in_(digests)))).scalars().all()
+                )
+            missing = [d for d in digests if d not in known]
+            if not missing:
+                continue
+            named = {
+                digest: (media_type, upstream_id)
+                for digest, media_type, upstream_id in (
+                    await session.execute(
+                        select(
+                            DockerManifestRef.digest,
+                            DockerManifestRef.media_type,
+                            DockerManifest.upstream_id,
+                        )
+                        .join(DockerManifest, DockerManifest.id == DockerManifestRef.manifest_id)
+                        .where(
+                            DockerManifestRef.digest.in_(missing),
+                            DockerManifestRef.ref_type.in_(("blob", "config")),
+                        )
+                    )
+                ).all()
+            }
+            held = set(
+                (
+                    await session.execute(
+                        select(DockerRepoBlob.digest).where(DockerRepoBlob.digest.in_(missing))
+                    )
+                ).scalars().all()
+            )
+            for digest in missing:
+                size = batch[digest]
+                if digest in named or digest in held:
+                    media_type, upstream_id = named.get(digest, (None, None))
+                    session.add(
+                        DockerBlob(
+                            digest=digest,
+                            size=size,
+                            media_type=media_type,
+                            upstream_id=upstream_id,
+                            # Held by a push, or named only by a pushed image:
+                            # exists nowhere else, so never evictable.
+                            is_local=digest in held or (digest in named and upstream_id is None),
+                        )
+                    )
+                    adopted += 1
+                elif store.delete(digest):
+                    deleted += 1
+                    freed += size
+    if adopted or deleted:
+        bump("docker.orphans.adopted", adopted)
+        bump("docker.orphans.deleted", deleted)
+        log.warning(
+            "blob store drift: recorded %d file(s) that had no row, deleted %d unreferenced "
+            "file(s) (%d bytes)",
+            adopted,
+            deleted,
+            freed,
+        )
+    return {"adopted": adopted, "deleted": deleted, "freed_bytes": freed}
 
 
 async def _evict() -> dict:

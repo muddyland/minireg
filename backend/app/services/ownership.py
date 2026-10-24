@@ -167,9 +167,11 @@ async def authorize_publish(
             log.warning(
                 "shadow check unavailable for %s:%s -- %s", ecosystem.value, display_name, exc
             )
+            # The resolver's exception text names upstream hosts and echoes
+            # their errors. It is logged above; the publisher gets the gist.
             raise PublishDenied(
-                f"could not check whether '{display_name}' already exists upstream "
-                f"({exc}). Refusing rather than risk shadowing a public package; "
+                f"could not check whether '{display_name}' already exists upstream. "
+                "Refusing rather than risk shadowing a public package; "
                 "retry once the upstreams are reachable.",
                 status_code=503,
             ) from exc

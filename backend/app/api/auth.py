@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..core.cache import rate_limit
+from ..core.cache import rate_limit, rate_limit_retry_after
 from ..core.deps import Identity, client_ip, require_primary_credential, require_user, resolve_identity
 from ..core.security import (
     create_session_token,
@@ -113,13 +113,16 @@ async def login(
 ) -> dict:
     ip = client_ip(request)
     # Throttle by IP *and* username so neither a single source nor a single
-    # account can be brute-forced.
+    # account can be brute-forced. Fail closed: with the cache down these fall
+    # back to an in-process counter instead of letting every guess through.
+    # The Basic-auth path in core/deps.py shares these buckets and already did.
     for key in (f"login:ip:{ip}", f"login:user:{payload.username}"):
-        allowed, _ = await rate_limit(key, settings.rate_limit_login_per_minute)
+        allowed, _ = await rate_limit(key, settings.rate_limit_login_per_minute, fail_closed=True)
         if not allowed:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="too many login attempts; try again shortly",
+                headers={"Retry-After": str(rate_limit_retry_after())},
             )
 
     user = (
@@ -260,7 +263,10 @@ async def change_password(
 # --------------------------------------------------------------------------- #
 @router.get("/tokens")
 async def list_tokens(
-    session: AsyncSession = Depends(get_session), identity: Identity = Depends(require_user)
+    session: AsyncSession = Depends(get_session),
+    # Same guard as minting: a leaked read-only token must not be able to
+    # enumerate (or, below, revoke) its owner's other credentials.
+    identity: Identity = Depends(require_primary_credential),
 ) -> dict:
     rows = (
         await session.execute(
@@ -400,7 +406,7 @@ async def revoke_token(
     token_id: int,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    identity: Identity = Depends(require_user),
+    identity: Identity = Depends(require_primary_credential),
 ) -> dict:
     row = await session.get(ApiToken, token_id)
     if row is None:
@@ -448,6 +454,36 @@ def _redirect_uri() -> str:
     return f"{settings.public_url}/api/auth/oidc/callback"
 
 
+#: Matches the users.username column.
+_USERNAME_MAX = 150
+
+
+async def _unique_username(session: AsyncSession, wanted: str) -> str:
+    """A free username based on what the identity provider proposed.
+
+    Inserting the claim verbatim raised IntegrityError -- a 500 -- whenever a
+    local account (or another IdP subject) already had that name, and at most
+    providers the user picks their own preferred_username. Suffixing keeps
+    the name recognisable while never touching the existing account.
+    """
+    base = (wanted or "").strip()[:_USERNAME_MAX] or "user"
+
+    async def taken(candidate: str) -> bool:
+        return (
+            await session.execute(select(User.id).where(User.username == candidate))
+        ).first() is not None
+
+    if not await taken(base):
+        return base
+    stem = base[: _USERNAME_MAX - 4]
+    for n in range(2, 100):
+        candidate = f"{stem}-{n}"
+        if not await taken(candidate):
+            return candidate
+    # Pathological: a hundred accounts already share the stem.
+    return f"{base[: _USERNAME_MAX - 9]}-{secrets.token_hex(4)}"
+
+
 @router.get("/oidc/login")
 async def oidc_login(next: str = "/") -> RedirectResponse:
     if not settings.oidc_enabled:
@@ -474,7 +510,13 @@ async def oidc_login(next: str = "/") -> RedirectResponse:
     try:
         url = await oidc.build_authorization_url(_redirect_uri(), state, nonce, challenge)
     except oidc.OidcError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        # The detail names the provider's endpoints and echoes its responses;
+        # that is for the operator's log, not for whoever clicked the button.
+        log.warning("OIDC login could not start: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="single sign-on is unavailable right now; try again later",
+        ) from exc
     response = RedirectResponse(url, status_code=status.HTTP_302_FOUND)
     response.set_cookie(
         OIDC_BIND_COOKIE,
@@ -550,10 +592,17 @@ async def oidc_callback(
             actor_type="anonymous",
             success=False,
             ip=ip,
-            detail={"method": "oidc", "error": str(exc)},
+            detail={"method": "oidc", "error": str(exc)[:500]},
         )
         await session.commit()
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+        # The exception text carries the token endpoint's URL and up to 300
+        # bytes of the provider's response body. Logged and audited above;
+        # the browser gets a generic message.
+        log.warning("OIDC callback failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="single sign-on failed; try signing in again",
+        ) from exc
 
     if not profile.is_permitted():
         await audit.record_audit(
@@ -619,7 +668,10 @@ async def oidc_callback(
                 detail="no local account exists and automatic creation is disabled",
             )
         user = User(
-            username=profile.username,
+            # preferred_username is chosen by the user at most IdPs. It is
+            # never used to find an account (that would be a takeover), and
+            # it may already be taken here, so derive a free one.
+            username=await _unique_username(session, profile.username),
             email=profile.email,
             full_name=profile.full_name,
             provider=AuthProvider.oidc,

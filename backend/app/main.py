@@ -30,7 +30,7 @@ from .api import search as search_api
 from .api.admin import router as admin_router
 from .config import settings
 from .core.cache import close_redis, init_redis
-from .core.deps import Identity, require_admin, resolve_identity
+from .core.deps import Identity, check_trusted_proxy_config, require_admin, resolve_identity
 from .core.metrics import COUNTERS
 from .core.security import hash_password
 from .db import create_schema, dispose_engine, init_engine, session_scope
@@ -375,6 +375,10 @@ if settings.environment == "dev":
         allow_headers=["*"],
     )
 
+# Say so at startup when the trusted-proxy set covers the address Docker's
+# port relay connects from; see core/deps.py.
+check_trusted_proxy_config()
+
 
 #: Paths that accept a package upload. Everything else gets a much smaller
 #: ceiling, because nothing else has a legitimate reason to be large.
@@ -498,7 +502,50 @@ async def security_headers(request: Request, call_next):
     # The registry endpoints are consumed by CLIs, not browsers, so a frame
     # policy only matters for the admin UI -- but it costs nothing here.
     response.headers.setdefault("x-frame-options", "DENY")
+    if _HSTS:
+        response.headers.setdefault("strict-transport-security", _HSTS)
+    content_type = response.headers.get("content-type", "")
+    if content_type.startswith("text/html"):
+        response.headers.setdefault("content-security-policy", UI_CSP)
     return response
+
+
+#: The policy for HTML responses -- in practice the SPA's index.html.
+#:
+#: What the built app needs, checked against the Vite output and the sources:
+#: * scripts: one module entry under /assets, no inline script (Vite bundles
+#:   its modulepreload polyfill into the entry chunk), no eval -- Vue
+#:   templates are compiled at build time, and the runtime-only build is used.
+#: * styles: the extracted CSS files under /assets, *plus* inline style
+#:   attributes. Templates carry static `style="..."` attributes, and Vue
+#:   inserts large static subtrees with innerHTML, which CSP treats as inline
+#:   style. Without 'unsafe-inline' those silently lose their layout. Inline
+#:   style cannot run script, so this is the right trade.
+#: * connections: fetch and EventSource to this origin only.
+#: * images: the favicon and inline SVG; `data:` for any icon a stylesheet
+#:   embeds.
+UI_CSP = "; ".join(
+    [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data:",
+        "font-src 'self' data:",
+        "connect-src 'self'",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+    ]
+)
+
+def hsts_value(public_url: str) -> str | None:
+    """Only over https: browsers ignore HSTS on plain http, and a deployment
+    reached over http must not be pinned to https it does not serve."""
+    return "max-age=31536000" if public_url.lower().startswith("https://") else None
+
+
+_HSTS = hsts_value(settings.public_url)
 
 
 @app.get("/health", tags=["meta"])

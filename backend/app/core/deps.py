@@ -118,6 +118,8 @@ def client_ip(request: Request) -> str | None:
 
     hops = max(1, settings.trusted_proxy_hops)
     forwarded = request.headers.get("x-forwarded-for")
+    if not forwarded and not request.headers.get("x-real-ip"):
+        _warn_if_relayed_direct(peer)
     if forwarded:
         parts = [p.strip() for p in forwarded.split(",") if p.strip()]
         if parts:
@@ -127,6 +129,101 @@ def client_ip(request: Request) -> str | None:
     if real:
         return real.strip()[:64]
     return peer[:64] if peer else None
+
+
+def _default_gateway(route_table: str = "/proc/net/route") -> str | None:
+    """The IPv4 default gateway, read from the kernel's routing table.
+
+    In a container on a Docker bridge this is the bridge's address on the
+    host -- the address Docker's userland proxy connects from when it relays
+    a published port.
+    """
+    import socket
+    import struct
+
+    try:
+        with open(route_table) as fh:
+            lines = fh.read().splitlines()[1:]
+    except OSError:
+        return None
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3 or fields[1] != "00000000":
+            continue
+        try:
+            return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
+        except (ValueError, struct.error, OSError):
+            return None
+    return None
+
+
+#: (gateway, already warned). Computed on first use.
+_relay_state: dict[str, object] = {}
+
+
+def check_trusted_proxy_config() -> str | None:
+    """Startup check: does TRUSTED_PROXY_IPS trust our own gateway?
+
+    Returns the gateway address when it does (after logging a warning), so
+    the operator is told once per start that the setting is only safe while
+    the published port is not reachable by clients directly. See
+    :func:`_warn_if_relayed_direct` for the stronger, traffic-based signal.
+    """
+    gateway = _default_gateway()
+    _relay_state["gateway"] = gateway
+    if not gateway or not _is_trusted_proxy(gateway):
+        return None
+    log.warning(
+        "TRUSTED_PROXY_IPS trusts %s, this container's gateway. Docker's port "
+        "relay connects from that address, so X-Forwarded-For is believed from "
+        "anything that reaches the published port. That is safe only while the "
+        "port is bound to loopback (BIND_ADDRESS=127.0.0.1) or reachable solely "
+        "by your reverse proxy; with BIND_ADDRESS=0.0.0.0 and no proxy, set "
+        "TRUSTED_PROXY_IPS= (empty).",
+        gateway,
+    )
+    return gateway
+
+
+def _warn_if_relayed_direct(peer: str | None) -> None:
+    """Warn, once, when a direct client reaches us through a trusted relay.
+
+    The default TRUSTED_PROXY_IPS trusts the private ranges because the
+    shipped layout has a proxy on the host reach the container over the
+    Docker bridge. But Docker's userland proxy relays *every* connection to
+    a published port from the bridge gateway, so with BIND_ADDRESS=0.0.0.0
+    (or an LXC/rootless setup that relays everything) any client on the
+    network arrives from that trusted address and may write its own
+    X-Forwarded-For -- choosing its rate-limit bucket and audit address.
+
+    That cannot be told apart at startup from the safe layout, where the
+    host's proxy connects to 127.0.0.1 and is relayed from the same gateway.
+    What does tell them apart is traffic: a reverse proxy always adds a
+    forwarding header, a client connecting directly does not. So the first
+    request from the gateway without one is logged as a warning. In-network
+    callers (the scanner, the healthcheck) connect from their own addresses,
+    not the gateway, and do not trigger it.
+    """
+    if not peer or _relay_state.get("warned"):
+        return
+    if "gateway" not in _relay_state:
+        _relay_state["gateway"] = _default_gateway()
+    gateway = _relay_state["gateway"]
+    if not gateway or peer != gateway or not _is_trusted_proxy(peer):
+        return
+    _relay_state["warned"] = True
+    log.warning(
+        "A request arrived from %s, this container's gateway, with no "
+        "X-Forwarded-For. That is a client reaching the published port directly "
+        "through Docker's port relay, and TRUSTED_PROXY_IPS (%s) trusts that "
+        "address -- so any such client can set X-Forwarded-For and choose the "
+        "address used for rate limits and the audit log. Bind the port to "
+        "loopback (BIND_ADDRESS=127.0.0.1) behind a reverse proxy, or narrow "
+        "TRUSTED_PROXY_IPS to the proxy's own address (empty when nothing is "
+        "in front).",
+        peer,
+        settings.trusted_proxy_ips,
+    )
 
 
 @lru_cache(maxsize=4096)
@@ -228,7 +325,10 @@ async def _basic_password_identity(
 async def resolve_identity(
     request: Request, session: AsyncSession = Depends(get_session)
 ) -> Identity:
-    """Never raises. Routes decide what to do with an anonymous identity.
+    """Routes decide what to do with an anonymous identity.
+
+    Raises only for a valid session cookie on a cross-site state-changing
+    request (403, see :func:`is_cross_site`); a bad credential is anonymous.
 
     An ``Authorization`` header is authoritative: if one is present but does not
     authenticate, we return anonymous rather than falling back to a session
@@ -269,9 +369,97 @@ async def resolve_identity(
             # password change or a sign-out-everywhere bumps it, which is what
             # makes a stateless session revocable.
             if user and user.is_active and payload.get("sv", 0) == user.session_version:
+                # The cookie is the one credential a browser attaches on its
+                # own, so it is the only one a cross-site request can ride.
+                reject_cross_site(request)
                 return Identity(user=user, method="session")
 
     return Identity()
+
+
+#: Methods that change state. A cookie-authenticated one must come from our
+#: own pages.
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+#: Origins besides PUBLIC_URL's that may drive the session in development
+#: (the Vite dev server, mirroring the CORS setup in main.py).
+_DEV_ORIGINS = frozenset({"http://localhost:5173"})
+
+
+def _origin_of(url: str) -> str | None:
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if scheme not in ("http", "https") or not host:
+        return None
+    default = 443 if scheme == "https" else 80
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{scheme}://{host}" + (f":{port}" if port and port != default else "")
+
+
+def _trusted_origin(origin: str | None) -> bool:
+    if not origin:
+        return False
+    if origin == _origin_of(settings.public_url):
+        return True
+    return settings.environment == "dev" and origin in _DEV_ORIGINS
+
+
+def is_cross_site(request: Request) -> bool:
+    """Whether a state-changing request did *not* come from our own pages.
+
+    ``Sec-Fetch-Site`` is set by the browser and cannot be forged by page
+    script; every current browser sends it. ``same-origin`` is our SPA,
+    ``none`` is the user acting directly (typing a URL, a bookmark). Anything
+    else -- including ``same-site``, which covers every other app on a shared
+    parent domain that ``SameSite=Lax`` does nothing about -- is refused.
+
+    Without that header (an older browser), ``Origin`` and then ``Referer``
+    must name PUBLIC_URL's origin; ``Origin: null`` (sandboxed frames,
+    privacy-sensitive redirects) counts as no match.
+
+    A request carrying none of the three is let through. The Fetch standard
+    has browsers attach ``Origin`` to every request whose method is not GET
+    or HEAD, so such a request did not come from a browser -- and forging a
+    request needs the victim's browser to send it. Scripts and test clients
+    that hold a session cookie keep working.
+    """
+    if request.method.upper() not in _UNSAFE_METHODS:
+        return False
+    site = request.headers.get("sec-fetch-site")
+    if site is not None:
+        return site.strip().lower() not in ("same-origin", "none")
+    origin = request.headers.get("origin")
+    if origin is not None and origin.strip().lower() != "null":
+        return not _trusted_origin(_origin_of(origin))
+    referer = request.headers.get("referer")
+    if referer:
+        return not _trusted_origin(_origin_of(referer))
+    # Origin: null with no Referer to vouch for it is a browser hiding where
+    # the request came from; refuse. No Origin at all is not a browser.
+    return origin is not None
+
+
+def reject_cross_site(request: Request) -> None:
+    """Refuse a cookie-authenticated unsafe request from another site."""
+    if is_cross_site(request):
+        log.warning(
+            "refused cross-site %s %s (Sec-Fetch-Site=%r, Origin=%r)",
+            request.method,
+            request.url.path,
+            request.headers.get("sec-fetch-site"),
+            request.headers.get("origin"),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="cross-site request refused; use this site's own pages or an API token",
+        )
 
 
 # --------------------------------------------------------------------------- #

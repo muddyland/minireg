@@ -474,11 +474,14 @@ class TestBlobs:
         headers = await anon(client, "secret")
         await client.get("/v2/secret/manifests/1", headers=headers)
         await client.get(f"/v2/secret/blobs/{sha(img.layers[0])}", headers=headers)
-        # Pull-through repos defer to the upstream, which already enforces
-        # its own access; a cached digest is content-verified either way.
+        # This used to answer 200: pull-through repos skipped the membership
+        # check for cached blobs, so any repository name served any cached
+        # layer -- including the layers of an image blocked or quarantined
+        # under its own name. A repository serves only what its manifests name.
         other = await anon(client, "other")
         resp = await client.get(f"/v2/other/blobs/{sha(img.layers[0])}", headers=other)
-        assert resp.status_code == 200
+        assert resp.status_code == 404
+        assert resp.json()["errors"][0]["code"] == "BLOB_UNKNOWN"
 
 
 class TestTagsAndCatalog:
