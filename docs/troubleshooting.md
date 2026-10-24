@@ -362,14 +362,14 @@ affected by **Block versions that could not be scanned**.
 
 ### Versions disappeared after an upstream change
 
-Disabling or deleting an upstream removes every cached version only it
-supplied — see
+Deleting an upstream removes every cached version only it supplied — see
 [Changing, disabling and deleting upstreams](configuration.md#changing-disabling-and-deleting-upstreams).
-The `admin.upstream.updated` or `admin.upstream.deleted` audit entry records
-`retired_versions`. Re-enable it and they are fetched again on demand.
+The `admin.upstream.deleted` audit entry records `retired_versions`. Disabling
+one removes nothing.
 
-Versions also go when a higher tier starts answering for a name and does not
-list them. The log line is `pruned N version(s) of …`.
+Versions also go when a higher tier starts answering for a name, with at least
+one version, and does not list them. The log line is
+`pruned N version(s) of …`.
 
 ### Package count jumped into the hundreds of thousands
 

@@ -112,10 +112,10 @@ tier 2 upstreams (raced)
   produce a version list no upstream ever published.
 - Locally published versions are never overwritten by upstream data, so a
   private package shadowing a public name keeps its own content.
-- Cached versions follow the current answer. When a tier answers, versions
-  cached from a lower tier that it does not list are pruned; so is everything
-  only a disabled or deleted upstream supplied. An upstream that is merely
-  unreachable keeps its versions.
+- Cached versions follow the current answer. When a tier answers with at
+  least one version, versions cached from a lower tier that it does not list
+  are pruned; so is everything only a deleted upstream supplied. A disabled or
+  merely unreachable upstream keeps its versions.
 - A refresh after `META_CACHE_TTL` sends the stored `ETag` / `Last-Modified`
   back to the upstream that issued them. A `304` only restarts the TTL.
 

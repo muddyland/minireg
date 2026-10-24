@@ -261,11 +261,12 @@ the ones that matter for that job.
 - Artifact URLs come out of upstream metadata, so fetches are restricted to
   the upstream's own host plus an allowlist, never to a private or link-local
   address, and re-checked on every redirect hop. Metadata and search requests
-  follow the same rules, and every connection is pinned to the address that
-  was checked, so DNS rebinding cannot redirect it.
-- Disabling an upstream removes what it alone supplied at once, artifacts
-  included; and when a higher tier answers for a name, versions cached from a
-  lower tier that it does not list are dropped.
+  follow the same rules, and every direct connection is pinned to the address
+  that was checked, so DNS rebinding cannot redirect it.
+- Deleting an upstream removes what it alone supplied at once, artifacts
+  included (disabling one is a pause); and when a higher tier answers for a
+  name with versions, versions cached from a lower tier that it does not list
+  are dropped.
 - Credentials go only to the upstream's own origin, so a 302 to object storage
   cannot carry a GitLab token off-site.
 - A response naming a different package than the one requested is discarded.

@@ -240,7 +240,7 @@ def _check_url_shape(
         raise BlockedUrl(f"refusing to fetch a non-HTTP URL ({scheme or 'no scheme'})")
     if scheme == "http" and not settings.upstream_allow_plaintext_http:
         raise BlockedUrl(
-            "refusing to fetch an artifact over plaintext HTTP; set "
+            "refusing to fetch from an upstream over plaintext HTTP; set "
             "UPSTREAM_ALLOW_PLAINTEXT_HTTP=true if an internal mirror needs it"
         )
 

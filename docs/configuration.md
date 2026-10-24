@@ -115,6 +115,10 @@ the upstream's credentials are dropped once a hop leaves its origin, and the
 connection is pinned to the address that was checked, so a DNS answer that
 changes in between cannot redirect it.
 
+Package upstream traffic honours `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`
+in the app's environment. A request sent through a proxy is not pinned,
+because the proxy resolves the name; the URL rules above still apply.
+
 | Variable | Default | Notes |
 |---|---|---|
 | `UPSTREAM_ARTIFACT_HOSTS` | the three public registries' CDNs | Comma-separated. Add a host when an upstream serves files from its own CDN. |
@@ -242,29 +246,32 @@ An upstream that fails 5 times consecutively is quarantined and skipped, with a
 probe every 2 minutes so recovery is automatic. The **Health** column shows the
 current state and the last error.
 
-Cached versions follow the current answer. When a tier answers for a name,
-versions cached earlier from a lower tier that are not in that answer are
-removed. Once an internal upstream is back from an outage, say, what a public
-tier answered in the meantime does not linger, which closes a
-dependency-confusion window. Versions from an upstream that is merely
-unreachable are kept and served, as before.
+Cached versions follow the current answer. When a tier answers for a name
+with at least one version, versions cached earlier from a lower tier that are
+not in that answer are removed, and the removal is logged. Once an internal
+upstream is back from an outage, say, what a public tier answered in the
+meantime does not linger, which closes a dependency-confusion window. A tier
+that answers with no versions at all displaces nothing. Versions from an
+upstream that is merely unreachable are kept and served, as before.
 
 ### Changing, disabling and deleting upstreams
 
-> **Disabling an upstream is not a pause.** Disabling or deleting one removes
-> at once every cached version and artifact that only that upstream supplied.
-> They stop being served immediately, including to clients installing
-> straight from a lockfile, and their files are deleted from disk at the next
-> garbage collection. Re-enabling does not restore them: packages are fetched
-> again on their next request.
+> **To stop serving what an upstream supplied, delete it; disabling is a
+> pause.** Disabling stops fetches from the upstream and marks the ecosystem
+> stale, but versions and artifacts already cached from it keep being served.
+> Deleting it removes at once every cached version and artifact that only that
+> upstream supplied. They stop being served immediately, including to clients
+> installing straight from a lockfile, and their files are deleted from disk
+> at the next garbage collection.
 
-Versions another upstream also supplied keep that upstream's files. Locally
-published packages are never touched. The audit entry records how many
-versions were removed (`retired_versions`).
+On a delete, versions another upstream also supplied keep that upstream's
+files, and locally published packages are never touched. The audit entry
+records how many versions were removed (`retired_versions`).
 
-That is what you want for a compromised upstream. For an outage, leave it
-enabled: an unreachable upstream's versions keep being served, and after five
-failures it is skipped automatically anyway.
+Delete a compromised upstream. Disable one you want to stop asking for a
+while, for maintenance or a rate limit; there is no need to for an outage,
+since an unhealthy upstream is skipped automatically after five failures and
+its cached versions keep being served either way.
 
 Creating an upstream, or changing anything that affects routing (URL, tier,
 priority, enabled, reserved names, authentication, GitLab project or group,

@@ -351,9 +351,16 @@ Operator-visible changes:
   that worked before stops resolving (it shows as unhealthy) until you set
   the flag. Metadata redirects are also checked hop by hop now. See
   [Upstream trust](configuration.md#upstream-trust).
-- **Disabling or deleting an upstream deletes what it alone supplied.** It is
-  not a pause. See
+- **To stop serving what an upstream supplied, delete it; disabling is a
+  pause.** Deleting an upstream now removes, at once, the cached versions and
+  artifacts that it alone supplied. Disabling stops fetches from it and marks
+  the ecosystem stale, but keeps serving what is cached. See
   [Changing, disabling and deleting upstreams](configuration.md#changing-disabling-and-deleting-upstreams).
+- **A higher tier now displaces lower-tier versions.** When a tier answers for
+  a name with at least one version, versions cached from a lower tier that it
+  does not list are removed, and the log says so.
+- **Outbound proxies are honoured again.** Package upstream traffic follows
+  `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`.
 - **Cross-site writes with the session cookie are refused** with `403`.
   Scripts that drive the API with a cookie copied from a browser should use an
   API token.
