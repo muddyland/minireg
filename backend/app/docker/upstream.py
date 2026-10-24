@@ -24,13 +24,12 @@ would otherwise get to decide:
 
 from __future__ import annotations
 
-import asyncio
+import asyncio  # noqa: F401 -- tests patch the resolver's loop through this module
 import base64
 import contextlib
 import ipaddress
 import logging
 import re
-import socket
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -39,13 +38,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from httpcore import AsyncNetworkBackend
 
 from ..config import settings
 from ..core.metrics import bump, gauge
 from ..core.security import decrypt_credential
 from ..models import Upstream, UpstreamKind
 from ..upstreams.base import user_agent
+from ..upstreams.netguard import PinnedBackend, is_public_address, pinned_client, resolve_host
 from .errors import RegistryError
 from .naming import PRESETS, host_matches
 
@@ -90,126 +89,32 @@ class BlockedTarget(Exception):
 # --------------------------------------------------------------------------- #
 # Network guard with DNS pinning
 # --------------------------------------------------------------------------- #
-def _is_public(address: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(address)
-    except ValueError:
-        return False
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-        or ip in ipaddress.ip_network("100.64.0.0/10")  # carrier-grade NAT
-    )
+# The address rules, the resolver and the pinning backend live in
+# upstreams/netguard.py, shared with the package upstreams so both agree on
+# what "private" means (the package side used to let 100.64.0.0/10 through).
+# The names below are kept for this module's callers and for the tests that
+# stub the resolver; check_target looks _resolve up at call time.
+_is_public = is_public_address
+_resolve = resolve_host
+_PinnedBackend = PinnedBackend
 
-
-async def _resolve(host: str, port: int) -> list[str]:
-    """Resolve, retrying transient failures.
-
-    Resolvers in container networks (Docker's embedded DNS forwarding to a
-    site resolver) intermittently answer EAI_NODATA/EAI_AGAIN for names that
-    resolve a moment later. One such answer used to fail a cold layer
-    download outright; three quick attempts ride it out.
-    """
-    loop = asyncio.get_running_loop()
-    last: OSError | None = None
-    for attempt in range(3):
-        try:
-            infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-            return list(dict.fromkeys(str(info[4][0]) for info in infos))
-        except socket.gaierror as exc:
-            if exc.errno == socket.EAI_NONAME:
-                raise  # the name really does not exist
-            last = exc
-            await asyncio.sleep(0.2 * (attempt + 1))
-    assert last is not None
-    raise last
-
-
-class _PinnedBackend(AsyncNetworkBackend):
-    """httpcore network backend that connects only to pre-approved addresses.
-
-    ``check_target`` resolves a host and approves its addresses; this backend
-    then refuses any connection to that host on an address it did not
-    approve, and resolves nothing itself. Closing the gap between "the name
-    resolved to something public when we checked" and "the socket went
-    somewhere public" is the whole point: without it a rebinding DNS server
-    answers the check with a public address and the connect with 10.0.0.5.
-    """
-
-    def __init__(self) -> None:
-        from httpcore._backends.auto import AutoBackend
-
-        self._inner = AutoBackend()
-        self.pins: dict[str, tuple[float, list[str]]] = {}
-
-    def pin(self, host: str, addresses: list[str]) -> None:
-        self.pins[host.lower()] = (time.monotonic() + 300, addresses)
-        if len(self.pins) > 4096:
-            now = time.monotonic()
-            self.pins = {h: v for h, v in self.pins.items() if v[0] > now}
-
-    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
-        entry = self.pins.get(host.lower())
-        if entry is None or entry[0] < time.monotonic():
-            raise httpx.ConnectError(f"connection to {host} was not approved")
-        last: Exception | None = None
-        for address in entry[1]:
-            try:
-                return await self._inner.connect_tcp(
-                    address,
-                    port,
-                    timeout=timeout,
-                    local_address=local_address,
-                    socket_options=socket_options,
-                )
-            except Exception as exc:  # try the next address
-                last = exc
-        raise last or httpx.ConnectError(f"could not connect to {host}")
-
-    async def connect_unix_socket(self, *args, **kwargs):  # pragma: no cover
-        raise httpx.ConnectError("unix sockets are not used for upstreams")
-
-    async def sleep(self, seconds: float) -> None:
-        await self._inner.sleep(seconds)
-
-
-_backend = _PinnedBackend()
+#: Image upstreams always pin: check_target resolves even when private
+#: addresses are allowed, so nothing here ever resolves at connect time.
+_backend = PinnedBackend()
 _clients: dict[bool, httpx.AsyncClient] = {}
 
 
 def _client(verify: bool) -> httpx.AsyncClient:
     client = _clients.get(verify)
     if client is None:
-        import httpcore
-
-        pool = httpcore.AsyncConnectionPool(
-            ssl_context=httpx.create_ssl_context(verify=verify),
-            max_connections=settings.upstream_max_connections,
-            max_keepalive_connections=settings.upstream_max_keepalive,
-            keepalive_expiry=30,
-            http1=True,
-            http2=True,
-            network_backend=_backend,
-        )
-        transport = httpx.AsyncHTTPTransport(verify=verify, http2=True)
-        # Swap in the pool built on the pinned backend. The transport's own
-        # pool is closed first so it does not leak.
-        old = transport._pool
-        transport._pool = pool
-        with contextlib.suppress(Exception):
-            asyncio.get_running_loop().create_task(old.aclose())
-        client = httpx.AsyncClient(
-            transport=transport,
+        client = pinned_client(
+            _backend,
+            verify=verify,
             timeout=httpx.Timeout(
                 settings.upstream_timeout_seconds, connect=settings.upstream_connect_timeout_seconds
             ),
-            follow_redirects=False,
+            max_connections=settings.upstream_max_connections,
+            max_keepalive=settings.upstream_max_keepalive,
             headers={"user-agent": user_agent()},
         )
         _clients[verify] = client

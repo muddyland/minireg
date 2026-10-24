@@ -10,18 +10,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
 from ..config import settings
 from ..core.security import decrypt_credential
 from ..models import Upstream
-from .netguard import check_fetchable, same_origin
+from .netguard import BlockedUrl, PinnedBackend, guard_url, pinned_client, same_origin
 
 log = logging.getLogger(__name__)
 
@@ -103,8 +105,9 @@ class UpstreamNotFound(UpstreamError):
 # --------------------------------------------------------------------------- #
 _client: httpx.AsyncClient | None = None
 _insecure_client: httpx.AsyncClient | None = None
-#: Redirect hops allowed on an artifact fetch, each re-checked before it is taken.
+#: Redirect hops allowed on an upstream fetch, each re-checked before it is taken.
 _MAX_REDIRECTS = 5
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 #: Longest Retry-After we will sit out inline rather than failing the request.
 _MAX_RETRY_AFTER_WAIT = 5.0
 
@@ -205,6 +208,41 @@ def get_http_client() -> httpx.AsyncClient:
     return _client
 
 
+#: Package-upstream traffic connects only to addresses netguard approved and
+#: pinned -- unless private addresses are allowed outright, in which case
+#: there is nothing to pin against and connections resolve normally.
+_upstream_backend = PinnedBackend(
+    require_pin=lambda: not settings.upstream_allow_private_addresses
+)
+_upstream_clients: dict[bool, httpx.AsyncClient] = {}
+
+
+def get_upstream_client(verify: bool = True) -> httpx.AsyncClient:
+    """The pooled client package providers talk to upstreams through.
+
+    Separate from :func:`get_http_client` (OIDC, OSV and the KEV feed use
+    that one, against hosts no upstream guard knows about): this one never
+    follows a redirect by itself and connects only where :func:`guard_url`
+    has pinned, which closes the window between "the name resolved to a
+    public address when we checked" and "the socket went there".
+    """
+    client = _upstream_clients.get(verify)
+    if client is None:
+        client = pinned_client(
+            _upstream_backend,
+            verify=verify,
+            timeout=httpx.Timeout(
+                settings.upstream_timeout_seconds,
+                connect=settings.upstream_connect_timeout_seconds,
+            ),
+            max_connections=settings.upstream_max_connections,
+            max_keepalive=settings.upstream_max_keepalive,
+            headers={"user-agent": user_agent()},
+        )
+        _upstream_clients[verify] = client
+    return client
+
+
 async def close_http_client() -> None:
     global _client, _insecure_client
     if _client is not None:
@@ -213,6 +251,9 @@ async def close_http_client() -> None:
     if _insecure_client is not None:
         await _insecure_client.aclose()
     _insecure_client = None
+    for client in list(_upstream_clients.values()):
+        await client.aclose()
+    _upstream_clients.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -237,10 +278,27 @@ class UpstreamProvider:
     # -- auth --------------------------------------------------------------- #
     @property
     def client(self) -> httpx.AsyncClient:
-        """The pooled client this upstream's TLS setting calls for."""
-        if getattr(self.upstream, "verify_ssl", True):
-            return get_http_client()
-        return get_insecure_http_client()
+        """The pooled, pinned client this upstream's TLS setting calls for."""
+        return get_upstream_client(bool(getattr(self.upstream, "verify_ssl", True)))
+
+    async def _guard(self, url: str, *, trusted: str | None = None) -> None:
+        """Check and pin one hop, raising :class:`BlockedUrl`.
+
+        ``trusted`` is a URL this provider built from its own configuration;
+        its host is allowed alongside the upstream's own and the operator's
+        allowlist.
+        """
+        extra = (urlsplit(trusted).hostname or "",) if trusted else ()
+        try:
+            await guard_url(
+                url,
+                upstream_url=self.upstream.url,
+                backend=_upstream_backend,
+                extra_hosts=extra,
+            )
+        except BlockedUrl as exc:
+            log.warning("upstream %s: refused %s: %s", self.name, url[:200], exc)
+            raise
 
     def auth_headers(self) -> dict[str, str]:
         secret = decrypt_credential(self.upstream.credential_enc)
@@ -304,8 +362,8 @@ class UpstreamProvider:
         last: Exception | None = None
         for attempt in range(attempts):
             try:
-                resp = await client.request(
-                    method, url, headers=merged, timeout=timeout, **kwargs
+                resp = await self._request_following(
+                    client, method, url, headers=headers, merged=merged, timeout=timeout, **kwargs
                 )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last = exc
@@ -337,6 +395,60 @@ class UpstreamProvider:
             return resp
         raise UpstreamError(str(last) if last else f"{self.name}: exhausted retries")
 
+    async def _request_following(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None,
+        merged: dict[str, str],
+        timeout: httpx.Timeout,
+        **kwargs,
+    ) -> httpx.Response:
+        """One request, its redirects followed by hand.
+
+        The client used to follow redirects itself, and nothing checked where
+        they went: a metadata request -- every packument, simple page and
+        index file -- could be 302'd to 169.254.169.254 or an internal host,
+        and the body was cached and served back. httpx also replays a custom
+        credential header (GitLab's PRIVATE-TOKEN) across origins, which it
+        only strips for Authorization. So, as in :meth:`stream`, every hop is
+        guarded and pinned before it is taken, and the credential stays
+        behind once a hop leaves the origin it was sent to.
+
+        Only GET and HEAD follow. A redirected publish (PUT/POST) is returned
+        as it is: replaying a body to wherever the upstream points is not
+        something to do on its behalf.
+        """
+        current = url
+        send = merged
+        for _ in range(_MAX_REDIRECTS + 1):
+            # The first URL was built by this provider from its configuration
+            # (cargo's API can live on its own host); hops are judged as any
+            # other upstream-chosen URL. Refusal is an upstream failure to the
+            # resolver: it moves on to the next candidate.
+            try:
+                await self._guard(current, trusted=url)
+            except BlockedUrl as exc:
+                raise UpstreamError(f"{self.name}: {exc}") from exc
+            resp = await client.request(
+                method, current, headers=send, timeout=timeout, follow_redirects=False, **kwargs
+            )
+            if resp.status_code not in _REDIRECT_STATUSES or method.upper() not in ("GET", "HEAD"):
+                return resp
+            location = resp.headers.get("location")
+            await resp.aclose()
+            if not location:
+                raise UpstreamError(f"{self.name}: redirect with no Location header")
+            current = str(httpx.URL(current).join(location))
+            # The Location is complete; the original query must not be
+            # appended to it again.
+            kwargs.pop("params", None)
+            if not same_origin(current, url):
+                send = dict(headers or {})
+        raise UpstreamError(f"{self.name}: too many redirects")
+
     async def stream(
         self, url: str, *, headers: dict[str, str] | None = None
     ) -> tuple[httpx.Response, AsyncIterator[bytes]]:
@@ -356,9 +468,12 @@ class UpstreamProvider:
 
         current = url
         for _ in range(_MAX_REDIRECTS):
+            # Every hop, the first included: the URL came out of upstream
+            # metadata, and this is where its address is resolved and pinned.
+            await self._guard(current)
             req = client.build_request("GET", current, headers=merged)
             resp = await client.send(req, stream=True, follow_redirects=False)
-            if resp.status_code not in (301, 302, 303, 307, 308):
+            if resp.status_code not in _REDIRECT_STATUSES:
                 return resp, resp.aiter_bytes(settings.stream_chunk_size)
 
             location = resp.headers.get("location")
@@ -366,7 +481,6 @@ class UpstreamProvider:
             if not location:
                 raise UpstreamError(f"{self.name}: redirect with no Location header")
             current = str(httpx.URL(current).join(location))
-            check_fetchable(current, upstream_url=self.upstream.url)
             if not same_origin(current, self.upstream.url):
                 # Left our origin: drop the credential rather than replay it.
                 merged = dict(headers or {})
@@ -415,13 +529,47 @@ class UpstreamProvider:
         if template:
             from ..core.naming import normalize_name_for
 
-            try:
-                return template.format(
-                    name=name,
-                    normalized_name=normalize_name_for(self.upstream.ecosystem.value, name),
-                )
-            except (KeyError, IndexError):
+            rendered = render_url_template(
+                template,
+                {
+                    "name": name,
+                    "normalized_name": normalize_name_for(self.upstream.ecosystem.value, name),
+                },
+            )
+            if rendered is None:
                 # A malformed template must not break the page it appears on.
                 log.warning("upstream %s has an invalid web_url_template", self.name)
-                return None
+            return rendered
         return self.default_web_url(name)
+
+
+_TEMPLATE_TOKEN = re.compile(r"\{\{|\}\}|\{([^{}]*)\}|[{}]")
+
+
+def render_url_template(template: str, values: dict[str, str]) -> str | None:
+    """Substitute ``{placeholder}`` names, and nothing else.
+
+    ``str.format`` evaluated the field expression: ``{name.__class__}`` or
+    ``{name.__init__.__globals__[...]}`` walked attributes and indexes of the
+    values passed in, so an admin-edited template could read process state
+    into a link rendered for every visitor. Only the documented names are
+    replaced here; ``{{`` and ``}}`` are literal braces as before. Anything
+    else -- an unknown name, a stray brace -- makes the template invalid
+    (None), as a KeyError did.
+    """
+    out: list[str] = []
+    pos = 0
+    for match in _TEMPLATE_TOKEN.finditer(template):
+        out.append(template[pos : match.start()])
+        token = match.group(0)
+        if token == "{{":
+            out.append("{")
+        elif token == "}}":
+            out.append("}")
+        elif match.group(1) is not None and match.group(1) in values:
+            out.append(values[match.group(1)])
+        else:
+            return None
+        pos = match.end()
+    out.append(template[pos:])
+    return "".join(out)
