@@ -20,6 +20,7 @@ from .base import (
     UpstreamNotFound,
     UpstreamProvider,
 )
+from .revalidation import Validators, check_not_modified
 
 log = logging.getLogger(__name__)
 
@@ -64,9 +65,21 @@ class NpmProvider(UpstreamProvider):
         template = self.PUBLIC_WEB.get(host)
         return template.format(name=name) if template else None
 
-    async def fetch_package(self, name: str) -> RemotePackage:
+    async def fetch_package(
+        self, name: str, *, validators: Validators | None = None
+    ) -> RemotePackage:
+        """Fetch the packument.
+
+        With ``validators`` the request is conditional and a 304 raises
+        :class:`~.revalidation.UpstreamNotModified`. The validators of a
+        successful response are left on ``self.response_validators``.
+        """
         url = self.package_url(name)
-        resp = await self.request("GET", url, headers={"accept": FULL_ACCEPT})
+        headers = {"accept": FULL_ACCEPT, **(validators.headers() if validators else {})}
+        resp = await self.request("GET", url, headers=headers)
+        check_not_modified(resp, validators)
+        if resp.status_code == 304:
+            raise UpstreamError(f"{self.name}: unsolicited HTTP 304")
         if resp.status_code == 404:
             raise UpstreamNotFound(f"{self.name}: {name} not found")
         if resp.status_code in (401, 403):
@@ -81,6 +94,7 @@ class NpmProvider(UpstreamProvider):
         if not isinstance(doc, dict) or "versions" not in doc:
             raise UpstreamError(f"{self.name}: malformed packument")
 
+        self.response_validators = Validators.from_response(self.id, resp)
         return self.parse_packument(doc, etag=resp.headers.get("etag"))
 
     def parse_packument(self, doc: dict, etag: str | None = None) -> RemotePackage:

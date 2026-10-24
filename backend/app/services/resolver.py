@@ -49,6 +49,7 @@ from ..upstreams.cargo_provider import CargoProvider
 from ..upstreams.gitlab_provider import GitLabNpmProvider, GitLabPyPIProvider
 from ..upstreams.npm_provider import NpmProvider
 from ..upstreams.pypi_provider import PyPIProvider
+from ..upstreams.revalidation import UpstreamNotModified, Validators
 
 log = logging.getLogger(__name__)
 
@@ -83,9 +84,20 @@ class TierUnavailable(Exception):
 
 @dataclass(slots=True)
 class ResolveResult:
-    package: RemotePackage
+    #: None only when ``not_modified`` is set.
+    package: RemotePackage | None
     upstream: Upstream
     tier: int
+    #: The upstream holding our validators answered 304: what we hold is
+    #: current, and there is no document to persist.
+    not_modified: bool = False
+    #: Validators to store with the persisted document, bound to the one
+    #: upstream that served it. None for a merged document.
+    validators: Validators | None = None
+
+
+#: Sentinel ``_query_one`` returns for a 304.
+_NOT_MODIFIED = object()
 
 
 async def load_upstreams(
@@ -126,6 +138,20 @@ def claimants_for(
     return [u for u in upstreams if not (u.name_patterns or [])]
 
 
+async def live_sources(
+    session: AsyncSession, ecosystem: Ecosystem, name: str
+) -> dict[int, int]:
+    """``{upstream id: tier}`` for every enabled upstream allowed to answer
+    for ``name`` right now.
+
+    Health is deliberately ignored: a quarantined upstream is unavailable,
+    not gone, and what it supplied keeps being served. Only configuration --
+    disabled, deleted, or no longer claiming the name -- makes a source dead.
+    """
+    upstreams = claimants_for(await load_upstreams(session, ecosystem), name, ecosystem)
+    return {u.id: u.tier for u in upstreams}
+
+
 def group_by_tier(upstreams: list[Upstream]) -> list[tuple[int, list[Upstream]]]:
     tiers: dict[int, list[Upstream]] = defaultdict(list)
     for up in upstreams:
@@ -149,15 +175,40 @@ def is_quarantined(upstream: Upstream) -> bool:
 class Resolver:
     """Resolves a package name across the configured upstream tiers."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, *, end_transaction: bool = False) -> None:
         self.session = session
+        #: Commit after reading the upstream list, before any network I/O, so
+        #: no transaction sits idle across upstream requests (Postgres kills
+        #: idle-in-transaction sessions after 60 s). Only for callers whose
+        #: session holds nothing uncommitted they would mind being committed
+        #: -- the metadata read path, not the publish path.
+        self.end_transaction = end_transaction
         #: Failures seen while querying the current tier, as (upstream, why).
         self.tier_errors: list[tuple[Upstream, str]] = []
+        #: Validators each answering upstream returned, by upstream id.
+        self.response_validators: dict[int, Validators | None] = {}
 
     async def resolve(
-        self, ecosystem: Ecosystem, name: str, *, merge_tier: bool | None = None
+        self,
+        ecosystem: Ecosystem,
+        name: str,
+        *,
+        merge_tier: bool | None = None,
+        validators: Validators | None = None,
     ) -> ResolveResult | None:
+        """Walk the tiers for ``name``.
+
+        ``validators`` are the conditional-request validators stored with the
+        cached document. They are sent only to the upstream that issued them,
+        and only when that upstream's answer would be the whole answer -- in a
+        merging tier with several members a 304 from one says nothing about
+        the others, so that tier is asked unconditionally.
+        """
         upstreams = await load_upstreams(self.session, ecosystem)
+        if self.end_transaction:
+            # The Upstream rows stay usable (expire_on_commit is off); the
+            # health bookkeeping on them is written by the caller's commit.
+            await self.session.commit()
         if not upstreams:
             return None
         upstreams = claimants_for(upstreams, name, ecosystem)
@@ -183,7 +234,12 @@ class Resolver:
                 continue
 
             self.tier_errors = []
-            results = await self._query_tier(candidates, name, collect_all=merge_tier)
+            tier_validators = validators
+            if merge_tier and len(candidates) > 1:
+                tier_validators = None
+            results = await self._query_tier(
+                candidates, name, collect_all=merge_tier, validators=tier_validators
+            )
             if not results:
                 if self.tier_errors:
                     # This tier could not answer, as opposed to answering "no".
@@ -195,20 +251,44 @@ class Resolver:
                 continue
             if len(results) == 1 or not merge_tier:
                 package, upstream = results[0]
+                if package is _NOT_MODIFIED:
+                    return ResolveResult(
+                        package=None, upstream=upstream, tier=tier, not_modified=True
+                    )
                 self.tag_files_with_upstream(package, upstream)
-                return ResolveResult(package=package, upstream=upstream, tier=tier)
+                return ResolveResult(
+                    package=package,
+                    upstream=upstream,
+                    tier=tier,
+                    validators=self.response_validators.get(upstream.id),
+                )
 
+            # Several documents to merge. A 304 cannot happen here: validators
+            # are withheld from a multi-member merging tier.
             merged = self._merge(results)
             return ResolveResult(package=merged, upstream=results[0][1], tier=tier)
         return None
 
     async def _query_tier(
-        self, candidates: list[Upstream], name: str, *, collect_all: bool
+        self,
+        candidates: list[Upstream],
+        name: str,
+        *,
+        collect_all: bool,
+        validators: Validators | None = None,
     ) -> list[tuple[RemotePackage, Upstream]]:
+        """Query one tier. A 304 appears in the results as ``_NOT_MODIFIED``
+        in place of a package, and counts as an answer like any other."""
+
+        def for_(upstream: Upstream) -> Validators | None:
+            if validators is not None and validators.upstream_id == upstream.id:
+                return validators
+            return None
+
         if not settings.upstream_tier_parallel:
             out: list[tuple[RemotePackage, Upstream]] = []
             for upstream in candidates:
-                pkg = await self._query_one(upstream, name)
+                pkg = await self._query_one(upstream, name, validators=for_(upstream))
                 if pkg is not None:
                     out.append((pkg, upstream))
                     if not collect_all:
@@ -218,7 +298,7 @@ class Resolver:
         async def query(upstream: Upstream) -> tuple[RemotePackage | None, Upstream]:
             # Carry the upstream through with the result so completion order
             # never has to be correlated back to an input.
-            return await self._query_one(upstream, name), upstream
+            return await self._query_one(upstream, name, validators=for_(upstream)), upstream
 
         tasks = [asyncio.create_task(query(u)) for u in candidates]
         found: list[tuple[RemotePackage, Upstream]] = []
@@ -242,19 +322,29 @@ class Resolver:
         found.sort(key=lambda pair: order.get(pair[1].id, 999))
         return found
 
-    async def _query_one(self, upstream: Upstream, name: str) -> RemotePackage | None:
+    async def _query_one(
+        self, upstream: Upstream, name: str, *, validators: Validators | None = None
+    ) -> RemotePackage | None:
         """Ask one upstream. Returns None for an authoritative 404.
 
         A *failure* is recorded on ``self.tier_errors`` rather than reported
         as a miss. The difference decides whether the next tier is consulted:
         treating a timeout or an expired token the same as "no such package"
         is how a single internal-registry blip let a public registry answer
-        for an internal name, permanently -- versions are never removed once
-        persisted, so the takeover survives the internal upstream recovering.
+        for an internal name. (Versions persisted from a lower tier are now
+        pruned once a higher tier answers -- see
+        ``packages.prune_unsourced`` -- but serving them even once is the
+        compromise.)
         """
         provider = build_provider(upstream)
         try:
-            package = await provider.fetch_package(name)
+            if validators is not None:
+                package = await provider.fetch_package(name, validators=validators)
+            else:
+                package = await provider.fetch_package(name)
+        except UpstreamNotModified:
+            await self._mark_healthy(upstream)
+            return _NOT_MODIFIED  # type: ignore[return-value]
         except UpstreamNotFound:
             await self._mark_healthy(upstream)
             return None
@@ -270,6 +360,7 @@ class Resolver:
             self.tier_errors.append((upstream, repr(exc)))
             return None
         await self._mark_healthy(upstream)
+        self.response_validators[upstream.id] = getattr(provider, "response_validators", None)
         return package
 
     def _merge(self, results: list[tuple[RemotePackage, Upstream]]) -> RemotePackage:
