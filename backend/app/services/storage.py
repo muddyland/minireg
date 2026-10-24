@@ -5,6 +5,7 @@ packages that ship byte-identical files share one blob. Layout:
 
     /data/packages/blobs/ab/cd/abcd....  (sha256, 2-level fan-out)
     /data/packages/tmp/                  (staging, same filesystem => atomic rename)
+    /data/packages/partial/              (artifact fills clients read while they grow)
 
 Writes stage to ``tmp`` and ``os.replace`` into place, so a crashed or
 concurrent write can never expose a truncated artifact to a client.
@@ -69,16 +70,30 @@ class Digests:
         self.sha512.update(chunk)
         self.size += len(chunk)
 
+    def stored(self, path: str, *, already_existed: bool) -> StoredBlob:
+        return StoredBlob(
+            sha256=self.sha256.hexdigest(),
+            size=self.size,
+            path=path,
+            sha1=self.sha1.hexdigest(),
+            md5=self.md5.hexdigest(),
+            blake2b_256=self.blake2b.hexdigest(),
+            sha512=self.sha512.hexdigest(),
+            already_existed=already_existed,
+        )
+
 
 class BlobStore:
     def __init__(self, root: str | None = None) -> None:
         self.root = Path(root or settings.storage_path)
         self.blobs_dir = self.root / "blobs"
         self.tmp_dir = self.root / "tmp"
+        self.partial_dir = self.root / "partial"
 
     def ensure_dirs(self) -> None:
         self.blobs_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        self.partial_dir.mkdir(parents=True, exist_ok=True)
 
     # -- paths ------------------------------------------------------------- #
     def path_for(self, sha256: str) -> Path:
@@ -122,6 +137,11 @@ class BlobStore:
             already = final.is_file()
             if already:
                 tmp_path.unlink(missing_ok=True)
+                # Mark it as in use again, so the orphan-file sweep (which
+                # spares recently modified files) cannot delete it between
+                # here and the caller committing its Blob row.
+                with contextlib.suppress(OSError):
+                    os.utime(final)
             else:
                 final.parent.mkdir(parents=True, exist_ok=True)
                 # Same filesystem, so this is atomic; a racing writer producing
@@ -129,19 +149,68 @@ class BlobStore:
                 os.replace(tmp_path, final)
                 os.chmod(final, 0o444)
 
-            return StoredBlob(
-                sha256=sha256,
-                size=digests.size,
-                path=self.relative_path_for(sha256),
-                sha1=digests.sha1.hexdigest(),
-                md5=digests.md5.hexdigest(),
-                blake2b_256=digests.blake2b.hexdigest(),
-                sha512=digests.sha512.hexdigest(),
-                already_existed=already,
-            )
+            return digests.stored(self.relative_path_for(sha256), already_existed=already)
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
+
+    def adopt(self, staged: Path, sha256: str) -> str:
+        """Move an already hashed and fsynced file into place as ``sha256``.
+
+        Returns its store-relative path. Replacing an existing copy is safe:
+        the bytes are identical by construction, and the fresh mtime keeps
+        the orphan-file sweep away until the caller has committed its row.
+        """
+        final = self.path_for(sha256)
+        final.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staged, final)
+        os.chmod(final, 0o444)
+        return self.relative_path_for(sha256)
+
+    # -- fills in progress ------------------------------------------------- #
+    # A fill writes ``partial/<file id>.<token>`` and, once it is over, a
+    # ``.done`` marker holding ``ok <sha256>`` or ``failed``. Readers in other
+    # replicas tail the partial file and learn the outcome from the marker.
+    def partial_path(self, key: str, token: str) -> Path:
+        return self.partial_dir / f"{key}.{token}"
+
+    def marker_path(self, key: str, token: str) -> Path:
+        return self.partial_dir / f"{key}.{token}.done"
+
+    def write_marker(self, key: str, token: str, outcome: str) -> None:
+        with contextlib.suppress(OSError):
+            self.marker_path(key, token).write_text(outcome)
+
+    def read_marker(self, key: str, token: str) -> str | None:
+        try:
+            return self.marker_path(key, token).read_text()
+        except OSError:
+            return None
+
+    def partials_for(self, key: str) -> list[tuple[str, Path]]:
+        """``(token, path)`` of every unfinished partial file for ``key``."""
+        found = []
+        with contextlib.suppress(OSError):
+            for entry in self.partial_dir.glob(f"{key}.*"):
+                name = entry.name
+                if name.endswith(".done"):
+                    continue
+                token = name[len(key) + 1 :]
+                if not self.marker_path(key, token).exists():
+                    found.append((token, entry))
+        return found
+
+    def finished_for(self, key: str) -> str | None:
+        """sha256 of a successful fill of ``key`` whose blob is still stored."""
+        with contextlib.suppress(OSError):
+            for entry in self.partial_dir.glob(f"{key}.*.done"):
+                with contextlib.suppress(OSError):
+                    outcome = entry.read_text()
+                    if outcome.startswith("ok "):
+                        sha = outcome[3:].strip()
+                        if self.exists(sha):
+                            return sha
+        return None
 
     # -- reads ------------------------------------------------------------- #
     def blob_path(self, sha256: str) -> Path:
@@ -208,21 +277,77 @@ class BlobStore:
         return await asyncio.to_thread(_walk)
 
     def cleanup_tmp(self, older_than_seconds: int = 3600) -> int:
-        """Reap staging files orphaned by a crash."""
+        """Reap staging files, partial fills and fill markers left by a crash.
+
+        A live fill writes continuously and is bounded by the artifact
+        download timeout, so nothing it still uses is an hour old.
+        """
         import time
 
-        if not self.tmp_dir.is_dir():
-            return 0
         cutoff = time.time() - older_than_seconds
         removed = 0
-        for entry in self.tmp_dir.iterdir():
-            try:
-                if entry.is_file() and entry.stat().st_mtime < cutoff:
-                    entry.unlink()
-                    removed += 1
-            except OSError:
+        for directory in (self.tmp_dir, self.partial_dir):
+            if not directory.is_dir():
                 continue
+            for entry in directory.iterdir():
+                try:
+                    if entry.is_file() and entry.stat().st_mtime < cutoff:
+                        entry.unlink()
+                        removed += 1
+                except OSError:
+                    continue
         return removed
+
+    # -- orphan-file sweep -------------------------------------------------- #
+    def shard_dirs(self) -> list[Path]:
+        """The top-level fan-out directories (at most 256)."""
+        try:
+            return sorted(p for p in self.blobs_dir.iterdir() if p.is_dir())
+        except OSError:
+            return []
+
+    @staticmethod
+    def scan_shard(shard: Path, cutoff: float) -> list[str]:
+        """Names of blob files under one shard last modified before ``cutoff``.
+
+        One shard is ~1/256 of the store, so the list stays small even for a
+        store of millions of blobs; the caller walks shard by shard.
+        """
+        found: list[str] = []
+        for dirpath, _dirs, files in os.walk(shard):
+            for name in files:
+                if len(name) != 64 or not _is_hex(name):
+                    continue
+                try:
+                    if os.stat(os.path.join(dirpath, name)).st_mtime < cutoff:
+                        found.append(name)
+                except OSError:
+                    continue
+        return found
+
+    def delete_if_older(self, sha256: str, cutoff: float) -> int:
+        """Delete a blob file unless it was modified since ``cutoff``.
+
+        Re-checks the mtime at the last moment: a writer that found the file
+        already present touches it before committing its row.
+        Returns the bytes freed (0 if nothing was deleted).
+        """
+        path = self.path_for(sha256)
+        try:
+            st = path.stat()
+        except OSError:
+            return 0
+        if st.st_mtime >= cutoff:
+            return 0
+        return st.st_size if self.delete(sha256) else 0
+
+
+def _is_hex(name: str) -> bool:
+    try:
+        int(name, 16)
+    except ValueError:
+        return False
+    return name == name.lower()
 
 
 async def _iter_bytes(data: bytes, chunk: int) -> AsyncIterator[bytes]:

@@ -121,11 +121,9 @@ async def _prune_task() -> None:
     from sqlalchemy import update
 
     from .models import DeviceAuthorization
-    from .services.artifacts import collect_orphan_blobs
 
     async with session_scope() as session:
         removed = await prune_old_logs(session)
-        orphans = await collect_orphan_blobs(session)
 
         # A device authorization that was approved but never polled keeps the
         # token in plaintext until someone collects it. Expired rows never
@@ -141,14 +139,25 @@ async def _prune_task() -> None:
                 .values(token_plaintext=None)
             )
         ).rowcount
-        if removed or orphans or cleared:
+        if removed or cleared:
             log.info(
-                "housekeeping: pruned=%s orphan_blobs=%d expired_device_tokens=%s",
+                "housekeeping: pruned=%s expired_device_tokens=%s",
                 removed,
-                orphans,
                 cleared,
             )
-    get_store().cleanup_tmp()
+
+
+async def _artifact_task() -> None:
+    """Orphan rows and files, the storage quota, and stale staging files."""
+    from .services.artifacts import run_housekeeping
+
+    result = await run_housekeeping()
+    if (
+        result["orphan_blobs"]
+        or result["orphan_files"]["files"]
+        or result["quota"].get("evicted")
+    ):
+        log.info("housekeeping: artifacts %s", result)
 
 
 async def _docker_task() -> None:
@@ -264,37 +273,52 @@ async def housekeeping_loop() -> None:
     while pruning logs silently skipped the GC and the CVE refresh for the
     whole hour.
 
-    A Redis lock keeps this to one runner: replicas all execute this loop, and
-    without the lock they duplicate every OSV call and race each other's
-    upserts.
+    A Redis lease keeps this to one runner: replicas all execute this loop,
+    and without it they duplicate every OSV call and race each other's
+    upserts. The lease is renewed while the pass runs; the fixed one-hour
+    lock it replaced lapsed under a pass that ran longer, and a second
+    replica then started GC in the middle of it.
     """
-    from .core.cache import herd_guard
-
     # Stagger the first run so a restart storm does not converge on one moment.
     await asyncio.sleep(60)
     while True:
         try:
-            async with herd_guard("housekeeping", ttl=3600, wait=False) as acquired:
-                if acquired:
-                    for name, task in (
-                        ("prune", _prune_task),
-                        ("docker", _docker_task),
-                        ("cve-refresh", _cve_refresh_task),
-                    ):
-                        try:
-                            await task()
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            log.exception("housekeeping task %s failed", name)
-                else:
-                    log.debug("housekeeping already running elsewhere; skipping")
+            await housekeeping_pass()
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("housekeeping iteration failed")
 
         await asyncio.sleep(3600)
+
+
+async def housekeeping_pass() -> bool:
+    """One pass of every housekeeping task, if no other replica is running one.
+
+    Returns whether this replica ran it.
+    """
+    from .core.cache import Lease
+
+    lease = Lease("housekeeping", ttl=120)
+    if not await lease.acquire():
+        log.debug("housekeeping already running elsewhere; skipping")
+        return False
+    try:
+        for name, task in (
+            ("prune", _prune_task),
+            ("artifacts", _artifact_task),
+            ("docker", _docker_task),
+            ("cve-refresh", _cve_refresh_task),
+        ):
+            try:
+                await task()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("housekeeping task %s failed", name)
+    finally:
+        await lease.release()
+    return True
 
 
 @asynccontextmanager
