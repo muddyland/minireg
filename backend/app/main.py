@@ -221,6 +221,10 @@ async def _cve_refresh_task() -> None:
                 await _scan_group(scanner, ecosystem, items)
             total += len(rows)
 
+        # After the commit above: drop the rendered documents that still have
+        # the old verdict baked in, for exactly the packages that changed.
+        await scanner.invalidate_changed()
+
         if len(rows) < settings.osv_batch_size:
             break
 

@@ -17,6 +17,8 @@ go in the URL fragment for HTML (PEP 503) and in the ``hashes`` object for JSON
 
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import UTC, datetime
 from html import escape
 from typing import Any
@@ -25,6 +27,7 @@ from urllib.parse import quote
 from ..config import settings
 from ..core.naming import normalize_pypi_name, sort_pypi_versions
 from ..models import Package, PackageFile, PackageVersion
+from .pypi_publish import stored_metadata_bytes
 
 API_VERSION = "1.1"
 
@@ -33,40 +36,56 @@ HTML_CONTENT_TYPE = "application/vnd.pypi.simple.v1+html"
 LEGACY_HTML_CONTENT_TYPE = "text/html"
 
 
+_JSON_TYPES = (JSON_CONTENT_TYPE, "application/vnd.pypi.simple.latest+json")
+_HTML_TYPES = (HTML_CONTENT_TYPE, "application/vnd.pypi.simple.latest+html")
+_LEGACY_HTML_TYPES = (LEGACY_HTML_CONTENT_TYPE, "text/*", "*/*")
+
+
 def select_content_type(accept: str | None, format_param: str | None = None) -> str:
     """PEP 691 content negotiation.
 
     ``?format=`` wins when present (PEP 691 permits it), then the Accept
-    header by q-value, then HTML as the default for bare browsers and old pip.
+    header by q-value, then ``text/html`` as the default.
+
+    Only an explicit ``application/vnd.pypi.simple.v1+html`` (or ``latest``)
+    is answered with that type. ``text/html``, ``*/*`` and a missing Accept
+    header get ``text/html``: PEP 691 requires it, and pip before 22.2 --
+    still what Ubuntu 22.04 ships -- refuses any other content type and then
+    reports that no versions exist.
     """
     if format_param:
         normalized = format_param.strip().lower()
-        if normalized in (JSON_CONTENT_TYPE, "json", "application/json"):
+        if normalized in (*_JSON_TYPES, "json", "application/json"):
             return JSON_CONTENT_TYPE
-        if normalized in (HTML_CONTENT_TYPE, "html", "text/html"):
+        if normalized in _HTML_TYPES:
             return HTML_CONTENT_TYPE
+        if normalized in ("html", LEGACY_HTML_CONTENT_TYPE):
+            return LEGACY_HTML_CONTENT_TYPE
 
     if not accept:
-        return HTML_CONTENT_TYPE
+        return LEGACY_HTML_CONTENT_TYPE
 
     best_type = LEGACY_HTML_CONTENT_TYPE
-    best_q = -1.0
+    best_q = 0.0
     for chunk in accept.split(","):
         parts = [p.strip() for p in chunk.split(";")]
         media = parts[0].lower()
         quality = 1.0
         for param in parts[1:]:
-            if param.startswith("q="):
+            if param.lower().startswith("q="):
                 try:
                     quality = float(param[2:])
                 except ValueError:
                     quality = 0.0
+        # q=0 means "not acceptable"; ties go to whichever was listed first.
         if quality <= best_q:
             continue
-        if media in (JSON_CONTENT_TYPE, "application/vnd.pypi.simple.latest+json"):
+        if media in _JSON_TYPES:
             best_type, best_q = JSON_CONTENT_TYPE, quality
-        elif media in (HTML_CONTENT_TYPE, "application/vnd.pypi.simple.latest+html") or media in (LEGACY_HTML_CONTENT_TYPE, "*/*"):
+        elif media in _HTML_TYPES:
             best_type, best_q = HTML_CONTENT_TYPE, quality
+        elif media in _LEGACY_HTML_TYPES:
+            best_type, best_q = LEGACY_HTML_CONTENT_TYPE, quality
     return best_type
 
 
@@ -104,15 +123,45 @@ def _yanked_value(file_row: PackageFile) -> bool | str:
     return file_row.yanked_reason or True
 
 
+#: Hash names a PEP 658/714 digest may use: hashlib's, plus the spelling
+#: Warehouse uses for blake2b-256.
+_HASH_NAMES = frozenset(hashlib.algorithms_guaranteed) | {"blake2b_256"}
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+
 def _core_metadata_value(file_row: PackageFile) -> bool | dict | None:
-    """PEP 714: ``true`` or ``{alg: digest}``; omitted when unavailable."""
+    """PEP 714: ``true`` or ``{hashname: hexdigest}``; omitted when unavailable.
+
+    ``core_metadata`` also holds the stored METADATA itself (``_raw_b64``, or a
+    legacy ``_raw``), which must never leak into the advertisement: only real
+    hash names with hex digests are emitted. When we hold the bytes but no
+    digest, the sha256 is computed from them. ``true`` is reserved for
+    metadata that is servable but whose digest we do not know -- an upstream
+    that advertised ``true``.
+    """
     value = file_row.core_metadata
     if not value:
         return None
-    if isinstance(value, dict):
-        digests = {k: v for k, v in value.items() if k != "available" and isinstance(v, str)}
-        return digests or True
-    return True
+    if not isinstance(value, dict):
+        return True
+    digests = {
+        key.lower(): digest.lower()
+        for key, digest in value.items()
+        if isinstance(key, str)
+        and key.lower() in _HASH_NAMES
+        and isinstance(digest, str)
+        and _HEX_RE.match(digest)
+    }
+    if not digests:
+        raw = stored_metadata_bytes(value)
+        if raw is not None:
+            digests = {"sha256": hashlib.sha256(raw).hexdigest()}
+    if digests:
+        # sha256 first: the HTML form carries a single digest.
+        if "sha256" in digests:
+            digests = {"sha256": digests.pop("sha256"), **digests}
+        return digests
+    return True if value.get("available") else None
 
 
 def _hashes_for(file_row: PackageFile) -> dict[str, str]:

@@ -23,6 +23,7 @@ so it could not host a private crate even if we implemented publishing.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 
@@ -54,6 +55,30 @@ def json_response(payload, status_code: int = 200) -> Response:
     )
 
 
+def _etag_matches(if_none_match: str | None, etag: str) -> bool:
+    """RFC 9110 weak comparison, which is what If-None-Match uses."""
+    if not if_none_match:
+        return False
+    if if_none_match.strip() == "*":
+        return True
+    return any(tag.strip().removeprefix("W/") == etag for tag in if_none_match.split(","))
+
+
+def index_response(request: Request, body: str | bytes, media_type: str) -> Response:
+    """An index document with a strong ETag over the exact bytes served.
+
+    Cargo's sparse protocol revalidates every cached index file with
+    If-None-Match and expects a 304 when nothing changed; without a validator
+    it re-downloads the whole file on every build. The body is hashed as
+    rendered, because policy can make it differ from the upstream's.
+    """
+    data = body.encode("utf-8") if isinstance(body, str) else body
+    etag = f'"{hashlib.sha256(data).hexdigest()}"'
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"etag": etag})
+    return Response(content=data, media_type=media_type, headers={"etag": etag})
+
+
 def cargo_error(message: str, status_code: int) -> Response:
     """Cargo surfaces a registry's error body when it is shaped like this, and
     prints a much less helpful generic failure otherwise."""
@@ -64,8 +89,12 @@ def cargo_error(message: str, status_code: int) -> Response:
 # Index
 # --------------------------------------------------------------------------- #
 @router.get("/index/config.json")
-async def index_config(identity: Identity = Depends(rate_limited_read)) -> Response:
-    return json_response(cargo_render.render_config_json())
+async def index_config(
+    request: Request, identity: Identity = Depends(rate_limited_read)
+) -> Response:
+    return index_response(
+        request, orjson.dumps(cargo_render.render_config_json()), "application/json"
+    )
 
 
 @router.get("/index/{index_path:path}")
@@ -112,7 +141,7 @@ async def index_file(
                 cache_hit=True,
             )
         )
-        return Response(content=cached["index"], media_type=cargo_render.INDEX_CONTENT_TYPE)
+        return index_response(request, cached["index"], cargo_render.INDEX_CONTENT_TYPE)
 
     lookup = await packages.fetch_package(session, ECOSYSTEM, normalized)
     if lookup.package is None:
@@ -139,7 +168,7 @@ async def index_file(
 
     body = cargo_render.render_index(package, blocked_versions=blocked)
     await cache_set_json(cache_id, {"index": body}, settings.meta_cache_ttl)
-    return Response(content=body, media_type=cargo_render.INDEX_CONTENT_TYPE)
+    return index_response(request, body, cargo_render.INDEX_CONTENT_TYPE)
 
 
 # --------------------------------------------------------------------------- #
