@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import BrandMark from '@/components/BrandMark.vue'
 import NavIcon from '@/components/NavIcon.vue'
 import { useAuthStore } from '@/stores/auth'
+import { errorMessage } from '@/utils/errors'
 
 const auth = useAuthStore()
 const route = useRoute()
@@ -22,7 +23,7 @@ async function submit() {
     await auth.login(username.value, password.value)
     router.push(route.query.next || { name: 'home' })
   } catch (err) {
-    error.value = err.detail || 'Sign-in failed.'
+    error.value = errorMessage(err, 'Sign-in failed.')
   } finally {
     busy.value = false
   }
@@ -47,7 +48,7 @@ onMounted(() => auth.loadOidcStatus())
 
       <div class="card">
         <div class="card-body">
-          <div v-if="error" class="alert alert-error">{{ error }}</div>
+          <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
           <form @submit.prevent="submit">
             <div class="field">

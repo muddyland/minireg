@@ -2,10 +2,12 @@
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
 import { formatBytes, formatNumber, percent } from '@/utils/format'
+import { errorMessage } from '@/utils/errors'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const stats = ref(null)
 const loading = ref(true)
+const error = ref(null)
 const message = ref(null)
 const busy = ref(false)
 
@@ -24,8 +26,13 @@ const dedupeRatio = computed(() => {
 
 async function load() {
   loading.value = true
-  stats.value = await api.storageStats()
-  loading.value = false
+  try {
+    stats.value = await api.storageStats()
+  } catch (err) {
+    error.value = errorMessage(err, 'Could not load storage statistics.')
+  } finally {
+    loading.value = false
+  }
 }
 
 async function purge() {
@@ -39,6 +46,8 @@ async function purge() {
     return
 
   busy.value = true
+  error.value = null
+  message.value = null
   try {
     const result = await api.purgeCache({
       ecosystem: purgeOptions.value.ecosystem || undefined,
@@ -47,6 +56,8 @@ async function purge() {
     })
     message.value = `Purged ${result.files_purged} files, freeing ${formatBytes(result.bytes_freed)}.`
     await load()
+  } catch (err) {
+    error.value = errorMessage(err, 'Could not purge the cache.')
   } finally {
     busy.value = false
   }
@@ -54,10 +65,14 @@ async function purge() {
 
 async function gc() {
   busy.value = true
+  error.value = null
+  message.value = null
   try {
     const result = await api.garbageCollect()
     message.value = `Removed ${result.orphan_blobs_removed} orphaned blobs and ${result.tmp_files_removed} stale temp files.`
     await load()
+  } catch (err) {
+    error.value = errorMessage(err, 'Garbage collection failed.')
   } finally {
     busy.value = false
   }
@@ -78,7 +93,8 @@ onMounted(load)
     <button class="btn" :disabled="busy" @click="gc">Run garbage collection</button>
   </div>
 
-  <div v-if="message" class="alert alert-ok">{{ message }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
+  <div v-if="message" class="alert alert-ok" role="status">{{ message }}</div>
   <div v-if="loading" class="empty">Loading…</div>
 
   <template v-else-if="stats">
@@ -194,8 +210,8 @@ onMounted(load)
           </p>
 
           <div class="field">
-            <label>Ecosystem</label>
-            <select v-model="purgeOptions.ecosystem">
+            <label for="storage-purge-ecosystem">Ecosystem</label>
+            <select id="storage-purge-ecosystem" v-model="purgeOptions.ecosystem">
               <option value="">All ecosystems</option>
               <option value="npm">npm only</option>
               <option value="pypi">PyPI only</option>
@@ -203,8 +219,8 @@ onMounted(load)
             </select>
           </div>
           <div class="field">
-            <label>Cached more than (days ago)</label>
-            <input v-model.number="purgeOptions.older_than_days" type="number" min="1" />
+            <label for="storage-purge-age">Cached more than (days ago)</label>
+            <input id="storage-purge-age" v-model.number="purgeOptions.older_than_days" type="number" min="1" />
           </div>
           <label class="check mb">
             <input v-model="purgeOptions.unused_only" type="checkbox" />

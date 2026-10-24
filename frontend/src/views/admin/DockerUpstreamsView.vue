@@ -11,6 +11,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import { relativeTime } from '@/utils/format'
 
 const upstreams = ref([])
@@ -20,6 +21,10 @@ const loading = ref(true)
 const error = ref(null)
 const message = ref(null)
 const testing = ref(null)
+const busy = ref(null)
+const formError = ref(null)
+const presetError = ref(null)
+const saving = ref(false)
 
 const showForm = ref(false)
 const editing = ref(null)
@@ -70,7 +75,7 @@ async function load() {
     upstreams.value = u.upstreams
     presets.value = p.presets
   } catch (err) {
-    error.value = err.detail || 'Could not load container upstreams.'
+    error.value = errorMessage(err, 'Could not load container registries.')
   } finally {
     loading.value = false
   }
@@ -89,12 +94,14 @@ const hostList = (text) =>
 
 function openCreate() {
   editing.value = null
+  formError.value = null
   form.value = blank()
   showForm.value = true
 }
 
 function openEdit(upstream) {
   editing.value = upstream
+  formError.value = null
   const extra = upstream.extra || {}
   form.value = {
     ...blank(),
@@ -116,7 +123,7 @@ function openEdit(upstream) {
 }
 
 async function save() {
-  error.value = null
+  formError.value = null
   const f = form.value
   const extra = {
     blob_hosts: hostList(f.blob_hosts),
@@ -135,6 +142,7 @@ async function save() {
   }
   if (f.credential) payload.credential = f.credential
   if (f.auth_type === 'none' && editing.value?.has_credential) payload.credential = ''
+  saving.value = true
   try {
     if (editing.value) {
       await api.updateUpstream(editing.value.id, payload)
@@ -144,44 +152,67 @@ async function save() {
       message.value = `${f.name} added. Pull with ${host.value}/${f.name.trim()}/<image>:<tag>.`
     }
     showForm.value = false
-    await load()
   } catch (err) {
-    error.value = err.detail || 'Could not save the upstream.'
+    // Shown inside the dialog: the page alert sits behind the backdrop.
+    formError.value = errorMessage(err, 'Could not save the registry.')
+    return
+  } finally {
+    saving.value = false
   }
+  await load()
 }
 
 function openPreset(preset) {
   presetDialog.value = preset
   presetCredential.value = ''
+  presetError.value = null
 }
 
 async function addPreset() {
   const preset = presetDialog.value
+  presetError.value = null
+  saving.value = true
   try {
     await api.dockerAddPreset(preset.name, { credential: presetCredential.value || null })
     message.value = `${preset.label} added. Pull with ${host.value}/${preset.name === 'dockerhub' ? '' : preset.name + '/'}<image>:<tag>.`
     presetDialog.value = null
     presetCredential.value = ''
-    await load()
   } catch (err) {
-    error.value = err.detail || 'Could not add the preset.'
+    presetError.value = errorMessage(err, `Could not add ${preset.label}.`)
+    return
+  } finally {
+    saving.value = false
   }
+  await load()
 }
 
 async function test(upstream) {
   testing.value = upstream.id
   message.value = null
+  error.value = null
   try {
     const result = await api.testUpstream(upstream.id)
     message.value = result.healthy ? `${upstream.name} is reachable.` : `${upstream.name} failed: ${result.error}`
+  } catch (err) {
+    error.value = errorMessage(err, `Could not test ${upstream.name}.`)
   } finally {
     testing.value = null
-    await load()
   }
+  // Refresh the health column either way; load() reports its own errors.
+  await load()
 }
 
 async function toggleEnabled(upstream) {
-  await api.updateUpstream(upstream.id, { enabled: !upstream.enabled })
+  error.value = null
+  busy.value = upstream.id
+  try {
+    await api.updateUpstream(upstream.id, { enabled: !upstream.enabled })
+  } catch (err) {
+    error.value = errorMessage(err, `Could not ${upstream.enabled ? 'disable' : 'enable'} ${upstream.name}.`)
+    return
+  } finally {
+    busy.value = null
+  }
   message.value = upstream.enabled
     ? `${upstream.name} disabled. Pulls under ${upstream.name}/ are refused; cached images stay on disk.`
     : `${upstream.name} enabled.`
@@ -189,29 +220,36 @@ async function toggleEnabled(upstream) {
 }
 
 async function makeDefault(upstream) {
+  error.value = null
   try {
     await api.updateUpstream(upstream.id, { extra: { default: true } })
     message.value = `Names without an upstream prefix now resolve to ${upstream.name}.`
     await load()
   } catch (err) {
-    error.value = err.detail || 'Could not change the default.'
+    error.value = errorMessage(err, 'Could not change the default.')
   }
 }
 
 async function remove(upstream) {
   if (!confirm(`Delete upstream "${upstream.name}"?`)) return
+  error.value = null
+  busy.value = upstream.id
   try {
-    await api.deleteUpstream(upstream.id)
-  } catch (err) {
-    if (err.status !== 409) {
-      error.value = err.detail || 'Could not delete.'
-      return
+    try {
+      await api.deleteUpstream(upstream.id)
+    } catch (err) {
+      if (err.status !== 409) throw err
+      const again = confirm(
+        `${err.detail}\n\nDelete "${upstream.name}" AND its cached images? Disabling keeps them.`,
+      )
+      if (!again) return
+      await api.deleteUpstream(upstream.id, { purge: true })
     }
-    const again = confirm(
-      `${err.detail}\n\nDelete "${upstream.name}" AND its cached images? Disabling keeps them.`,
-    )
-    if (!again) return
-    await api.deleteUpstream(upstream.id, { purge: true })
+  } catch (err) {
+    error.value = errorMessage(err, `Could not delete ${upstream.name}.`)
+    return
+  } finally {
+    busy.value = null
   }
   message.value = `${upstream.name} deleted.`
   await load()
@@ -228,11 +266,19 @@ onMounted(load)
 <template>
   <div class="page-head">
     <div>
-      <h1>Container upstreams</h1>
+      <h1>Container registries</h1>
       <p class="page-sub">
         Registries images are pulled through. The upstream's name is the image path prefix:
         <code>{{ host }}/ghcr/aquasecurity/trivy</code> comes from the <code>ghcr</code> upstream.
         Names without a known prefix go to the default upstream, normally Docker Hub.
+      </p>
+      <p class="page-sub">
+        Why a separate page from package
+        <router-link :to="{ name: 'upstreams' }">Upstreams</router-link>: here the name is part of
+        every image path rather than a label, there is no tier fall-through between registries, and
+        each registry needs its CDN hosts listed, because layer downloads are redirected off the
+        registry and minireg only follows redirects to hosts it has been told about. Vulnerability
+        rules for images are on <router-link :to="{ name: 'image-policy' }">Image policy</router-link>.
       </p>
     </div>
     <div class="row-tight">
@@ -241,8 +287,8 @@ onMounted(load)
     </div>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
-  <div v-if="message" class="alert alert-info">{{ message }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
+  <div v-if="message" class="alert alert-info" role="status">{{ message }}</div>
 
   <div v-if="unconfiguredPresets.length" class="card mb">
     <div class="card-head"><h3>Well-known registries</h3></div>
@@ -268,7 +314,7 @@ onMounted(load)
     </div>
     <div class="card-body tight">
       <div v-if="!docker.length" class="empty">
-        No container upstreams yet. Add Docker Hub above to start pulling through this registry.
+        No container registries yet. Add Docker Hub above to start pulling through this registry.
       </div>
       <div v-else class="table-wrap">
         <table>
@@ -290,7 +336,7 @@ onMounted(load)
                   <span v-if="upstream.name === defaultName" class="badge badge-accent" title="Answers names with no upstream prefix">default</span>
                   <span v-if="upstream.extra?.preset" class="badge">preset</span>
                   <span v-if="upstream.kind === 'gitlab_oci'" class="badge">GitLab</span>
-                  <span v-if="upstream.has_credential" class="badge" title="Credential configured">🔒 authenticated</span>
+                  <span v-if="upstream.has_credential" class="badge" title="Credential configured"><span aria-hidden="true">🔒 </span>authenticated</span>
                   <span v-if="!upstream.enabled" class="badge badge-warn">disabled</span>
                 </div>
               </td>
@@ -324,14 +370,14 @@ onMounted(load)
               </td>
               <td class="num nowrap">
                 <button class="btn btn-sm" :disabled="testing === upstream.id" @click="test(upstream)">
-                  {{ testing === upstream.id ? '…' : 'Test' }}
+                  {{ testing === upstream.id ? 'Testing…' : 'Test' }}
                 </button>
                 <button v-if="upstream.name !== defaultName && upstream.enabled" class="btn btn-sm" title="Answer names with no upstream prefix" @click="makeDefault(upstream)">
                   Make default
                 </button>
-                <button class="btn btn-sm" @click="toggleEnabled(upstream)">{{ upstream.enabled ? 'Disable' : 'Enable' }}</button>
+                <button class="btn btn-sm" :disabled="busy === upstream.id" @click="toggleEnabled(upstream)">{{ upstream.enabled ? 'Disable' : 'Enable' }}</button>
                 <button class="btn btn-sm" @click="openEdit(upstream)">Edit</button>
-                <button class="btn btn-sm btn-danger" @click="remove(upstream)">Delete</button>
+                <button class="btn btn-sm btn-danger" :disabled="busy === upstream.id" @click="remove(upstream)">Delete</button>
               </td>
             </tr>
           </tbody>
@@ -344,13 +390,14 @@ onMounted(load)
     <div class="modal" style="max-width: 560px">
       <div class="modal-head">
         <h3>Add {{ presetDialog.label }}</h3>
-        <button class="btn btn-sm btn-ghost" @click="presetDialog = null">✕</button>
+        <button class="btn btn-sm btn-ghost" aria-label="Close" @click="presetDialog = null">✕</button>
       </div>
       <div class="modal-body">
         <p class="small">
           Pulled as <code>{{ host }}/{{ presetDialog.name === 'dockerhub' ? '' : presetDialog.name + '/' }}&lt;image&gt;:&lt;tag&gt;</code>
           from <code>{{ presetDialog.url }}</code>.
         </p>
+        <div v-if="presetError" class="alert alert-error" role="alert">{{ presetError }}</div>
         <p v-if="presetDialog.note" class="field-hint">{{ presetDialog.note }}</p>
         <div class="field">
           <label for="preset-cred">Credential <span class="faint">(optional)</span></label>
@@ -367,7 +414,7 @@ onMounted(load)
       </div>
       <div class="modal-foot">
         <button class="btn" @click="presetDialog = null">Cancel</button>
-        <button class="btn btn-primary" @click="addPreset">Add</button>
+        <button class="btn btn-primary" :disabled="saving" @click="addPreset">{{ saving ? 'Adding…' : 'Add' }}</button>
       </div>
     </div>
   </div>
@@ -376,9 +423,10 @@ onMounted(load)
     <div class="modal" style="max-width: 640px">
       <div class="modal-head">
         <h3>{{ editing ? `Edit ${editing.name}` : 'Add a container registry' }}</h3>
-        <button class="btn btn-sm btn-ghost" @click="showForm = false">✕</button>
+        <button class="btn btn-sm btn-ghost" aria-label="Close" @click="showForm = false">✕</button>
       </div>
       <div class="modal-body">
+        <div v-if="formError" class="alert alert-error" role="alert">{{ formError }}</div>
         <div class="row" style="gap: 0.8rem">
           <div class="field" style="flex: 1">
             <label for="up-name">Name (image path prefix)</label>
@@ -471,7 +519,7 @@ onMounted(load)
         <button class="btn" @click="showForm = false">Cancel</button>
         <button
           class="btn btn-primary"
-          :disabled="!form.name || !form.url || (form.kind === 'gitlab_oci' && !form.registry_url)"
+          :disabled="saving || !form.name || !form.url || (form.kind === 'gitlab_oci' && !form.registry_url)"
           @click="save"
         >
           Save

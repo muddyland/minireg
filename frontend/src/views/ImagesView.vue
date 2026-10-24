@@ -6,6 +6,7 @@
 import { onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import { formatBytes, formatNumber, relativeTime } from '@/utils/format'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
@@ -35,7 +36,7 @@ async function load() {
     images.value = data.images
     total.value = data.total
   } catch (err) {
-    error.value = err.detail || 'Could not load images.'
+    error.value = errorMessage(err, 'Could not load images.')
   } finally {
     loading.value = false
   }
@@ -83,24 +84,30 @@ onMounted(async () => {
     </div>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
   <div class="card mb">
     <div class="card-body">
       <div class="row">
-        <input
-          v-model="q"
-          type="search"
-          placeholder="Filter by name, e.g. python or dockerhub/library"
-          style="flex: 1; min-width: 200px"
-          @keyup.enter="applyFilters"
-        />
-        <div class="eco-filter" style="margin-top: 0">
+        <form class="row" style="flex: 1; min-width: 200px" @submit.prevent="applyFilters">
+          <input
+            v-model="q"
+            type="search"
+            placeholder="Filter by name, e.g. python or dockerhub/library"
+            aria-label="Filter images by name"
+            style="flex: 1; min-width: 200px"
+          />
+          <button class="btn" type="submit">Filter</button>
+        </form>
+        <div class="eco-filter" style="margin-top: 0" role="radiogroup" aria-label="Show">
           <button
             v-for="option in SCOPES"
             :key="option.value"
+            type="button"
+            role="radio"
             class="eco-chip"
             :class="{ active: scope === option.value }"
+            :aria-checked="scope === option.value"
             @click="scope = option.value; applyFilters()"
           >
             {{ option.label }}

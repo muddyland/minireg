@@ -20,7 +20,13 @@ async function copy(text, key) {
 }
 
 onMounted(async () => {
-  config.value = await api.clientConfig()
+  // Only used for the public URL; on failure the commands fall back to the
+  // address this page was loaded from, which is right in almost every setup.
+  try {
+    config.value = await api.clientConfig()
+  } catch {
+    config.value = null
+  }
 })
 
 const COMMANDS = [

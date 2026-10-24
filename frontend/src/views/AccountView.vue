@@ -1,6 +1,7 @@
 <script setup>
 import { ref } from 'vue'
 import api from '@/api/client'
+import { errorMessage } from '@/utils/errors'
 import { useAuthStore } from '@/stores/auth'
 import { formatDateTime } from '@/utils/format'
 
@@ -21,7 +22,7 @@ async function changePassword() {
     message.value = 'Password changed.'
     form.value = { current_password: '', new_password: '', confirm: '' }
   } catch (err) {
-    error.value = err.detail || 'Could not change the password.'
+    error.value = errorMessage(err, 'Could not change the password.')
   }
 }
 </script>
@@ -74,8 +75,8 @@ async function changePassword() {
           Your password is managed by your identity provider and cannot be changed here.
         </div>
         <template v-else>
-          <div v-if="message" class="alert alert-ok">{{ message }}</div>
-          <div v-if="error" class="alert alert-error">{{ error }}</div>
+          <div v-if="message" class="alert alert-ok" role="status">{{ message }}</div>
+          <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
           <form @submit.prevent="changePassword">
             <div class="field">
               <label for="cur">Current password</label>

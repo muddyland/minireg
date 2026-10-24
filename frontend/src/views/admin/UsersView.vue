@@ -3,11 +3,16 @@ import { onMounted, ref } from 'vue'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 import { formatDate, relativeTime } from '@/utils/format'
+import { errorMessage } from '@/utils/errors'
 
 const auth = useAuthStore()
 const users = ref([])
 const loading = ref(true)
 const error = ref(null)
+const formError = ref(null)
+const saving = ref(false)
+// User id whose enable/delete call is in flight.
+const busy = ref(null)
 
 const showForm = ref(false)
 const editing = ref(null)
@@ -26,13 +31,14 @@ async function load() {
   try {
     users.value = (await api.listUsers()).users
   } catch (err) {
-    error.value = err.detail || 'Could not load users.'
+    error.value = errorMessage(err, 'Could not load users.')
   } finally {
     loading.value = false
   }
 }
 
 function openCreate() {
+  formError.value = null
   editing.value = null
   form.value = {
     username: '',
@@ -47,6 +53,7 @@ function openCreate() {
 }
 
 function openEdit(user) {
+  formError.value = null
   editing.value = user
   form.value = { ...user, password: '' }
   showForm.value = true
@@ -54,6 +61,8 @@ function openEdit(user) {
 
 async function save() {
   error.value = null
+  formError.value = null
+  saving.value = true
   try {
     if (editing.value) {
       const payload = {
@@ -79,26 +88,40 @@ async function save() {
     showForm.value = false
     await load()
   } catch (err) {
-    error.value = err.detail || 'Could not save the user.'
+    // Shown inside the dialog: the page alert is hidden behind the backdrop.
+    formError.value = errorMessage(err, 'Could not save the user.')
+  } finally {
+    saving.value = false
   }
 }
 
 async function remove(user) {
   if (!confirm(`Delete "${user.username}"? Their API tokens are revoked too.`)) return
+  error.value = null
+  busy.value = user.id
   try {
     await api.deleteUser(user.id)
     await load()
   } catch (err) {
-    error.value = err.detail || 'Could not delete the user.'
+    error.value = errorMessage(err, `Could not delete ${user.username}.`)
+  } finally {
+    busy.value = null
   }
 }
 
 async function toggleActive(user) {
+  error.value = null
+  busy.value = user.id
   try {
     await api.updateUser(user.id, { is_active: !user.is_active })
     await load()
   } catch (err) {
-    error.value = err.detail || 'Could not update the user.'
+    error.value = errorMessage(
+      err,
+      `Could not ${user.is_active ? 'disable' : 'enable'} ${user.username}.`,
+    )
+  } finally {
+    busy.value = null
   }
 }
 
@@ -117,7 +140,7 @@ onMounted(load)
     <button class="btn btn-primary" @click="openCreate">Add user</button>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
   <div class="card">
     <div class="card-body tight">
@@ -162,14 +185,14 @@ onMounted(load)
                 <button class="btn btn-sm" @click="openEdit(user)">Edit</button>
                 <button
                   class="btn btn-sm"
-                  :disabled="user.id === auth.user?.id"
+                  :disabled="user.id === auth.user?.id || busy === user.id"
                   @click="toggleActive(user)"
                 >
                   {{ user.is_active ? 'Disable' : 'Enable' }}
                 </button>
                 <button
                   class="btn btn-sm btn-danger"
-                  :disabled="user.id === auth.user?.id"
+                  :disabled="user.id === auth.user?.id || busy === user.id"
                   @click="remove(user)"
                 >
                   Delete
@@ -186,27 +209,28 @@ onMounted(load)
     <div class="modal">
       <div class="modal-head">
         <h3>{{ editing ? `Edit ${editing.username}` : 'Add user' }}</h3>
-        <button class="btn btn-sm btn-ghost" @click="showForm = false">✕</button>
+        <button class="btn btn-sm btn-ghost" aria-label="Close" @click="showForm = false">✕</button>
       </div>
       <div class="modal-body">
         <div v-if="!editing" class="field">
-          <label>Username</label>
-          <input v-model="form.username" autocomplete="off" />
+          <label for="user-username">Username</label>
+          <input id="user-username" v-model="form.username" autocomplete="off" />
         </div>
         <div class="field">
-          <label>Email</label>
-          <input v-model="form.email" type="email" autocomplete="off" />
+          <label for="user-email">Email</label>
+          <input id="user-email" v-model="form.email" type="email" autocomplete="off" />
           <p class="field-hint">
             An SSO login with a matching email is linked to this account automatically.
           </p>
         </div>
         <div class="field">
-          <label>Full name</label>
-          <input v-model="form.full_name" autocomplete="off" />
+          <label for="user-full-name">Full name</label>
+          <input id="user-full-name" v-model="form.full_name" autocomplete="off" />
         </div>
         <div v-if="editing?.provider !== 'oidc'" class="field">
-          <label>{{ editing ? 'New password' : 'Password' }}</label>
+          <label for="user-password">{{ editing ? 'New password' : 'Password' }}</label>
           <input
+            id="user-password"
             v-model="form.password"
             type="password"
             autocomplete="new-password"
@@ -228,8 +252,11 @@ onMounted(load)
         </label>
       </div>
       <div class="modal-foot">
+        <span v-if="formError" class="alert alert-error small" role="alert" style="margin: 0; flex: 1">
+          {{ formError }}
+        </span>
         <button class="btn" @click="showForm = false">Cancel</button>
-        <button class="btn btn-primary" :disabled="!editing && !form.username" @click="save">Save</button>
+        <button class="btn btn-primary" :disabled="saving || (!editing && !form.username)" @click="save">Save</button>
       </div>
     </div>
   </div>

@@ -11,6 +11,7 @@ import { useRoute, useRouter } from 'vue-router'
 import api from '@/api/client'
 import TagDetails from '@/components/TagDetails.vue'
 import { useAuthStore } from '@/stores/auth'
+import { errorMessage } from '@/utils/errors'
 import { SEVERITIES, formatBytes, relativeTime, shortDigest, trivySeverityClass } from '@/utils/format'
 
 const route = useRoute()
@@ -22,6 +23,8 @@ const repo = ref(null)
 const loading = ref(true)
 const error = ref(null)
 const message = ref(null)
+const updating = ref(false)
+const refreshing = ref(null)
 const watchInput = ref('')
 const tagFilter = ref('')
 // Bumped after admin actions so open panels drop their cached data.
@@ -38,7 +41,10 @@ async function load() {
     // Nothing chosen: open the newest tag, so the page is never just a list.
     if (!open.value.size && repo.value.tags.length) open.value = new Set([repo.value.tags[0].tag])
   } catch (err) {
-    error.value = err.status === 404 ? 'This repository has not been pulled or pushed yet.' : err.detail
+    error.value =
+      err.status === 404
+        ? 'This repository has not been pulled or pushed yet.'
+        : errorMessage(err, 'Could not load this repository.')
   } finally {
     loading.value = false
   }
@@ -77,20 +83,50 @@ function rowScan(tag) {
 
 async function update(payload, note) {
   message.value = null
+  error.value = null
+  updating.value = true
   try {
     await api.dockerUpdateRepository(name.value, payload)
-    message.value = note
-    await load()
   } catch (err) {
-    error.value = err.detail || 'Update failed.'
+    error.value = errorMessage(err, 'Update failed.')
+    return
+  } finally {
+    updating.value = false
   }
+  message.value = note
+  await load()
 }
+
+// Quarantining asks for the reason pulls are refused with, in a dialog.
+const quarantineOpen = ref(false)
+const quarantineReason = ref('')
+const quarantineError = ref(null)
+const quarantining = ref(false)
 
 function toggleQuarantine() {
   if (repo.value.quarantined) return update({ quarantined: false }, 'Quarantine lifted.')
-  const reason = prompt('Why is this repository being quarantined? The reason is shown to anyone whose pull is refused.')
-  if (reason === null) return
-  return update({ quarantined: true, quarantine_reason: reason }, 'Repository quarantined; pulls are refused.')
+  quarantineReason.value = ''
+  quarantineError.value = null
+  quarantineOpen.value = true
+}
+
+async function confirmQuarantine() {
+  quarantineError.value = null
+  quarantining.value = true
+  try {
+    await api.dockerUpdateRepository(name.value, {
+      quarantined: true,
+      quarantine_reason: quarantineReason.value.trim(),
+    })
+  } catch (err) {
+    quarantineError.value = errorMessage(err, 'Could not quarantine this repository.')
+    return
+  } finally {
+    quarantining.value = false
+  }
+  quarantineOpen.value = false
+  message.value = 'Repository quarantined; pulls are refused.'
+  await load()
 }
 
 function saveWatch() {
@@ -100,14 +136,19 @@ function saveWatch() {
 
 async function refresh(tag) {
   message.value = null
+  error.value = null
+  refreshing.value = tag
   try {
     const result = await api.dockerRefreshTag(name.value, tag)
     message.value = `${tag}: ${result.source}, ${result.layers_fetched} layers fetched, scans queued for ${result.platforms.join(', ') || 'the image'}.`
     generation.value++
-    await load()
   } catch (err) {
-    error.value = err.detail || 'Refresh failed.'
+    error.value = errorMessage(err, `Could not refresh ${tag}.`)
+    return
+  } finally {
+    refreshing.value = null
   }
+  await load()
 }
 
 watch(name, () => {
@@ -135,8 +176,8 @@ onMounted(load)
     </div>
   </div>
 
-  <div v-if="error" class="alert alert-error">{{ error }}</div>
-  <div v-if="message" class="alert alert-ok">{{ message }}</div>
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
+  <div v-if="message" class="alert alert-ok" role="status">{{ message }}</div>
   <div v-if="loading && !repo" class="empty">Loading…</div>
 
   <template v-if="repo">
@@ -147,12 +188,18 @@ onMounted(load)
     <div v-if="auth.isAdmin" class="card admin-strip mb">
       <div class="admin-strip-body">
         <span class="admin-label">Administration</span>
-        <button class="btn btn-sm" title="Exempt from storage eviction" @click="update({ pinned: !repo.pinned }, repo.pinned ? 'Unpinned.' : 'Pinned: exempt from eviction.')">
+        <button
+          class="btn btn-sm"
+          title="Exempt from storage eviction"
+          :disabled="updating"
+          @click="update({ pinned: !repo.pinned }, repo.pinned ? 'Unpinned.' : 'Pinned: exempt from eviction.')"
+        >
           {{ repo.pinned ? 'Unpin' : 'Pin' }}
         </button>
         <button
           class="btn btn-sm"
           :class="repo.quarantined ? '' : 'btn-danger'"
+          :disabled="updating"
           title="Refuse every pull, with a reason shown to the client; recorded in the audit log"
           @click="toggleQuarantine"
         >
@@ -162,7 +209,7 @@ onMounted(load)
           <span class="admin-sep" />
           <label for="watch-tags" class="small dim nowrap" title="Revalidated, pre-fetched and rescanned hourly; never evicted">Watched tags</label>
           <input id="watch-tags" v-model="watchInput" class="watch-input" placeholder="3.12-slim, latest" @keyup.enter="saveWatch" />
-          <button class="btn btn-sm" @click="saveWatch">Save</button>
+          <button class="btn btn-sm" :disabled="updating" @click="saveWatch">Save</button>
         </template>
       </div>
     </div>
@@ -177,6 +224,7 @@ onMounted(load)
             type="search"
             class="tag-filter"
             placeholder="Filter tags…"
+            aria-label="Filter tags"
           />
         </div>
         <div v-if="!repo.tags.length" class="empty">No tags cached yet.</div>
@@ -231,8 +279,9 @@ onMounted(load)
                   v-if="auth.isAdmin && !repo.local"
                   class="btn btn-sm btn-ghost"
                   title="Revalidate upstream now, pre-fetch layers, queue scans"
+                  :disabled="refreshing === tag.tag"
                   @click="refresh(tag.tag)"
-                >Refresh</button>
+                >{{ refreshing === tag.tag ? 'Refreshing…' : 'Refresh' }}</button>
               </span>
             </div>
             <TagDetails
@@ -274,6 +323,49 @@ onMounted(load)
       </div>
     </div>
   </template>
+
+  <div
+    v-if="quarantineOpen"
+    class="modal-backdrop"
+    @click.self="quarantineOpen = false"
+    @keydown.esc="quarantineOpen = false"
+  >
+    <form
+      class="modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="quarantine-title"
+      @submit.prevent="confirmQuarantine"
+    >
+      <div class="modal-head">
+        <h3 id="quarantine-title">Quarantine repository</h3>
+        <button type="button" class="btn btn-sm btn-ghost" aria-label="Close" @click="quarantineOpen = false">✕</button>
+      </div>
+      <div class="modal-body">
+        <div v-if="quarantineError" class="alert alert-error" role="alert">{{ quarantineError }}</div>
+        <p class="small dim" style="margin-top: 0">
+          Every pull from <span class="mono">{{ name }}</span> is refused until the quarantine is lifted.
+          The change is recorded in the audit log.
+        </p>
+        <div class="field">
+          <label for="quarantine-reason">Reason</label>
+          <input
+            id="quarantine-reason"
+            v-model="quarantineReason"
+            placeholder="e.g. compromised upstream tag, under investigation"
+            autofocus
+          />
+          <p class="field-hint">Shown to anyone whose pull is refused.</p>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="btn" @click="quarantineOpen = false">Cancel</button>
+        <button type="submit" class="btn btn-danger" :disabled="quarantining">
+          {{ quarantining ? 'Quarantining…' : 'Quarantine' }}
+        </button>
+      </div>
+    </form>
+  </div>
 </template>
 
 <style scoped>

@@ -37,7 +37,7 @@ const routes = [
   { path: '/admin/downloads', name: 'downloads', component: () => import('@/views/admin/DownloadsView.vue'), meta: { admin: true } },
   { path: '/admin/audit', name: 'audit', component: () => import('@/views/admin/AuditView.vue'), meta: { admin: true } },
 
-  { path: '/:pathMatch(.*)*', redirect: '/' },
+  { path: '/:pathMatch(.*)*', name: 'not-found', component: () => import('@/views/NotFoundView.vue') },
 ]
 
 const router = createRouter({

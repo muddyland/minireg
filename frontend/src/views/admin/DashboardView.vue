@@ -2,7 +2,15 @@
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
 import { formatBytes, formatNumber, relativeTime } from '@/utils/format'
+import { errorMessage } from '@/utils/errors'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
+
+// Every package ecosystem the registry serves; images are counted separately.
+const ECOSYSTEMS = [
+  ['npm', 'npm'],
+  ['pypi', 'PyPI'],
+  ['cargo', 'cargo'],
+]
 
 const days = ref(30)
 const overview = ref(null)
@@ -11,6 +19,7 @@ const logins = ref([])
 const timeline = ref([])
 const health = ref(null)
 const loading = ref(true)
+const error = ref(null)
 
 const maxDownloads = computed(() => Math.max(1, ...top.value.map((p) => p.downloads)))
 
@@ -30,19 +39,25 @@ const cacheHitPercent = computed(() => {
 
 async function load() {
   loading.value = true
-  const [o, t, l, tl, h] = await Promise.all([
-    api.statsOverview(days.value),
-    api.topPackages({ days: days.value, limit: 12 }),
-    api.recentLogins(10),
-    api.downloadsTimeline(days.value),
-    api.health().catch(() => null),
-  ])
-  overview.value = o
-  top.value = t.packages
-  logins.value = l.logins
-  timeline.value = tl.points
-  health.value = h
-  loading.value = false
+  error.value = null
+  try {
+    const [o, t, l, tl, h] = await Promise.all([
+      api.statsOverview(days.value),
+      api.topPackages({ days: days.value, limit: 12 }),
+      api.recentLogins(10),
+      api.downloadsTimeline(days.value),
+      api.health().catch(() => null),
+    ])
+    overview.value = o
+    top.value = t.packages
+    logins.value = l.logins
+    timeline.value = tl.points
+    health.value = h
+  } catch (err) {
+    error.value = errorMessage(err, 'Could not load the dashboard.')
+  } finally {
+    loading.value = false
+  }
 }
 
 onMounted(load)
@@ -54,7 +69,7 @@ onMounted(load)
       <h1>Dashboard</h1>
       <p class="page-sub">Registry activity over the last {{ days }} days.</p>
     </div>
-    <select v-model.number="days" style="width: auto" @change="load">
+    <select v-model.number="days" style="width: auto" aria-label="Time window" @change="load">
       <option :value="7">Last 7 days</option>
       <option :value="30">Last 30 days</option>
       <option :value="90">Last 90 days</option>
@@ -62,6 +77,7 @@ onMounted(load)
     </select>
   </div>
 
+  <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
   <div v-if="loading" class="empty">Loading…</div>
 
   <template v-else-if="overview">
@@ -70,7 +86,9 @@ onMounted(load)
         <div class="stat-label">Packages</div>
         <div class="stat-value">{{ formatNumber(overview.packages.with_content) }}</div>
         <div class="stat-meta">
-          {{ formatNumber(overview.packages.npm) }} npm · {{ formatNumber(overview.packages.pypi) }} PyPI
+          <template v-for="([key, label], i) in ECOSYSTEMS" :key="key">
+            <template v-if="i"> · </template>{{ formatNumber(overview.packages[key] ?? 0) }} {{ label }}
+          </template>
           <template v-if="overview.packages.index_only">
             <br />
             <span
@@ -80,6 +98,19 @@ onMounted(load)
               + {{ formatNumber(overview.packages.index_only) }} indexed names
             </span>
           </template>
+        </div>
+      </div>
+      <div v-if="overview.images" class="card stat">
+        <div class="stat-label">Container images</div>
+        <div class="stat-value">{{ formatNumber(overview.images.repositories) }}</div>
+        <div class="stat-meta">
+          {{ formatNumber(overview.images.tags) }} tags · {{ formatNumber(overview.images.local) }} pushed here
+          <template v-if="overview.images.quarantined">
+            · {{ formatNumber(overview.images.quarantined) }} quarantined
+          </template>
+          <br />
+          <router-link :to="{ name: 'images' }">Images</router-link> ·
+          <router-link :to="{ name: 'image-policy' }">Image policy</router-link>
         </div>
       </div>
       <div class="card stat">
@@ -182,7 +213,7 @@ onMounted(load)
       <div class="card">
         <div class="card-head">
           <h3>Most downloaded</h3>
-          <router-link :to="{ name: 'admin-packages' }" class="small">All packages →</router-link>
+          <router-link :to="{ name: 'admin-packages' }" class="small">Manage packages →</router-link>
         </div>
         <div class="card-body">
           <div v-if="!top.length" class="empty">No downloads recorded yet.</div>
