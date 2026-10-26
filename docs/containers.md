@@ -48,7 +48,7 @@ Put the registry's hostname in front of the image name:
 ```
 docker pull minireg.example.com/alpine:3.20                    # Docker Hub (library/alpine)
 docker pull minireg.example.com/bitnami/redis:7.4              # Docker Hub (bitnami/redis)
-docker pull minireg.example.com/ghcr/aquasecurity/trivy:0.76.0 # ghcr.io
+docker pull minireg.example.com/ghcr/aquasecurity/trivy:0.76.1 # ghcr.io
 docker pull minireg.example.com/quay/prometheus/busybox        # quay.io
 docker pull minireg.example.com/k8s/pause:3.10                 # registry.k8s.io
 ```
