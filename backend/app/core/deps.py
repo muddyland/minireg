@@ -33,7 +33,7 @@ from ..core.security import (
     verify_token_secret,
 )
 from ..db import get_session
-from ..models import ApiToken, User
+from ..models import ApiToken, AuthProvider, User
 
 log = logging.getLogger(__name__)
 
@@ -387,7 +387,9 @@ async def _basic_password_identity(
     # account costs the same argon2 work as a real one. Skipping it answered
     # unknown names in microseconds, which enumerates accounts.
     password_ok = verify_password(password, user.password_hash if user else None)
-    if user and user.is_active and password_ok:
+    # An SSO account's password is not ours to check: the identity provider
+    # decides who may sign in, and a leftover local password bypassed it.
+    if user and user.is_active and password_ok and user.provider == AuthProvider.local:
         await forgive_login_attempt(ip, username, started)
         return Identity(user=user, method=PASSWORD_BASIC)
 

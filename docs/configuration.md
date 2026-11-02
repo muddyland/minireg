@@ -434,7 +434,12 @@ the admin group demotes them the next time they log in — you do not have to
 touch the local account.
 
 An OIDC login whose email matches an existing local account links to it rather
-than creating a duplicate.
+than creating a duplicate — only when the provider says the email is
+verified. From then on the account signs in through the provider only: its
+local password is removed and the sessions it had are ended, so the
+provider's group checks and disabling cannot be sidestepped with the old
+password. Its API tokens keep working. Accounts linked by an earlier release
+lose their password the same way on the first start after upgrading.
 
 When a new SSO account's `preferred_username` is already taken, it gets a
 numeric suffix (`alice-2`) rather than failing, and the existing account is

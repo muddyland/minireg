@@ -6,6 +6,7 @@ Each class names the hole it closes.
 from __future__ import annotations
 
 import base64
+import hashlib
 
 import pytest
 from sqlalchemy import func, select
@@ -13,7 +14,7 @@ from sqlalchemy import func, select
 from app import db as db_module
 from app.config import settings
 from app.core import cache, security
-from app.models import ApiToken, AuditLog, Package, User
+from app.models import ApiToken, AuditLog, AuthProvider, Package, User
 from tests import test_integration as _integration
 from tests.test_integration import auth, npm_publish_body
 
@@ -319,3 +320,110 @@ class TestChangePasswordIsThrottled:
         assert resp.status_code == 200
         app_client.cookies.clear()
         await login(app_client, password="a-new-password-123")
+
+
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def provider(monkeypatch):
+    """An OIDC provider whose next ID token carries the claims in the dict."""
+    from app.services import oidc
+
+    monkeypatch.setattr(settings, "oidc_enabled", True)
+    monkeypatch.setattr(settings, "oidc_issuer", "https://idp.example")
+    monkeypatch.setattr(settings, "oidc_auto_create_users", True)
+    monkeypatch.setattr(settings, "oidc_user_group", None)
+    monkeypatch.setattr(settings, "oidc_admin_group", "minireg-admins")
+    claims: dict = {"iss": "https://idp.example"}
+
+    async def exchange(code, redirect_uri, verifier):
+        return {"id_token": "x", "access_token": None}
+
+    async def verify(token, nonce):
+        return dict(claims)
+
+    monkeypatch.setattr(oidc, "exchange_code", exchange)
+    monkeypatch.setattr(oidc, "verify_id_token", verify)
+    return claims
+
+
+async def sso(client):
+    """Run the OIDC callback as the browser that started the flow."""
+    from app.api.auth import OIDC_BIND_COOKIE
+    from app.core.security import create_state_token
+
+    state = create_state_token(
+        {"nonce": "n", "verifier": "v", "next": "/", "bind": hashlib.sha256(b"b").hexdigest()}
+    )
+    client.cookies.set(OIDC_BIND_COOKIE, "b")
+    return await client.get("/api/auth/oidc/callback", params={"code": "c", "state": state})
+
+
+class TestLinkedAccountsLoseTheirPassword:
+    """Linking a local account to an OIDC subject kept its password, and
+    neither the login form nor Basic looked at the provider: the password
+    went on working after the IdP removed the person from the required group
+    or disabled them, while both password-change paths refused to touch it."""
+
+    async def test_linking_drops_the_password_and_its_sessions(self, app_client, provider):
+        old_cookie = await login(app_client)
+        app_client.cookies.clear()
+        provider.update(
+            {"sub": "pub-sub", "preferred_username": "pub", "email": "pub@test", "email_verified": True}
+        )
+        resp = await sso(app_client)
+        assert resp.status_code == 302
+        row = await user_row("publisher")
+        assert row.provider == AuthProvider.oidc
+        assert row.password_hash is None
+        # The SSO cookie just issued works...
+        assert (await app_client.get("/api/auth/me")).status_code == 200
+        # ...a session opened with the password before the link does not.
+        app_client.cookies.clear()
+        app_client.cookies.set(settings.session_cookie, old_cookie)
+        assert (await app_client.get("/api/auth/me")).status_code == 401
+        app_client.cookies.clear()
+
+        # The password no longer signs in, by form or by Basic.
+        resp = await app_client.post(
+            "/api/auth/login",
+            json={"username": "publisher", "password": "publisher-password-1"},
+            headers=SAME_ORIGIN,
+        )
+        assert resp.status_code == 401
+        resp = await app_client.get("/api/auth/me", headers=password_basic())
+        assert resp.status_code == 401
+        # Its API tokens are untouched.
+        assert (await app_client.get("/api/auth/me", headers=auth(app_client))).status_code == 200
+
+    async def test_an_oidc_row_with_a_password_is_refused(self, app_client):
+        """Defence in depth for rows the startup fix has not reached."""
+        async with db_module.session_scope() as session:
+            row = (
+                await session.execute(select(User).where(User.username == "publisher"))
+            ).scalar_one()
+            row.provider = AuthProvider.oidc
+        resp = await app_client.post(
+            "/api/auth/login",
+            json={"username": "publisher", "password": "publisher-password-1"},
+            headers=SAME_ORIGIN,
+        )
+        assert resp.status_code == 401
+        assert (await app_client.get("/api/auth/me", headers=password_basic())).status_code == 401
+
+    async def test_startup_clears_already_linked_rows_once(self, app_client):
+        async with db_module.session_scope() as session:
+            row = (
+                await session.execute(select(User).where(User.username == "publisher"))
+            ).scalar_one()
+            row.provider = AuthProvider.oidc
+            row.oidc_subject = "linked-before-the-fix"
+            version = row.session_version
+        await db_module.create_schema()
+        row = await user_row("publisher")
+        assert row.password_hash is None
+        assert row.session_version == version + 1
+        # Idempotent: a second boot changes nothing.
+        await db_module.create_schema()
+        assert (await user_row("publisher")).session_version == version + 1
+        # Local accounts keep their passwords.
+        assert (await user_row("admin")).password_hash

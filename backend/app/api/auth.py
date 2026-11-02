@@ -135,7 +135,9 @@ async def login(
     # Always pay for one argon2 verify -- against a dummy hash when there is
     # no such user -- so the response time does not say which usernames exist.
     password_ok = verify_password(payload.password, user.password_hash if user else None)
-    if user is None or not password_ok:
+    # An SSO account signs in through its identity provider only, so that
+    # the provider's group checks and disabling apply to every sign-in.
+    if user is None or not password_ok or user.provider != AuthProvider.local:
         await audit.record_audit(
             session,
             audit.LOGIN_FAILED,
@@ -688,6 +690,14 @@ async def oidc_callback(
             user.oidc_issuer = profile.issuer
             user.oidc_subject = profile.subject
             user.provider = AuthProvider.oidc
+            # From here the identity provider decides who this is. A local
+            # password left in place kept working beside SSO -- after the
+            # IdP disabled the person or took them out of the required
+            # group -- and could no longer be changed or reset, since both
+            # paths refuse an OIDC account. Drop it, and every session it
+            # may have opened.
+            user.password_hash = None
+            user.session_version = (user.session_version or 0) + 1
             log.info("linked local account '%s' to OIDC subject", user.username)
 
     created = False
