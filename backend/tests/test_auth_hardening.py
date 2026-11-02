@@ -717,3 +717,50 @@ class TestSigningOutRevokesTheSession:
         )
         assert resp.status_code == 403
         assert await self._works(app_client, cookie)
+
+
+class TestFailedRegistryLoginsAreBounded:
+    """Each failed /v2 login wrote and committed an audit row before any rate
+    limit applied, so an anonymous loop of bad credentials grew the audit
+    table by one row per request, indefinitely."""
+
+    @staticmethod
+    def basic(secret, ip="203.0.113.9"):
+        raw = base64.b64encode(f"x:{secret}".encode()).decode()
+        return {"authorization": f"Basic {raw}", "x-forwarded-for": ip}
+
+    async def _failures(self):
+        return await count(AuditLog, AuditLog.action == "auth.token.failed")
+
+    async def test_a_flood_is_throttled_and_logged_once(self, app_client, login_throttle):
+        codes = []
+        for n in range(20):
+            resp = await app_client.get("/v2/token", headers=self.basic(f"mrg_aaaa_{n}"))
+            codes.append(resp.status_code)
+        assert codes == [401] * 3 + [429] * 17
+        assert resp.json()["errors"][0]["code"] == "TOOMANYREQUESTS"
+        assert resp.headers.get("retry-after")
+        assert await self._failures() == 1
+        # Other paths under /v2 share the budget.
+        resp = await app_client.get("/v2/library/x/manifests/latest", headers=self.basic("mrg_aaaa_x"))
+        assert resp.status_code == 429
+        assert await self._failures() == 1
+
+    async def test_distinct_tokens_are_each_logged(self, app_client, login_throttle):
+        for name in ("mrg_aaaa_1", "mrg_bbbb_1", "not-a-token"):
+            assert (await app_client.get("/v2/token", headers=self.basic(name))).status_code == 401
+        async with db_module.session_scope() as session:
+            prefixes = (
+                await session.execute(
+                    select(AuditLog.detail).where(AuditLog.action == "auth.token.failed")
+                )
+            ).scalars().all()
+        assert sorted(str(d["token_prefix"]) for d in prefixes) == ["None", "mrg_aaaa", "mrg_bbbb"]
+
+    async def test_a_good_token_from_a_throttled_address_still_works(self, app_client, login_throttle):
+        for n in range(5):
+            await app_client.get("/v2/token", headers=self.basic(f"mrg_aaaa_{n}"))
+        resp = await app_client.get(
+            "/v2/token", headers=self.basic(app_client.tokens["publisher"])
+        )
+        assert resp.status_code == 200

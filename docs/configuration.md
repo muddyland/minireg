@@ -199,7 +199,10 @@ client address, per account from one address, and per account from all
 addresses together at ten times the limit. Someone guessing at your username
 therefore throttles only their own address until the guessing is spread over
 many addresses, at which point the account itself is throttled for the rest
-of the minute.
+of the minute. Failed container-registry logins (`docker login`, `/v2`) are
+counted per address against the same limit and answered `429` beyond it;
+they are audited once per address and token per minute, so a loop of bad
+logins cannot grow the audit log without bound.
 
 Login and CLI device-flow limits fall back to an in-process counter when the
 cache is unreachable, rather than failing open — a cache outage should not
