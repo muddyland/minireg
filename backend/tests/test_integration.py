@@ -263,8 +263,9 @@ class TestNpmPublishFlow:
         assert response.json()["version"] == "1.0.0"
 
     async def test_scoped_package_publish_and_fetch(self, app_client):
+        # The attachment key libnpmpublish sends: the full name, scope included.
         body = npm_publish_body(name="@scope/thing")
-        body["_attachments"] = {"thing-1.0.0.tgz": body["_attachments"].pop("@scope/thing-1.0.0.tgz")}
+        assert "@scope/thing-1.0.0.tgz" in body["_attachments"]
         response = await app_client.put(
             "/npm/@scope%2fthing", json=body, headers=auth(app_client)
         )
@@ -275,6 +276,13 @@ class TestNpmPublishFlow:
             got = await app_client.get(path)
             assert got.status_code == 200, path
             assert got.json()["name"] == "@scope/thing"
+
+        # And the tarball URL it advertises must actually serve the bytes.
+        tarball = got.json()["versions"]["1.0.0"]["dist"]["tarball"]
+        assert tarball.endswith("/thing/-/thing-1.0.0.tgz")
+        fetched = await app_client.get(tarball)
+        assert fetched.status_code == 200
+        assert fetched.content == b"tarball-content"
 
     async def test_dist_tags_endpoints(self, app_client):
         await app_client.put("/npm/test-pkg", json=npm_publish_body(), headers=auth(app_client))

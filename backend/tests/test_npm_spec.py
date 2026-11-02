@@ -246,14 +246,33 @@ class TestPublishDocumentParsing:
         assert parsed.attachments["my-pkg-1.0.0.tgz"].data == b"fake-tarball-bytes"
 
     def test_scoped_package(self):
+        # libnpmpublish keys the attachment with the full name, scope and all.
         doc = make_publish_doc(name="@scope/pkg")
-        # npm names the attachment without the scope.
+        assert "@scope/pkg-1.0.0.tgz" in doc["_attachments"]
+        parsed = parse_publish_document(doc, "@scope/pkg")
+        assert parsed.name == "@scope/pkg"
+        assert match_attachment(parsed, "1.0.0") is not None
+
+    def test_scoped_package_scopeless_attachment_name(self):
+        # Older clients and some proxies drop the scope; still accepted.
+        doc = make_publish_doc(name="@scope/pkg")
         doc["_attachments"] = {
             "pkg-1.0.0.tgz": doc["_attachments"].pop("@scope/pkg-1.0.0.tgz")
         }
         parsed = parse_publish_document(doc, "@scope/pkg")
-        assert parsed.name == "@scope/pkg"
         assert match_attachment(parsed, "1.0.0") is not None
+
+    def test_provenance_bundle_is_not_decoded_or_matched(self):
+        # `npm publish --provenance` adds the sigstore bundle as raw JSON.
+        doc = make_publish_doc(name="@scope/pkg")
+        doc["_attachments"]["@scope/pkg-1.0.0.sigstore"] = {
+            "content_type": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "data": '{"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json"}',
+            "length": 62,
+        }
+        parsed = parse_publish_document(doc, "@scope/pkg")
+        assert list(parsed.attachments) == ["@scope/pkg-1.0.0.tgz"]
+        assert match_attachment(parsed, "1.0.0").data == b"fake-tarball-bytes"
 
     def test_rejects_name_path_mismatch(self):
         with pytest.raises(PublishError, match="does not match the request path"):

@@ -29,8 +29,11 @@ build breaks, and "blocked by rule" wastes everyone's afternoon where
 
 ### Name patterns
 
-Globs, matched against the *normalized* name (lowercase; for PyPI, PEP 503
-normalized so `Foo.Bar`, `foo-bar`, and `foo_bar` are one name).
+Globs, matched against the *normalized* name, ignoring case (for PyPI, PEP
+503 normalized so `Foo.Bar`, `foo-bar`, and `foo_bar` are one name). npm
+names are case-sensitive, so `JSONStream` and `jsonstream` are different
+packages, but a rule written `jsonstream` matches both: a rule can only ever
+catch more spellings, never fewer.
 
 | Pattern | Matches |
 |---|---|

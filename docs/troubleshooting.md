@@ -26,8 +26,10 @@ have already explained themselves in one of those two places.
    unhealthy; it is retried every 2 minutes. The **Health** column shows the
    last error. Hit *Test*.
 3. **Is the name right?** PyPI normalizes names (PEP 503): `Foo.Bar`,
-   `foo-bar`, and `foo_bar` are one project. npm is case-sensitive for display
-   but lowercase for lookup.
+   `foo-bar`, and `foo_bar` are one project. npm names are case-sensitive, as
+   on registry.npmjs.org: `JSONStream` and `jsonstream` are two different
+   packages, and asking for the wrong spelling is a `404` (or the other
+   package).
 
 ### `403` with a message
 

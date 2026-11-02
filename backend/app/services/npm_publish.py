@@ -20,7 +20,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..config import settings
-from ..core.naming import is_valid_npm_name, is_valid_semver, npm_tarball_filename
+from ..core.naming import (
+    is_valid_npm_name,
+    is_valid_semver,
+    npm_dist_tag_error,
+    npm_tarball_filename,
+)
 from .storage import Digests
 
 log = logging.getLogger(__name__)
@@ -121,12 +126,30 @@ def parse_publish_document(doc: Any, path_name: str) -> PublishRequest:
     for version, meta in versions.items():
         if not is_valid_semver(version):
             raise PublishError(f"'{version}' is not a valid semver version")
+        if "+" in version:
+            # Build metadata does not take part in precedence: 1.0.0+r *is*
+            # 1.0.0 to every semver range, lockfile and `npm install`. Stored
+            # as a separate string it walked past the duplicate check and
+            # the unpublish tombstone of 1.0.0. npm itself never sends it --
+            # `npm publish` normalises the manifest with semver.clean().
+            raise PublishError(
+                f"version '{version}' carries build metadata; publish "
+                f"'{version.split('+', 1)[0]}' instead (npm ignores everything after '+')"
+            )
         if not isinstance(meta, dict):
             raise PublishError(f"version '{version}' metadata must be an object")
         declared = meta.get("version")
         if declared is not None and declared != version:
             raise PublishError(
                 f"version key '{version}' does not match its metadata version '{declared}'"
+            )
+        # The version document is what installers read the name from; one
+        # naming another package (or another spelling of this one) would be
+        # served under this package's URL.
+        declared_name = meta.get("name")
+        if declared_name is not None and declared_name != name:
+            raise PublishError(
+                f"version '{version}' is named '{declared_name}', not '{name}'"
             )
 
     dist_tags = doc.get("dist-tags") or {}
@@ -135,19 +158,33 @@ def parse_publish_document(doc: Any, path_name: str) -> PublishRequest:
     for tag, version in dist_tags.items():
         if not isinstance(version, str):
             raise PublishError(f"dist-tag '{tag}' must map to a version string")
-        if is_valid_semver(tag):
-            # npm forbids this: a tag that parses as a version makes
-            # `npm install pkg@1.0.0` ambiguous.
-            raise PublishError(f"dist-tag '{tag}' must not be a valid semver version")
+        # npm forbids a tag that parses as a version or range: it makes
+        # `npm install pkg@1.0.0` ambiguous and can never be installed by name.
+        tag_error = npm_dist_tag_error(tag)
+        if tag_error:
+            raise PublishError(tag_error)
 
     raw_attachments = doc.get("_attachments") or {}
     if not isinstance(raw_attachments, dict):
         raise PublishError("'_attachments' must be an object")
-    attachments = {
-        filename: _decode_attachment(filename, spec)
+    # Only tarballs are decoded. `npm publish --provenance` adds a
+    # `{name}-{version}.sigstore` attachment whose `data` is the bundle's
+    # JSON, not base64, so decoding every attachment refused the whole
+    # publish with a 400. This registry does not store or serve provenance
+    # bundles; the tarball publishes and the bundle is dropped.
+    supplied = {
+        filename: spec
         for filename, spec in raw_attachments.items()
         if isinstance(spec, dict) and spec.get("data")
     }
+    attachments = {
+        filename: _decode_attachment(filename, spec)
+        for filename, spec in supplied.items()
+        if is_tarball_attachment(filename)
+    }
+    ignored = sorted(set(supplied) - set(attachments))
+    if ignored:
+        log.info("npm publish of %s: ignoring non-tarball attachments %s", name, ignored)
 
     deprecations = {
         version: meta["deprecated"]
@@ -157,7 +194,10 @@ def parse_publish_document(doc: Any, path_name: str) -> PublishRequest:
 
     # Intent: an attachment means new bytes are being published. No attachment
     # but versions present means a metadata-only edit (deprecate/undeprecate).
-    if attachments:
+    # Any attachment counts, tarball or not: a publish whose only attachment
+    # is a provenance bundle is a publish missing its tarball, and must fail
+    # as one rather than be read as a deprecation.
+    if supplied:
         intent = "publish"
     elif versions:
         intent = "deprecate"
@@ -178,15 +218,26 @@ def parse_publish_document(doc: Any, path_name: str) -> PublishRequest:
     )
 
 
+def is_tarball_attachment(filename: str) -> bool:
+    return filename.endswith(".tgz")
+
+
 def match_attachment(request: PublishRequest, version: str) -> Attachment | None:
     """Find the tarball belonging to a version.
 
-    npm names it ``{unscoped-name}-{version}.tgz``, but we also accept a
-    ``dist.tarball`` basename because some clients and proxies differ.
+    libnpmpublish names it ``{manifest.name}-{version}.tgz`` -- the *full*
+    name, scope included (``@acme/widget-1.0.0.tgz``). The scope-less form
+    and a ``dist.tarball`` basename are accepted too, because older clients
+    and some proxies send those. Whatever the attachment is called, the
+    stored file is named :func:`npm_tarball_filename`, the one the tarball
+    route and rendered ``dist.tarball`` use.
     """
-    expected = npm_tarball_filename(request.name, version)
-    if expected in request.attachments:
-        return request.attachments[expected]
+    for expected in (
+        f"{request.name}-{version}.tgz",
+        npm_tarball_filename(request.name, version),
+    ):
+        if expected in request.attachments:
+            return request.attachments[expected]
 
     meta = request.versions.get(version) or {}
     tarball = (meta.get("dist") or {}).get("tarball")
@@ -195,7 +246,9 @@ def match_attachment(request: PublishRequest, version: str) -> Attachment | None
         if basename in request.attachments:
             return request.attachments[basename]
 
-    # Single-version publish with an oddly named attachment: unambiguous.
+    # Single-version publish with an oddly named tarball: unambiguous.
+    # `attachments` only ever holds tarballs, so a provenance bundle riding
+    # along does not make this ambiguous.
     if len(request.attachments) == 1 and len(request.versions) == 1:
         return next(iter(request.attachments.values()))
     return None
