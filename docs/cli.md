@@ -148,6 +148,12 @@ own config, which a plain `minireg configure` in CI should not start doing. `~/.
 reads are anonymous and cargo only sends credentials to an index that declares
 `auth-required`.
 
+In `pip.conf` the block goes directly under your `[global]` header (or at the
+end, with its own `[global]`, when there is none), because an option belongs
+to the section above it. If your `[global]` already sets `index-url`, the file
+is left alone with a warning: a second copy is an error that makes pip ignore
+the whole file.
+
 The cargo block goes at the *end* of the file on first write. That matters for
 TOML in a way it does not for the other two: `[source.…]` are table headers, so
 anything placed after them would be read as part of `[source.minireg]`.

@@ -479,3 +479,54 @@ class TestConfigureUsesTheGivenAddress:
         text = (home / ".cargo" / "config.toml").read_text()
         assert "sparse+http://localhost:5055/cargo/index/" in text
         assert "public.example" not in text
+
+
+OLD_BLOCK_IN_FREEZE = (
+    "[global]\ntimeout = 60\n\n[freeze]\nall = true\n"
+    "# >>> minireg >>>\nindex-url = http://old/pypi/simple/\n# <<< minireg <<<\n"
+)
+
+
+class TestPipConfLandsUnderGlobal:
+    INDEX = "http://__token__:mrg_tok@localhost:5055/pypi/simple/"
+
+    @pytest.mark.parametrize(
+        "layout",
+        [
+            "",
+            "[global]\ntimeout = 60\n\n[freeze]\nall = true\n",
+            "[install]\nno-compile = true\n",
+            "[freeze]\nall = true\n[global]\ntimeout = 60",
+            "; comment\n[global]\n\n[install]\nuser = false\n[freeze]\nall = true\n",
+            OLD_BLOCK_IN_FREEZE,  # what an older CLI left behind
+        ],
+    )
+    def test_index_url_parses_under_global(self, home, layout):
+        path = pip_conf(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(layout)
+        configure("pip")
+        conf = parsed_pip_conf(home)
+        assert conf.get("global", "index-url") == self.INDEX
+        assert conf.get("global", "trusted-host") == "localhost"
+        for section in conf.sections():
+            if section != "global":
+                assert not conf.has_option(section, "index-url"), section
+        if "timeout" in layout:
+            assert conf.get("global", "timeout") == "60"
+
+        once = path.read_text()
+        configure("pip")
+        assert path.read_text() == once  # idempotent
+        assert once.count("# >>> minireg >>>") == 1
+
+    def test_users_own_index_url_is_not_duplicated(self, home, capsys):
+        """A second index-url in [global] is a DuplicateOptionError, and pip
+        then ignores its whole config. Leave the file as it is and say so."""
+        path = pip_conf(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = "[global]\nindex_url = https://pypi.org/simple/\n[freeze]\nall = true\n"
+        path.write_text(original)
+        configure("pip")
+        assert path.read_text() == original
+        assert "already sets index_url" in capsys.readouterr().err

@@ -413,22 +413,17 @@ def _npmrc_path() -> Path:
     return Path.home() / ".npmrc"
 
 
-def _upsert_lines(path: Path, lines: list[str], marker: str) -> None:
-    """Replace our managed block, leaving anything else in the file alone."""
-    begin = f"# >>> {marker} >>>"
-    end = f"# <<< {marker} <<<"
-    block = "\n".join([begin, *lines, end])
+def _markers(marker: str) -> tuple[str, str]:
+    return f"# >>> {marker} >>>", f"# <<< {marker} <<<"
 
-    existing = path.read_text() if path.is_file() else ""
-    if begin in existing and end in existing:
-        pattern = re.compile(
-            re.escape(begin) + r".*?" + re.escape(end), re.DOTALL
-        )
-        updated = pattern.sub(block, existing)
-    else:
-        separator = "" if not existing or existing.endswith("\n") else "\n"
-        updated = f"{existing}{separator}{block}\n"
 
+def _without_block(existing: str, marker: str) -> str:
+    """``existing`` with our managed block (and its line break) cut out."""
+    begin, end = _markers(marker)
+    return re.sub(re.escape(begin) + r".*?" + re.escape(end) + r"\n?", "", existing, flags=re.DOTALL)
+
+
+def _write_private(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Create with 0600 from the start. Writing then chmod'ing leaves the file
     # world-readable for the moment in between, and these files hold an API
@@ -438,13 +433,84 @@ def _upsert_lines(path: Path, lines: list[str], marker: str) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w") as handle:
-            handle.write(updated)
+            handle.write(text)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
     os.chmod(path, 0o600)
+
+
+def _upsert_lines(path: Path, lines: list[str], marker: str) -> None:
+    """Replace our managed block, leaving anything else in the file alone."""
+    begin, end = _markers(marker)
+    block = "\n".join([begin, *lines, end])
+
+    existing = path.read_text() if path.is_file() else ""
+    if begin in existing and end in existing:
+        pattern = re.compile(
+            re.escape(begin) + r".*?" + re.escape(end), re.DOTALL
+        )
+        # A function, not a replacement string: a backslash in the block
+        # (a token from MINIREG_TOKEN, say) must not be read as an escape.
+        updated = pattern.sub(lambda _m: block, existing)
+    else:
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        updated = f"{existing}{separator}{block}\n"
+    _write_private(path, updated)
+
+
+_INI_SECTION_RE = re.compile(r"^\s*\[([^\]]*)\]")
+_INI_OPTION_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)\s*[=:]")
+
+
+def _ini_key(name: str) -> str:
+    # pip reads `index_url` and `index-url` as the same option.
+    return name.strip().lower().replace("_", "-")
+
+
+def plan_pip_conf(existing: str, settings: list[str], marker: str = "minireg"):
+    """``existing`` pip.conf with ``settings`` in our block under ``[global]``.
+
+    pip reads the file with configparser, where an option belongs to the
+    section above it. The block used to be appended at the end of the file,
+    which put index-url in whatever section came last (``[freeze]``,
+    ``[install]``) whenever the file had one after ``[global]``. It now goes
+    directly under the ``[global]`` header, or at the end with its own header
+    when there is none. Returns ``(text, None)``, or ``(None, conflict)``
+    when the user's own ``[global]`` already sets one of these options: a
+    second copy is a DuplicateOptionError, which stops pip reading its config
+    at all.
+    """
+    begin, end = _markers(marker)
+    outside = _without_block(existing, marker)
+    lines = outside.splitlines(keepends=True)
+    header = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if (m := _INI_SECTION_RE.match(line)) and m.group(1).strip() == "global"
+        ),
+        None,
+    )
+    if header is None:
+        separator = "" if not outside or outside.endswith("\n") else "\n"
+        block = "\n".join([begin, "[global]", *settings, end])
+        return f"{outside}{separator}{block}\n", None
+
+    ours = {_ini_key(s.split("=", 1)[0]) for s in settings}
+    for line in lines[header + 1 :]:
+        if _INI_SECTION_RE.match(line):
+            break
+        option = _INI_OPTION_RE.match(line)
+        if option and _ini_key(option.group(1)) in ours:
+            return None, option.group(1)
+
+    if not lines[header].endswith("\n"):
+        lines[header] += "\n"
+    lines.insert(header + 1, "\n".join([begin, *settings, end]) + "\n")
+    return "".join(lines), None
 
 
 def cmd_configure(args):
@@ -499,22 +565,24 @@ def cmd_configure(args):
             scheme, _, rest = index_url.partition("://")
             index_url = f"{scheme}://__token__:{urllib.parse.quote(token, safe='')}@{rest}"
         # A second `[global]` section makes configparser raise
-        # DuplicateSectionError, which breaks pip completely -- so only emit
-        # the header when the file does not already have one outside our block.
+        # DuplicateSectionError, which breaks pip completely; plan_pip_conf
+        # puts our lines under the existing header instead.
         existing_conf = pip_conf.read_text() if pip_conf.is_file() else ""
-        outside = re.sub(
-            r"# >>> minireg >>>.*?# <<< minireg <<<", "", existing_conf, flags=re.DOTALL
-        )
-        lines = []
-        if not re.search(r"^\s*\[global\]", outside, re.M):
-            lines.append("[global]")
-        lines.append(f"index-url = {index_url}")
+        lines = [f"index-url = {index_url}"]
         if registry.startswith("http://"):
-            lines.append(f"trusted-host = {host.split(':')[0]}")
-        if args.dry_run:
+            lines.append(f"trusted-host = {urllib.parse.urlsplit(registry).hostname}")
+        updated, conflict = plan_pip_conf(existing_conf, lines)
+        if updated is None:
+            info(
+                yellow(
+                    f"  {pip_conf} already sets {conflict} under [global]; not changed. "
+                    "Remove that line and re-run, or point it at the registry yourself."
+                )
+            )
+        elif args.dry_run:
             print(f"\n{bold(str(pip_conf))}\n" + "\n".join(lines))
         else:
-            _upsert_lines(pip_conf, lines, "minireg")
+            _write_private(pip_conf, updated)
             changed.append(str(pip_conf))
 
     if "cargo" in wanted:
