@@ -6,6 +6,7 @@ the parts unit tests of pure functions cannot cover.
 
 import base64
 import io
+import tomllib
 import zipfile
 
 import pytest_asyncio
@@ -977,17 +978,42 @@ class TestClientConfig:
         cargo = body["cargo"]
         assert cargo["registry"] == "sparse+http://registry.test/cargo/index/"
 
-        assert set(cargo) >= {"registry", "config_toml", "config_path", "commands", "note"}
+        assert set(cargo) >= {
+            "registry",
+            "config_toml",
+            "config_path",
+            "commands",
+            "note",
+            "auth_required",
+        }
 
-        # It has to be a source replacement, not a plain [registries] entry --
-        # only replacement redirects crates.io deps without editing Cargo.toml.
-        assert "[source.crates-io]" in cargo["config_toml"]
-        assert 'replace-with = "minireg"' in cargo["config_toml"]
-        assert cargo["registry"] in cargo["config_toml"]
+        # A source replacement pointing at a [registries] entry: replacement
+        # redirects crates.io deps without editing Cargo.toml, and only a
+        # registry entry with a credential provider can carry the token cargo
+        # needs when reads are not anonymous.
+        conf = tomllib.loads(cargo["config_toml"])
+        assert conf["source"]["crates-io"] == {"replace-with": "minireg"}
+        assert conf["registries"]["minireg"] == {
+            "index": cargo["registry"],
+            "credential-provider": "cargo:token",
+        }
+        # No secret belongs in it; the token lives in credentials.toml.
+        assert "mrg_" not in cargo["config_toml"]
+        assert cargo["auth_required"] is False
+        assert not any("cargo login" in c for c in cargo["commands"])
 
-        # No token belongs in it: reads are anonymous and cargo only sends
-        # credentials to an index declaring auth-required.
-        assert "token" not in cargo["config_toml"].lower()
+    async def test_cargo_setup_asks_for_a_token_when_reads_need_one(
+        self, app_client, monkeypatch
+    ):
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "allow_anonymous_read", False)
+        body = (
+            await app_client.get("/api/client-config", headers=auth(app_client))
+        ).json()
+        cargo = body["cargo"]
+        assert cargo["auth_required"] is True
+        assert any(c.startswith("cargo login --registry minireg") for c in cargo["commands"])
 
 
 class TestUserSearch:

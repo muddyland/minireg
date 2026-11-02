@@ -125,11 +125,12 @@ pip config set global.index-url https://registry.example.com/pypi/simple/
 
 ```toml
 # cargo, by hand — ~/.cargo/config.toml
+[registries.minireg]
+index = "sparse+https://registry.example.com/cargo/index/"
+credential-provider = "cargo:token"   # used only when reads need a token
+
 [source.crates-io]
 replace-with = "minireg"
-
-[source.minireg]
-registry = "sparse+https://registry.example.com/cargo/index/"
 ```
 
 > **`PUBLIC_URL` must match the address clients actually use.** Every tarball

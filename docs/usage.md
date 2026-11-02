@@ -338,18 +338,18 @@ in the audit log and can be revoked without disrupting anyone.
     pip config set global.index-url \
       "https://__token__:$MINIREG_TOKEN@registry.example.com/pypi/simple/"
     mkdir -p ~/.cargo && cat >> ~/.cargo/config.toml <<'EOF'
+    [registries.minireg]
+    index = "sparse+https://registry.example.com/cargo/index/"
+    credential-provider = "cargo:token"
     [source.crates-io]
     replace-with = "minireg"
-    [source.minireg]
-    registry = "sparse+https://registry.example.com/cargo/index/"
     EOF
 ```
 
-Cargo needs no token here while reads are anonymous: cargo only sends
-credentials to an index that declares `auth-required`. With
-`ALLOW_ANONYMOUS_READ=false`, use the `[registries.minireg]` block from
-[When reads need a token](#when-reads-need-a-token) and set
-`CARGO_REGISTRIES_MINIREG_TOKEN: ${{ secrets.MINIREG_TOKEN }}` in the step's `env`.
+Cargo sends no token while reads are anonymous: it only sends credentials to
+an index that declares `auth-required`. With `ALLOW_ANONYMOUS_READ=false`, also
+set `CARGO_REGISTRIES_MINIREG_TOKEN: ${{ secrets.MINIREG_TOKEN }}` in the
+step's `env` (see [When reads need a token](#when-reads-need-a-token)).
 
 ### GitLab CI
 

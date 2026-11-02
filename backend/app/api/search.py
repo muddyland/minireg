@@ -300,19 +300,32 @@ async def client_config(identity: Identity = Depends(require_user)) -> dict:
             # Source replacement is how cargo mirrors a registry. It applies to
             # every crates.io dependency without touching a single Cargo.toml,
             # which is what makes it the right shape for a caching proxy -- and
-            # also why it cannot host crates that are not on crates.io.
+            # also why it cannot host crates that are not on crates.io. The
+            # replacement points at a [registries] entry rather than a
+            # [source] one because cargo only attaches a credential to a
+            # registry entry with a credential provider; with anonymous reads
+            # on, config.json does not declare auth-required and cargo sends
+            # no token, so the same block works either way. It is also exactly
+            # what `minireg configure` writes.
             "config_toml": "\n".join(
                 [
+                    "[registries.minireg]",
+                    f'index = "sparse+{base}/cargo/index/"',
+                    'credential-provider = "cargo:token"',
+                    "",
                     "[source.crates-io]",
                     'replace-with = "minireg"',
-                    "",
-                    "[source.minireg]",
-                    f'registry = "sparse+{base}/cargo/index/"',
                 ]
             ),
+            "auth_required": not settings.allow_anonymous_read,
             "config_path": "~/.cargo/config.toml (or .cargo/config.toml in the project)",
             "commands": [
                 "minireg configure   # writes the stanza above",
+                *(
+                    ["cargo login --registry minireg   # paste a read token"]
+                    if not settings.allow_anonymous_read
+                    else []
+                ),
                 f"cargo build         # crates.io deps now resolve through {host}",
             ],
             "note": (
