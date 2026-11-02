@@ -270,3 +270,145 @@ async def test_empty_publish_does_not_freeze_a_cached_package_in_a_reserved_name
     assert response.status_code == 400, response.text
     row = await _package_row("@corp/lib")
     assert row is not None and row.is_local is False and row.owner_user_id is None
+
+
+# --------------------------------------------------------------------------- #
+# Scoped publishes in libnpmpublish's exact shape
+# --------------------------------------------------------------------------- #
+def libnpmpublish_document(name: str, version: str, tarball: bytes, *, provenance=False):
+    """What libnpmpublish's buildMetadata() PUTs, field for field.
+
+    The attachment is keyed ``${manifest.name}-${version}.tgz`` -- scope
+    included -- and ``dist.tarball`` is ``${registry}/${name}/-/${that}``.
+    With ``--provenance`` a second attachment carries the sigstore bundle,
+    its ``data`` the bundle's JSON serialisation rather than base64.
+    """
+    import base64
+    import hashlib
+    import json
+
+    tarball_name = f"{name}-{version}.tgz"
+    manifest = {
+        "name": name,
+        "version": version,
+        "description": "x",
+        "_id": f"{name}@{version}",
+        "dist": {
+            "integrity": "sha512-" + base64.b64encode(hashlib.sha512(tarball).digest()).decode(),
+            "shasum": hashlib.sha1(tarball).hexdigest(),
+            "tarball": f"http://registry.test/npm/{name}/-/{tarball_name}",
+        },
+    }
+    doc = {
+        "_id": name,
+        "name": name,
+        "description": "x",
+        "dist-tags": {"latest": version},
+        "versions": {version: manifest},
+        "access": None,
+        "_attachments": {
+            tarball_name: {
+                "content_type": "application/octet-stream",
+                "data": base64.b64encode(tarball).decode(),
+                "length": len(tarball),
+            }
+        },
+    }
+    if provenance:
+        bundle = json.dumps(
+            {
+                "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+                "verificationMaterial": {"tlogEntries": [{"logIndex": "1"}]},
+                "dsseEnvelope": {"payload": "e30=", "signatures": []},
+            }
+        )
+        doc["_attachments"][f"{name}-{version}.sigstore"] = {
+            "content_type": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "data": bundle,
+            "length": len(bundle),
+        }
+    return doc
+
+
+async def _install(client, name: str, version: str) -> bytes:
+    """What `npm install` does: abbreviated packument, then dist.tarball."""
+    packument = await client.get(
+        f"/npm/{name.replace('/', '%2f')}",
+        headers={"accept": "application/vnd.npm.install-v1+json"},
+    )
+    assert packument.status_code == 200, packument.text
+    url = packument.json()["versions"][version]["dist"]["tarball"]
+    fetched = await client.get(url)
+    assert fetched.status_code == 200, (url, fetched.text)
+    return fetched.content
+
+
+async def test_scoped_publish_from_the_npm_cli_is_installable(env):
+    """The attachment was stored under its key, `@acme/widget-1.0.0.tgz`, and
+    the advertised `.../-/%40acme%2Fwidget-1.0.0.tgz` answered 404; with
+    `--provenance` the bundle failed base64 decoding and the publish 400'd."""
+    client, tokens = env
+    await _reserve(["@acme/*"])
+    as_user(client, tokens["alice"])
+
+    plain = await client.put(
+        "/npm/@acme%2fwidget", json=libnpmpublish_document("@acme/widget", "1.0.0", b"one")
+    )
+    assert plain.status_code == 201, plain.text
+    signed = await client.put(
+        "/npm/@acme%2fwidget",
+        json=libnpmpublish_document("@acme/widget", "1.0.1", b"two", provenance=True),
+    )
+    assert signed.status_code == 201, signed.text
+
+    assert await _install(client, "@acme/widget", "1.0.0") == b"one"
+    assert await _install(client, "@acme/widget", "1.0.1") == b"two"
+    full = (await client.get("/npm/@acme/widget")).json()
+    assert full["versions"]["1.0.1"]["dist"]["tarball"].endswith("/widget/-/widget-1.0.1.tgz")
+
+    # `npm unpublish @acme/widget@1.0.0` deletes the tarball by that URL.
+    gone = await client.delete("/npm/@acme/widget/-/widget-1.0.0.tgz/-rev/1")
+    assert gone.status_code == 200, gone.text
+
+
+async def test_publish_with_only_a_provenance_bundle_is_refused(env):
+    client, tokens = env
+    await _reserve(["@acme/*"])
+    as_user(client, tokens["alice"])
+    doc = libnpmpublish_document("@acme/widget", "1.0.0", b"one", provenance=True)
+    del doc["_attachments"]["@acme/widget-1.0.0.tgz"]
+    response = await client.put("/npm/@acme%2fwidget", json=doc)
+    assert response.status_code == 400
+    assert "no tarball attachment" in response.json()["error"]
+    assert await _package_row("@acme/widget") is None
+
+
+async def test_startup_repairs_scoped_tarball_names_stored_by_older_releases(env):
+    """Rows the old publish path wrote keep working once the repair runs."""
+    from sqlalchemy import select, update
+
+    from app.models import PackageFile
+
+    client, tokens = env
+    await _reserve(["@acme/*"])
+    as_user(client, tokens["alice"])
+    doc = libnpmpublish_document("@acme/old", "1.0.0", b"legacy")
+    assert (await client.put("/npm/@acme%2fold", json=doc)).status_code == 201
+
+    # What the old code stored: the attachment key, scope and all.
+    async with db_module.session_scope() as session:
+        await session.execute(update(PackageFile).values(filename="@acme/old-1.0.0.tgz"))
+    from app.services.packages import invalidate_package_cache
+
+    await invalidate_package_cache("npm", "@acme/old")
+    packument = (await client.get("/npm/@acme%2fold")).json()
+    broken = packument["versions"]["1.0.0"]["dist"]["tarball"]
+    assert (await client.get(broken)).status_code == 404
+
+    await db_module.create_schema()
+    await db_module.create_schema()  # idempotent
+    async with db_module.session_scope() as session:
+        names = (await session.execute(select(PackageFile.filename))).scalars().all()
+    assert names == ["old-1.0.0.tgz"]
+    await invalidate_package_cache("npm", "@acme/old")
+    assert await _install(client, "@acme/old", "1.0.0") == b"legacy"

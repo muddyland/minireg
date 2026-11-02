@@ -159,11 +159,24 @@ def parse_publish_document(doc: Any, path_name: str) -> PublishRequest:
     raw_attachments = doc.get("_attachments") or {}
     if not isinstance(raw_attachments, dict):
         raise PublishError("'_attachments' must be an object")
-    attachments = {
-        filename: _decode_attachment(filename, spec)
+    # Only tarballs are decoded. `npm publish --provenance` adds a
+    # `{name}-{version}.sigstore` attachment whose `data` is the bundle's
+    # JSON, not base64, so decoding every attachment refused the whole
+    # publish with a 400. This registry does not store or serve provenance
+    # bundles; the tarball publishes and the bundle is dropped.
+    supplied = {
+        filename: spec
         for filename, spec in raw_attachments.items()
         if isinstance(spec, dict) and spec.get("data")
     }
+    attachments = {
+        filename: _decode_attachment(filename, spec)
+        for filename, spec in supplied.items()
+        if is_tarball_attachment(filename)
+    }
+    ignored = sorted(set(supplied) - set(attachments))
+    if ignored:
+        log.info("npm publish of %s: ignoring non-tarball attachments %s", name, ignored)
 
     deprecations = {
         version: meta["deprecated"]
@@ -173,7 +186,10 @@ def parse_publish_document(doc: Any, path_name: str) -> PublishRequest:
 
     # Intent: an attachment means new bytes are being published. No attachment
     # but versions present means a metadata-only edit (deprecate/undeprecate).
-    if attachments:
+    # Any attachment counts, tarball or not: a publish whose only attachment
+    # is a provenance bundle is a publish missing its tarball, and must fail
+    # as one rather than be read as a deprecation.
+    if supplied:
         intent = "publish"
     elif versions:
         intent = "deprecate"
@@ -194,15 +210,26 @@ def parse_publish_document(doc: Any, path_name: str) -> PublishRequest:
     )
 
 
+def is_tarball_attachment(filename: str) -> bool:
+    return filename.endswith(".tgz")
+
+
 def match_attachment(request: PublishRequest, version: str) -> Attachment | None:
     """Find the tarball belonging to a version.
 
-    npm names it ``{unscoped-name}-{version}.tgz``, but we also accept a
-    ``dist.tarball`` basename because some clients and proxies differ.
+    libnpmpublish names it ``{manifest.name}-{version}.tgz`` -- the *full*
+    name, scope included (``@acme/widget-1.0.0.tgz``). The scope-less form
+    and a ``dist.tarball`` basename are accepted too, because older clients
+    and some proxies send those. Whatever the attachment is called, the
+    stored file is named :func:`npm_tarball_filename`, the one the tarball
+    route and rendered ``dist.tarball`` use.
     """
-    expected = npm_tarball_filename(request.name, version)
-    if expected in request.attachments:
-        return request.attachments[expected]
+    for expected in (
+        f"{request.name}-{version}.tgz",
+        npm_tarball_filename(request.name, version),
+    ):
+        if expected in request.attachments:
+            return request.attachments[expected]
 
     meta = request.versions.get(version) or {}
     tarball = (meta.get("dist") or {}).get("tarball")
@@ -211,7 +238,9 @@ def match_attachment(request: PublishRequest, version: str) -> Attachment | None
         if basename in request.attachments:
             return request.attachments[basename]
 
-    # Single-version publish with an oddly named attachment: unambiguous.
+    # Single-version publish with an oddly named tarball: unambiguous.
+    # `attachments` only ever holds tarballs, so a provenance bundle riding
+    # along does not make this ambiguous.
     if len(request.attachments) == 1 and len(request.versions) == 1:
         return next(iter(request.attachments.values()))
     return None

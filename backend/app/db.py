@@ -94,7 +94,8 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 # handled by this mechanism.
 # Known limitation, stated plainly: this is not a migration framework. It
 # handles additive columns and nothing else -- a drop, a rename, a type change
-# or a backfill needs a real migration, applied by hand. If the schema starts
+# or a large backfill needs a real migration, applied by hand (small,
+# idempotent row repairs live in DATA_REPAIRS below). If the schema starts
 # needing those regularly, adopt alembic and baseline it against the current
 # tables rather than extending this list.
 ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
@@ -108,6 +109,55 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "require_digest", "BOOLEAN NOT NULL DEFAULT TRUE"),
     ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
     ("api_tokens", "docker_repo_prefixes", "JSONB"),
+]
+
+
+# --------------------------------------------------------------------------- #
+# Data repairs
+#
+# Rows an older release wrote in a shape the code no longer produces. Each
+# repair runs on every boot, on SQLite and PostgreSQL alike, so it must be
+# idempotent (a no-op once applied), portable, and cheap when there is
+# nothing left to do: select the few affected rows first, then fix them.
+# --------------------------------------------------------------------------- #
+async def _repair_npm_scoped_tarball_names(conn) -> None:
+    """npm files stored under the publish attachment's key, scope included.
+
+    libnpmpublish keys a scoped tarball ``@scope/pkg-1.0.0.tgz``, and the
+    publish path used to store that key as the filename. The tarball URL
+    rendered from it could never be fetched, so these versions were
+    uninstallable. The canonical name (:func:`npm_tarball_filename`) is the
+    part after the slash. A version that somehow already has a file by that
+    name is left alone rather than tripping the unique constraint.
+    """
+    from sqlalchemy import text
+
+    rows = (
+        await conn.execute(
+            text(
+                "SELECT f.id, f.filename FROM package_files f "
+                "JOIN package_versions v ON v.id = f.version_id "
+                "JOIN packages p ON p.id = v.package_id "
+                "WHERE p.ecosystem = 'npm' AND f.filename LIKE '%/%'"
+            )
+        )
+    ).all()
+    for file_id, filename in rows:
+        canonical = filename.rsplit("/", 1)[-1]
+        await conn.execute(
+            text(
+                "UPDATE package_files SET filename = :canonical WHERE id = :id "
+                "AND NOT EXISTS (SELECT 1 FROM package_files other "
+                "WHERE other.version_id = package_files.version_id "
+                "AND other.filename = :canonical)"
+            ),
+            {"canonical": canonical, "id": file_id},
+        )
+        log.warning("repaired npm tarball filename %r -> %r", filename, canonical)
+
+
+DATA_REPAIRS = [
+    _repair_npm_scoped_tarball_names,
 ]
 
 
@@ -168,6 +218,11 @@ async def create_schema() -> None:
                         stmt.split(" ON ")[0],
                         exc,
                     )
+
+        # Inside the same transaction (and, on Postgres, the same advisory
+        # lock), so replicas booting together do not repair the same rows.
+        for repair in DATA_REPAIRS:
+            await repair(conn)
 
 
 async def dispose_engine() -> None:

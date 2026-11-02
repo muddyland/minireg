@@ -73,6 +73,9 @@ Rules that are enforced:
 - A version carrying build metadata (`1.0.0+build.5`) is rejected with `400`:
   semver ignores everything after `+`, so it would be the same version as
   `1.0.0`. `npm publish` strips it itself; other clients must too.
+- `npm publish --provenance` works, but the sigstore bundle it attaches is not
+  stored or served: the tarball publishes, and `npm audit signatures` has no
+  attestation from this registry to check.
 - Blocked packages are refused, so a blocked name cannot be squatted locally.
 - If CVE policy is enforcing, a version whose score falls in the blocked range
   is refused at publish time.

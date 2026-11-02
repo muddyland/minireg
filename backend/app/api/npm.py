@@ -1183,7 +1183,11 @@ async def _handle_publish(
         session.add(
             PackageFile(
                 version_id=version_row.id,
-                filename=attachment.filename,
+                # The canonical name, never the attachment key: libnpmpublish
+                # keys a scoped tarball `@scope/pkg-1.0.0.tgz`, and storing
+                # that rendered a dist.tarball (`.../-/%40scope%2Fpkg-...`)
+                # the tarball route could never match.
+                filename=npm_tarball_filename(parsed.name, version),
                 blob_sha256=stored.sha256,
                 size=stored.size,
                 content_type=attachment.content_type,
