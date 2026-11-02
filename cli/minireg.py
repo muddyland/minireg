@@ -51,7 +51,7 @@ if sys.version_info < MIN_PYTHON:
     )
     raise SystemExit(1)
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 DEFAULT_TIMEOUT = 30
 USER_AGENT = f"minireg-cli/{__version__}"
@@ -1405,7 +1405,17 @@ def _print_cargo_fix_advice(path: Path, findings: list[dict]) -> int:
 
 
 def normalize_key(ecosystem: str, name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).lower() if ecosystem == "pypi" else name.lower()
+    """The key two spellings of a dependency must share to be one package.
+
+    npm names are case-sensitive (`JSONStream` and `jsonstream` are two
+    packages), so they are compared as written; folding them made a fix for
+    one rewrite the other's range in package.json.
+    """
+    if ecosystem == "pypi":
+        return re.sub(r"[-_.]+", "-", name).lower()
+    if ecosystem == "npm":
+        return name
+    return name.lower()
 
 
 def plan_requirements_fix(path: Path, fixes: dict) -> tuple[str, list[str]]:

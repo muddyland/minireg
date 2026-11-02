@@ -1171,6 +1171,17 @@ class TestFixPlanners:
         _text, changes, _skipped = cli.plan_package_json_fix(path, {"lodash": "4.18.0"})
         assert changes == []
 
+    def test_package_json_fix_does_not_cross_npm_case_variants(self, tmp_path):
+        # JSONStream and jsonstream are different npm packages; a fix for
+        # one must not rewrite the other's range.
+        path = tmp_path / "package.json"
+        path.write_text('{"dependencies": {"JSONStream": "^1.3.0", "jsonstream": "^1.0.0"}}')
+        fixes = {cli.normalize_key("npm", "jsonstream"): "1.0.4"}
+        text, changes, _skipped = cli.plan_package_json_fix(path, fixes)
+        assert '"JSONStream": "^1.3.0"' in text
+        assert '"jsonstream": "^1.0.4"' in text
+        assert changes == ["jsonstream  ^1.0.0 -> ^1.0.4"]
+
 
 class TestCliVersionDiscovery:
     """How the CLI learns it has fallen behind."""

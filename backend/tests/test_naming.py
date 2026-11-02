@@ -178,8 +178,11 @@ class TestNpmNames:
         assert npm_tarball_filename("@babel/core", "7.0.0") == "core-7.0.0.tgz"
         assert npm_tarball_filename("lodash", "4.17.21") == "lodash-4.17.21.tgz"
 
-    def test_lookup_is_case_insensitive(self):
-        assert normalize_npm_name("LoDash") == "lodash"
+    def test_lookup_is_case_sensitive(self):
+        # registry.npmjs.org: JSONStream and jsonstream are two packages.
+        assert normalize_npm_name("JSONStream") == "JSONStream"
+        assert normalize_npm_name("JSONStream") != normalize_npm_name("jsonstream")
+        assert normalize_npm_name(" lodash ") == "lodash"
 
 
 class TestSemver:

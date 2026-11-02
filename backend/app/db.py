@@ -156,8 +156,199 @@ async def _repair_npm_scoped_tarball_names(conn) -> None:
         log.warning("repaired npm tarball filename %r -> %r", filename, canonical)
 
 
+#: Settings row recording that the one-shot npm case repair has run.
+NPM_CASE_REPAIR_MARKER = "repair:npm-case-sensitive-names"
+
+
+async def _repair_npm_case_folded_keys(conn) -> None:
+    """Re-key npm packages stored under a lowercased name; drop case-sibling rows.
+
+    npm names used to be lowercased into ``normalized_name``. They are
+    case-sensitive now (see ``normalize_npm_name``), so:
+
+    1. A row whose display name has capitals (``JSONStream`` under the key
+       ``jsonstream``) is re-keyed to the name it was stored with, which is
+       the spelling its upstream document declared. Its cached copy keeps
+       serving; validators and freshness are reset so the next request
+       re-reads it from upstream, replacing a document that may have been
+       written by the other spelling.
+    2. While the key was shared, a refresh of one spelling merged its files
+       and versions into the other's row (`Q` into `q`). A non-local file
+       whose name differs from the row's canonical tarball name *only in
+       case* came from the sibling, and goes; a version left with no file of
+       its own goes too. The next refresh restores anything genuine.
+
+    A row is not re-keyed when the target key is already taken. Runs once,
+    recorded in the settings table, because step 2 scans every npm file.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import and_, delete, func, insert, or_, select, update
+
+    from .core.naming import npm_tarball_filename
+    from .models import (
+        Blob,
+        DistTag,
+        Ecosystem,
+        Package,
+        PackageFile,
+        PackageVersion,
+        PackageVulnerability,
+        Setting,
+    )
+
+    if (
+        await conn.execute(select(Setting.key).where(Setting.key == NPM_CASE_REPAIR_MARKER))
+    ).first() is not None:
+        return
+
+    packages = Package.__table__
+    is_npm = packages.c.ecosystem == Ecosystem.npm
+    rekeyed = 0
+    for package_id, name, normalized in (
+        await conn.execute(
+            select(packages.c.id, packages.c.name, packages.c.normalized_name).where(
+                is_npm, packages.c.name != packages.c.normalized_name
+            )
+        )
+    ).all():
+        target = name.strip()
+        if target == normalized or target.lower() != normalized:
+            continue
+        taken = (
+            await conn.execute(
+                select(packages.c.id).where(is_npm, packages.c.normalized_name == target)
+            )
+        ).first()
+        if taken is not None:
+            log.warning("npm case repair: %r already exists; leaving %r", target, normalized)
+            continue
+        await conn.execute(
+            update(packages)
+            .where(packages.c.id == package_id)
+            .values(normalized_name=target, cached_at=None, cached_etag=None)
+        )
+        rekeyed += 1
+
+    files = PackageFile.__table__
+    versions = PackageVersion.__table__
+    candidates = (
+        await conn.execute(
+            select(packages.c.id, packages.c.name)
+            .distinct()
+            .select_from(
+                packages.join(versions, versions.c.package_id == packages.c.id).join(
+                    files, files.c.version_id == versions.c.id
+                )
+            )
+            .where(
+                is_npm,
+                versions.c.is_local.is_(False),
+                or_(
+                    packages.c.name != func.lower(packages.c.name),
+                    files.c.filename != func.lower(files.c.filename),
+                ),
+            )
+        )
+    ).all()
+    purged_files = purged_versions = 0
+    for package_id, name in candidates:
+        rows = (
+            await conn.execute(
+                select(
+                    versions.c.id,
+                    versions.c.version,
+                    files.c.id,
+                    files.c.filename,
+                    files.c.blob_sha256,
+                )
+                .select_from(versions.join(files, files.c.version_id == versions.c.id))
+                .where(versions.c.package_id == package_id, versions.c.is_local.is_(False))
+            )
+        ).all()
+        by_version: dict[int, tuple[str, list]] = {}
+        for version_id, version, file_id, filename, sha in rows:
+            by_version.setdefault(version_id, (version, []))[1].append((file_id, filename, sha))
+        doomed_versions: list[tuple[int, str]] = []
+        doomed_files: list[tuple[int, str | None]] = []
+        for version_id, (version, version_files) in by_version.items():
+            expected = npm_tarball_filename(name, version)
+            foreign = [
+                (file_id, sha)
+                for file_id, filename, sha in version_files
+                if filename != expected and filename.lower() == expected.lower()
+            ]
+            if not foreign:
+                continue
+            doomed_files.extend(foreign)
+            if len(foreign) == len(version_files):
+                doomed_versions.append((version_id, version))
+        if not doomed_files:
+            continue
+
+        for file_id, sha in doomed_files:
+            await conn.execute(delete(files).where(files.c.id == file_id))
+            if sha:
+                # The orphan sweep deletes the bytes once nothing points at them.
+                await conn.execute(
+                    update(Blob.__table__)
+                    .where(Blob.__table__.c.sha256 == sha)
+                    .values(refcount=Blob.__table__.c.refcount - 1)
+                )
+        version_ids = [version_id for version_id, _ in doomed_versions]
+        if version_ids:
+            vulns = PackageVulnerability.__table__
+            await conn.execute(delete(vulns).where(vulns.c.version_id.in_(version_ids)))
+            await conn.execute(delete(versions).where(versions.c.id.in_(version_ids)))
+            tags = DistTag.__table__
+            await conn.execute(
+                delete(tags).where(
+                    and_(
+                        tags.c.package_id == package_id,
+                        tags.c.version.in_([v for _, v in doomed_versions]),
+                    )
+                )
+            )
+            await conn.execute(
+                update(packages)
+                .where(
+                    packages.c.id == package_id,
+                    packages.c.latest_version.in_([v for _, v in doomed_versions]),
+                )
+                .values(latest_version=None)
+            )
+        await conn.execute(
+            update(packages)
+            .where(packages.c.id == package_id)
+            .values(cached_at=None, cached_etag=None)
+        )
+        purged_files += len(doomed_files)
+        purged_versions += len(doomed_versions)
+
+    await conn.execute(
+        insert(Setting.__table__).values(
+            key=NPM_CASE_REPAIR_MARKER,
+            value={
+                "rekeyed": rekeyed,
+                "purged_files": purged_files,
+                "purged_versions": purged_versions,
+                "at": datetime.now(UTC).isoformat(),
+            },
+        )
+    )
+    if rekeyed or purged_files:
+        log.warning(
+            "npm case repair: re-keyed %d package(s), removed %d file(s) and %d "
+            "version(s) a differently-cased package had merged in",
+            rekeyed,
+            purged_files,
+            purged_versions,
+        )
+
+
 DATA_REPAIRS = [
     _repair_npm_scoped_tarball_names,
+    _repair_npm_case_folded_keys,
 ]
 
 

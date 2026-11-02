@@ -142,12 +142,24 @@ _NPM_BLACKLIST = {"node_modules", "favicon.ico"}
 
 
 def normalize_npm_name(name: str) -> str:
-    """npm names are case-insensitive for lookup but preserved for display.
+    """npm names are case-*sensitive*: the key is the name as spelled.
 
-    New names may not contain uppercase at all; legacy ones may, so lookup is
-    lowercased while the published spelling is kept on the package row.
+    registry.npmjs.org treats ``JSONStream`` and ``jsonstream``, ``Q`` and
+    ``q``, ``CSSselect`` and ``cssselect`` as different packages, and so
+    must a mirror of it. Folding case here made the pairs share one row:
+    whichever was fetched first answered for both, a refresh of one merged
+    its versions into the other, and a *local* publish of the lowercase
+    spelling of an uppercase-only public name passed the shadow check (the
+    lowercase name does not exist upstream) and then answered every request
+    for the public one, tarballs included.
+
+    New names may not contain capitals at all (:func:`is_valid_npm_name`),
+    and the publish path separately refuses a new name that differs only in
+    case from one this registry already holds. Policy rules and namespace
+    patterns still match case-insensitively; that only ever blocks or
+    reserves more.
     """
-    return name.strip().lower()
+    return name.strip()
 
 
 def is_valid_npm_name(name: str) -> tuple[bool, str | None]:

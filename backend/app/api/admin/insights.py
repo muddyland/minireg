@@ -947,7 +947,9 @@ async def trigger_scan(
     if ecosystem is not None:
         conditions.append(Package.ecosystem == ecosystem)
     if package_name:
-        conditions.append(Package.normalized_name == package_name.lower())
+        # Case-insensitive: npm keys keep their case (JSONStream), and
+        # scanning both spellings of a name is harmless.
+        conditions.append(func.lower(Package.normalized_name) == package_name.lower())
     if not rescan_all:
         conditions.append(PackageVersion.scanned_at.is_(None))
 

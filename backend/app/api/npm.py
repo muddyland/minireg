@@ -307,7 +307,7 @@ async def search(
                 keywords=row.keywords or [],
                 author=row.author,
                 date=row.updated_at,
-                score=1.0 if row.normalized_name == query.lower() else 0.5,
+                score=1.0 if row.normalized_name.lower() == query.lower() else 0.5,
             )
         )
 
@@ -384,7 +384,7 @@ async def set_dist_tag(
     if tag_error:
         return npm_error(tag_error, status.HTTP_400_BAD_REQUEST)
 
-    package = await _lean_package(session, name.lower())
+    package = await _lean_package(session, packages.normalized_for(ECOSYSTEM, name))
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -444,7 +444,7 @@ async def delete_dist_tag(
         return npm_error("the 'latest' tag cannot be removed", status.HTTP_400_BAD_REQUEST)
 
     name = npm_path_to_name(package_name)
-    package = await _lean_package(session, name.lower())
+    package = await _lean_package(session, packages.normalized_for(ECOSYSTEM, name))
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -685,7 +685,7 @@ async def get_tarball(
 ) -> Response:
     started = time.perf_counter()
     name = npm_path_to_name(package_name)
-    normalized = name.lower()
+    normalized = packages.normalized_for(ECOSYSTEM, name)
 
     # A narrow join, not the whole package graph: fetch_package eager-loads
     # every version and the Package entity, which carries the entire upstream
@@ -876,7 +876,9 @@ async def update_packument(
             status.HTTP_400_BAD_REQUEST,
         )
 
-    package = await _lean_package(session, name.lower(), with_versions=True, with_files=True)
+    package = await _lean_package(
+        session, packages.normalized_for(ECOSYSTEM, name), with_versions=True, with_files=True
+    )
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -994,7 +996,7 @@ async def publish(
     except npm_publish.PublishError as exc:
         return npm_error(exc.message, exc.status_code)
 
-    normalized = parsed.name.lower()
+    normalized = packages.normalized_for(ECOSYSTEM, parsed.name)
 
     # The block list is enforced on publish too, so a blocked name cannot be
     # squatted locally to bypass the policy.
@@ -1057,7 +1059,7 @@ async def _record_publish_denied(
 async def _handle_publish(
     session: AsyncSession, request: Request, identity: Identity, parsed: npm_publish.PublishRequest
 ) -> Response:
-    normalized = parsed.name.lower()
+    normalized = packages.normalized_for(ECOSYSTEM, parsed.name)
 
     # Ownership first, before a single row is touched. Everything below flips
     # `is_local`, and a package with any local version is never refreshed from
@@ -1271,7 +1273,9 @@ async def _handle_publish(
 async def _handle_deprecate(
     session: AsyncSession, request: Request, identity: Identity, parsed: npm_publish.PublishRequest
 ) -> Response:
-    package = await _lean_package(session, parsed.name.lower(), with_versions=True)
+    package = await _lean_package(
+        session, packages.normalized_for(ECOSYSTEM, parsed.name), with_versions=True
+    )
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -1348,7 +1352,9 @@ async def unpublish_version(
     identity: Identity = Depends(rate_limited_publish),
 ) -> Response:
     name = npm_path_to_name(package_name)
-    package = await _lean_package(session, name.lower(), with_versions=True, with_files=True)
+    package = await _lean_package(
+        session, packages.normalized_for(ECOSYSTEM, name), with_versions=True, with_files=True
+    )
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -1442,7 +1448,9 @@ async def unpublish_package(
     identity: Identity = Depends(rate_limited_publish),
 ) -> Response:
     name = npm_path_to_name(package_name)
-    package = await _lean_package(session, name.lower(), with_versions=True, with_files=True)
+    package = await _lean_package(
+        session, packages.normalized_for(ECOSYSTEM, name), with_versions=True, with_files=True
+    )
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -1488,7 +1496,7 @@ async def unpublish_package(
         detail={"scope": "package"},
     )
     await session.commit()
-    await packages.invalidate_package_cache("npm", name.lower())
+    await packages.invalidate_package_cache("npm", packages.normalized_for(ECOSYSTEM, name))
     return json_response({"ok": True})
 
 
@@ -1629,7 +1637,7 @@ async def _packument_response(
     accept: str | None,
 ) -> Response:
     abbreviated = npm_render.wants_abbreviated(accept)
-    normalized = name.lower()
+    normalized = packages.normalized_for(ECOSYSTEM, name)
 
     # Cheap check before touching upstreams: never fetch a blocked package.
     policy = PolicyEngine(session)

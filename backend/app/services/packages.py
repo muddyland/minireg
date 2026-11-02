@@ -1085,7 +1085,8 @@ async def search_local(
 
     total = (await session.execute(count_stmt)).scalar_one()
     stmt = stmt.order_by(
-        (Package.normalized_name == query.lower()).desc(),
+        # Exact match first, ignoring case: npm keys keep it (JSONStream).
+        (func.lower(Package.normalized_name) == query.lower()).desc(),
         Package.download_count.desc(),
         Package.normalized_name.asc(),
     ).limit(limit).offset(offset)

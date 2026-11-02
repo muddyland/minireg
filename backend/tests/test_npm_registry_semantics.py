@@ -9,6 +9,7 @@ test), which is stricter than SQLite about OFFSET, types and constraints.
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 import pytest_asyncio
@@ -530,3 +531,265 @@ async def test_packument_edit_from_the_filtered_view_spares_hidden_versions(env)
     stored, retired = await _stored_and_retired("oldcli")
     assert stored == ["1.0.0", "1.1.0"]
     assert retired == ["2.0.0"]
+
+
+# --------------------------------------------------------------------------- #
+# npm names are case-sensitive
+# --------------------------------------------------------------------------- #
+def _upstream_packument(name: str, version: str, description: str) -> dict:
+    return {
+        "_id": name,
+        "name": name,
+        "description": description,
+        "dist-tags": {"latest": version},
+        "versions": {
+            version: {
+                "name": name,
+                "version": version,
+                "description": description,
+                "dist": {
+                    "shasum": "0" * 40,
+                    "tarball": f"https://upstream.test/{name}/-/{name}-{version}.tgz",
+                },
+            }
+        },
+    }
+
+
+#: Real case-pairs on registry.npmjs.org, and an uppercase-only name.
+UPSTREAM = {
+    "/JSONStream": _upstream_packument("JSONStream", "1.3.5", "the real JSONStream"),
+    "/jsonstream": _upstream_packument("jsonstream", "1.0.3", "a different package"),
+    "/CSSselect": _upstream_packument("CSSselect", "0.7.0", "the real CSSselect"),
+}
+
+
+def _upstream_handler(request):
+    import httpx
+
+    path = request.url.raw_path.decode().split("?")[0]
+    if path in UPSTREAM:
+        return httpx.Response(200, json=UPSTREAM[path])
+    return httpx.Response(404, json={"error": "Not found"})
+
+
+async def _add_upstream() -> None:
+    from app.models import Ecosystem, Upstream, UpstreamKind
+
+    async with db_module.session_scope() as session:
+        session.add(
+            Upstream(
+                name="mock-npm",
+                ecosystem=Ecosystem.npm,
+                kind=UpstreamKind.npm,
+                url="https://upstream.test",
+                tier=1,
+                enabled=True,
+            )
+        )
+
+
+async def _make_stale() -> None:
+    from sqlalchemy import update
+
+    from app.models import Package
+
+    async with db_module.session_scope() as session:
+        await session.execute(update(Package).values(cached_at=None))
+
+
+async def test_case_pairs_are_separate_packages(env):
+    """JSONStream and jsonstream shared one row: whichever was fetched first
+    answered for both, and a refresh of one merged into the other."""
+    import respx
+
+    client, tokens = env
+    await _add_upstream()
+    as_user(client, tokens["alice"])
+    with respx.mock(assert_all_called=False) as router:
+        router.route(host="upstream.test").mock(side_effect=_upstream_handler)
+        for _round in range(2):
+            for name, version in (("jsonstream", "1.0.3"), ("JSONStream", "1.3.5")):
+                doc = (await client.get(f"/npm/{name}")).json()
+                assert doc["name"] == name
+                assert list(doc["versions"]) == [version]
+                assert (await client.get(f"/npm/{name}/latest")).json()["name"] == name
+                assert (await client.get(f"/npm/-/package/{name}/dist-tags")).json() == {
+                    "latest": version
+                }
+            await _make_stale()
+
+        # A spelling neither registry has is a 404, not the nearest match.
+        assert (await client.get("/npm/JsonStream")).status_code == 404
+
+
+async def test_lowercase_publish_cannot_answer_for_an_uppercase_public_name(env):
+    """`cssselect` does not exist upstream, so its publish passed the shadow
+    check -- and then GET /npm/CSSselect and its tarball served it."""
+    import respx
+
+    client, tokens = env
+    await _add_upstream()
+    as_user(client, tokens["alice"])
+    with respx.mock(assert_all_called=False) as router:
+        router.route(host="upstream.test").mock(side_effect=_upstream_handler)
+        published = await client.put(
+            "/npm/cssselect", json=publish_body("cssselect", "9.9.9", b"evil")
+        )
+        assert published.status_code == 201, published.text
+
+        public = (await client.get("/npm/CSSselect")).json()
+        assert public["name"] == "CSSselect"
+        assert list(public["versions"]) == ["0.7.0"]
+        assert (await client.get("/npm/CSSselect/-/cssselect-9.9.9.tgz")).status_code == 404
+        assert (await client.get("/npm/CSSselect/9.9.9")).status_code == 404
+        # The local package is still exactly what it is.
+        assert list((await client.get("/npm/cssselect")).json()["versions"]) == ["9.9.9"]
+
+
+async def test_new_name_differing_only_in_case_from_a_held_one_is_refused(env):
+    import respx
+
+    client, tokens = env
+    await _add_upstream()
+    as_user(client, tokens["alice"])
+    with respx.mock(assert_all_called=False) as router:
+        router.route(host="upstream.test").mock(side_effect=_upstream_handler)
+        assert (await client.get("/npm/CSSselect")).status_code == 200
+        refused = await client.put("/npm/cssselect", json=publish_body("cssselect", "9.9.9"))
+    assert refused.status_code == 403, refused.text
+    assert "differs only in case from 'CSSselect'" in refused.json()["error"]
+    assert await _package_row("cssselect") is None
+
+
+async def test_version_document_must_carry_the_package_name(env):
+    client, tokens = env
+    as_user(client, tokens["alice"])
+    body = publish_body("named", "1.0.0")
+    body["versions"]["1.0.0"]["name"] = "Named"
+    response = await client.put("/npm/named", json=body)
+    assert response.status_code == 400
+    assert "is named 'Named'" in response.json()["error"]
+
+
+async def test_policy_rules_still_match_every_spelling(env):
+    import respx
+
+    client, tokens = env
+    await _add_upstream()
+    await _block("jsonstream", "*")
+    as_user(client, tokens["alice"])
+    with respx.mock(assert_all_called=False) as router:
+        router.route(host="upstream.test").mock(side_effect=_upstream_handler)
+        assert (await client.get("/npm/JSONStream")).status_code == 403
+        assert (await client.get("/npm/jsonstream")).status_code == 403
+
+
+async def test_startup_rekeys_case_folded_rows_and_drops_merged_siblings(env):
+    """Rows written while npm keys were lowercased: `JSONStream` stored under
+    `jsonstream` with jsonstream's 1.0.3 merged in, and `q` carrying `Q`'s
+    0.0.1. The repair re-keys and separates them, once."""
+    import respx
+    from sqlalchemy import select
+
+    from app.models import (
+        Blob,
+        DistTag,
+        Ecosystem,
+        Package,
+        PackageFile,
+        PackageVersion,
+        Setting,
+    )
+
+    client, tokens = env
+
+    async def legacy_row(name, key, files):
+        async with db_module.session_scope() as session:
+            package = Package(
+                ecosystem=Ecosystem.npm,
+                name=name,
+                normalized_name=key,
+                is_local=False,
+                latest_version=files[-1][0],
+            )
+            session.add(package)
+            await session.flush()
+            for version, filename in files:
+                row = PackageVersion(
+                    package_id=package.id,
+                    version=version,
+                    normalized_version=version,
+                    metadata_json={"name": filename.rsplit("-", 1)[0], "version": version},
+                )
+                session.add(row)
+                await session.flush()
+                sha = hashlib.sha256(filename.encode()).hexdigest()
+                session.add(Blob(sha256=sha, size=1, path=f"x/{sha}", refcount=1))
+                session.add(
+                    PackageFile(
+                        version_id=row.id,
+                        filename=filename,
+                        upstream_url=f"https://upstream.test/x/-/{filename}",
+                        blob_sha256=sha,
+                    )
+                )
+                session.add(DistTag(package_id=package.id, tag=f"t{version}", version=version))
+
+    await legacy_row(
+        "JSONStream",
+        "jsonstream",
+        [("1.0.3", "jsonstream-1.0.3.tgz"), ("1.3.5", "JSONStream-1.3.5.tgz")],
+    )
+    await legacy_row("q", "q", [("0.0.1", "Q-0.0.1.tgz"), ("1.5.1", "q-1.5.1.tgz")])
+    # A database from before the repair existed has no marker; the fixture's
+    # fresh schema has already recorded one.
+    async with db_module.session_scope() as session:
+        await session.delete(await session.get(Setting, db_module.NPM_CASE_REPAIR_MARKER))
+
+    await db_module.create_schema()
+    await db_module.create_schema()  # once only: the second boot is a no-op
+
+    async with db_module.session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Package.name, Package.normalized_name, PackageVersion.version)
+                .join(PackageVersion, PackageVersion.package_id == Package.id)
+                .order_by(Package.name, PackageVersion.version)
+            )
+        ).all()
+        files = sorted((await session.execute(select(PackageFile.filename))).scalars().all())
+        tags = sorted((await session.execute(select(DistTag.tag))).scalars().all())
+        refcounts = dict((await session.execute(select(Blob.sha256, Blob.refcount))).all())
+        marker = await session.get(Setting, db_module.NPM_CASE_REPAIR_MARKER)
+    assert [tuple(r) for r in rows] == [
+        ("JSONStream", "JSONStream", "1.3.5"),
+        ("q", "q", "1.5.1"),
+    ]
+    assert files == ["JSONStream-1.3.5.tgz", "q-1.5.1.tgz"]
+    assert tags == ["t1.3.5", "t1.5.1"]
+    assert refcounts[hashlib.sha256(b"jsonstream-1.0.3.tgz").hexdigest()] == 0
+    assert marker is not None and marker.value["rekeyed"] == 1
+    assert marker.value["purged_versions"] == 2
+
+    # The re-keyed row answers for its own spelling and refreshes from it.
+    await _add_upstream()
+    as_user(client, tokens["alice"])
+    with respx.mock(assert_all_called=False) as router:
+        router.route(host="upstream.test").mock(side_effect=_upstream_handler)
+        doc = (await client.get("/npm/JSONStream")).json()
+        assert doc["name"] == "JSONStream" and list(doc["versions"]) == ["1.3.5"]
+        assert (await client.get("/npm/jsonstream")).json()["name"] == "jsonstream"
+
+
+def test_reserved_namespace_claims_every_spelling():
+    """Keys keep their case now; a `@corp/*` claim must still keep `@Corp/x`
+    away from the public pool."""
+    from app.models import Ecosystem, Upstream
+    from app.services.resolver import claimants_for
+
+    internal = Upstream(name="internal", name_patterns=["@corp/*"])
+    public = Upstream(name="public", name_patterns=[])
+    for name in ("@corp/lib", "@Corp/lib", "@CORP/lib"):
+        assert claimants_for([internal, public], name, Ecosystem.npm) == [internal]
+    assert claimants_for([internal, public], "lodash", Ecosystem.npm) == [public]

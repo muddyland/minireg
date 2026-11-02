@@ -123,7 +123,10 @@ def claimants_for(
 
     Upstreams with no patterns are the general pool and serve everything else.
     """
-    normalized = normalize_name_for(ecosystem.value, name)
+    # Matched case-insensitively: npm keys are case-sensitive now, and a
+    # reservation of `@corp/*` must still keep `@Corp/x` away from the public
+    # pool, so a spelling variant can never be answered by the wrong tier.
+    normalized = normalize_name_for(ecosystem.value, name).lower()
     claimed = [
         u
         for u in upstreams

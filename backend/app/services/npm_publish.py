@@ -143,6 +143,14 @@ def parse_publish_document(doc: Any, path_name: str) -> PublishRequest:
             raise PublishError(
                 f"version key '{version}' does not match its metadata version '{declared}'"
             )
+        # The version document is what installers read the name from; one
+        # naming another package (or another spelling of this one) would be
+        # served under this package's URL.
+        declared_name = meta.get("name")
+        if declared_name is not None and declared_name != name:
+            raise PublishError(
+                f"version '{version}' is named '{declared_name}', not '{name}'"
+            )
 
     dist_tags = doc.get("dist-tags") or {}
     if not isinstance(dist_tags, dict):
