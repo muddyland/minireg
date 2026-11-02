@@ -108,6 +108,25 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "require_digest", "BOOLEAN NOT NULL DEFAULT TRUE"),
     ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
     ("api_tokens", "docker_repo_prefixes", "JSONB"),
+    ("docker_repo_manifests", "push_block_reason", "TEXT"),
+]
+
+#: Idempotent data fixes, run after the column migrations on every start.
+#: Plain SQL both SQLite and PostgreSQL accept.
+DATA_FIXES: list[str] = [
+    # The push verdict moved from the shared manifest row to the link of a
+    # local repository (DockerRepoManifest.push_block_reason). Carry existing
+    # verdicts over to the local repositories holding the digest -- never to
+    # upstream ones, where the shared row's verdict refused pulls the push
+    # rules have no say over -- then clear the old column so it cannot be
+    # carried over again after a policy change cleared the new one.
+    "UPDATE docker_repo_manifests SET push_block_reason = ("
+    " SELECT m.policy_block_reason FROM docker_manifests m"
+    " WHERE m.id = docker_repo_manifests.manifest_id)"
+    " WHERE push_block_reason IS NULL"
+    " AND manifest_id IN (SELECT id FROM docker_manifests WHERE policy_block_reason IS NOT NULL)"
+    " AND repository_id IN (SELECT id FROM docker_repositories WHERE is_local = TRUE)",
+    "UPDATE docker_manifests SET policy_block_reason = NULL WHERE policy_block_reason IS NOT NULL",
 ]
 
 
@@ -168,6 +187,11 @@ async def create_schema() -> None:
                         stmt.split(" ON ")[0],
                         exc,
                     )
+
+        from sqlalchemy import text
+
+        for stmt in DATA_FIXES:
+            await conn.execute(text(stmt))
 
 
 async def dispose_engine() -> None:

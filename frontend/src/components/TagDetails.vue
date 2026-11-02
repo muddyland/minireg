@@ -45,6 +45,13 @@ function defaultDigest() {
   return pick?.digest || null
 }
 const digest = ref(defaultDigest())
+// The push verdict belongs to this repository, not to the digest (the same
+// bytes pulled through an upstream are judged by the pull rules), so it comes
+// from the repository listing rather than the digest's detail.
+const blockReason = computed(() => {
+  if (!props.tag.manifest.is_index) return props.tag.manifest.policy_block_reason
+  return platforms.value.find((p) => p.digest === digest.value)?.manifest?.policy_block_reason || null
+})
 
 // -- data, per digest ---------------------------------------------------------
 const cache = reactive({}) // digest -> { detail, config, packages, findings }
@@ -273,8 +280,8 @@ watch(filters, loadFindings)
 
     <template v-else-if="detail">
       <!-- summary strip -->
-      <div v-if="detail.policy_block_reason" class="alert alert-error small">
-        Pulls of this image are refused: {{ detail.policy_block_reason }}
+      <div v-if="blockReason" class="alert alert-error small">
+        Pulls of this image are refused: {{ blockReason }}
       </div>
       <div v-if="detail.last_job?.status === 'failed'" class="alert alert-error small">
         Last scan failed after {{ detail.last_job.attempts }} attempts: {{ detail.last_job.error }}

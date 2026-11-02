@@ -57,7 +57,10 @@ router = APIRouter(prefix="/api/docker", tags=["docker"])
 # --------------------------------------------------------------------------- #
 # Serialisation
 # --------------------------------------------------------------------------- #
-def manifest_payload(m: DockerManifest) -> dict[str, Any]:
+def manifest_payload(m: DockerManifest, push_block_reason: str | None = None) -> dict[str, Any]:
+    """``push_block_reason`` is the push verdict in the repository the
+    manifest is shown for; it belongs to that repository, not to the digest,
+    so digest-level views leave it empty."""
     return {
         "digest": m.digest,
         "media_type": m.media_type,
@@ -78,7 +81,7 @@ def manifest_payload(m: DockerManifest) -> dict[str, Any]:
         "fixable_count": m.fixable_count,
         "kev_count": m.kev_count,
         "has_sbom": bool(m.sbom_digest),
-        "policy_block_reason": m.policy_block_reason,
+        "policy_block_reason": push_block_reason,
         "created_at": m.created_at,
         "last_accessed_at": m.last_accessed_at,
     }
@@ -210,6 +213,19 @@ async def _repo_summary(session: AsyncSession, repo: DockerRepository) -> dict:
     }
 
 
+async def _push_blocks(session: AsyncSession, repo: DockerRepository) -> dict[int, str]:
+    """Manifest id -> push verdict, for the images blocked in this repository."""
+    rows = (
+        await session.execute(
+            select(DockerRepoManifest.manifest_id, DockerRepoManifest.push_block_reason).where(
+                DockerRepoManifest.repository_id == repo.id,
+                DockerRepoManifest.push_block_reason.isnot(None),
+            )
+        )
+    ).all()
+    return dict(rows)
+
+
 @router.get("/repository")
 async def get_repository(
     name: str,
@@ -218,6 +234,7 @@ async def get_repository(
 ) -> dict:
     repo = await _repo_or_404(session, name)
     names = await _upstream_names(session)
+    blocks = await _push_blocks(session, repo)
     tags = (
         await session.execute(
             select(DockerTag, DockerManifest)
@@ -230,13 +247,13 @@ async def get_repository(
     for tag, m in tags:
         children = []
         if m.is_index:
-            children = await _children(session, m)
+            children = await _children(session, m, blocks)
         tag_list.append(
             {
                 "tag": tag.tag,
                 "checked_at": tag.checked_at,
                 "updated_at": tag.updated_at,
-                "manifest": manifest_payload(m),
+                "manifest": manifest_payload(m, blocks.get(m.id)),
                 "platforms": children,
             }
         )
@@ -257,7 +274,7 @@ async def get_repository(
         **repo_payload(repo, names),
         "pull_reference": _pull_ref(repo, upstream),
         "tags": tag_list,
-        "digests": [manifest_payload(m) for m in untagged],
+        "digests": [manifest_payload(m, blocks.get(m.id)) for m in untagged],
     }
 
 
@@ -275,7 +292,9 @@ def _pull_ref(repo: DockerRepository, upstream: Upstream | None) -> str:
     return f"{host}/{name}"
 
 
-async def _children(session: AsyncSession, index: DockerManifest) -> list[dict]:
+async def _children(
+    session: AsyncSession, index: DockerManifest, blocks: dict[int, str] | None = None
+) -> list[dict]:
     refs = (
         await session.execute(
             select(DockerManifestRef)
@@ -302,7 +321,7 @@ async def _children(session: AsyncSession, index: DockerManifest) -> list[dict]:
                 "attestation": (r.annotations or {}).get("vnd.docker.reference.type") == "attestation-manifest"
                 or r.platform == "unknown/unknown",
                 "fetched": m is not None,
-                "manifest": manifest_payload(m) if m else None,
+                "manifest": manifest_payload(m, (blocks or {}).get(m.id)) if m else None,
             }
         )
     return out
@@ -398,11 +417,11 @@ async def inspect_image(
         and image.scan_status == "unscanned"
         and policy.scanning_enabled
         and not repo.quarantined
-        and (policy.scan_on_pull or image.upstream_id is None)
+        and (policy.scan_on_pull or repo.is_local)
         and policy.scans_platform(image.platform)
     )
     if wants_scan:
-        priority = scanning.PRIORITY_PUSH if image.upstream_id is None else scanning.PRIORITY_PULL
+        priority = scanning.PRIORITY_PUSH if repo.is_local else scanning.PRIORITY_PULL
         await scanning.enqueue(session, image, repo.name, reason="cli", priority=priority)
 
     # What `docker pull` would get: the tag's own verdict (for an index, the
@@ -435,6 +454,7 @@ async def inspect_image(
     ).scalars().all()
     upstream = await session.get(Upstream, repo.upstream_id) if repo.upstream_id else None
     pull_ref = _pull_ref(repo, upstream)
+    blocks = await _push_blocks(session, repo)
     await session.commit()
     return {
         "reference": ref,
@@ -447,7 +467,7 @@ async def inspect_image(
         "is_index": top.is_index,
         "platforms": platforms,
         "platform": image.platform,
-        "image": manifest_payload(image),
+        "image": manifest_payload(image, blocks.get(image.id)),
         "verdict": {
             "allowed": verdict.allowed,
             "code": None if verdict.allowed else verdict.code,
@@ -1168,7 +1188,9 @@ async def stats(
     ).scalar_one()
     blocked = (
         await session.execute(
-            select(func.count()).select_from(DockerManifest).where(DockerManifest.policy_block_reason.isnot(None))
+            select(func.count(func.distinct(DockerRepoManifest.manifest_id))).where(
+                DockerRepoManifest.push_block_reason.isnot(None)
+            )
         )
     ).scalar_one()
     quarantined = (

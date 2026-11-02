@@ -212,6 +212,14 @@ async def put_manifest(
         session, body, content_type, expected_digest=expected, upstream_id=None, pushed_by=ident.user_id
     )
     await link(session, repo, manifest)
+    if manifest.scan_status == "scanned":
+        # Bytes already scanned (pulled through an upstream, or pushed to
+        # another repository): judge them by the push bar here and now.
+        # Pulls do not wait for the rescan the push queues, so without this
+        # they would be served on the pull rules until it lands.
+        from .scanning import apply_push_policy
+
+        await apply_push_policy(session, manifest)
     if not is_digest(reference):
         await set_tag(session, repo, reference, manifest, user_id=ident.user_id)
     repo.last_pushed_at = datetime.now(UTC)

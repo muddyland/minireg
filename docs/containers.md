@@ -150,6 +150,12 @@ The pull error names the reason, for example
 fix it, rebuild on a patched base image and push again. Changing the push
 rules re-judges every pushed image immediately.
 
+The push rules cover everything served from `local/`, whatever its origin:
+an upstream image re-tagged and pushed unchanged is held to them there,
+even when the pull rules let it through the upstream. The verdict
+belongs to the repository, not to the image: pushing an image here never
+changes how pulls of the same image through an upstream are judged.
+
 ## Scanning
 
 A separate scanner worker runs Trivy. It claims jobs from minireg over HTTP

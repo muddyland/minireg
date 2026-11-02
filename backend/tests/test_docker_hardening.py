@@ -49,13 +49,30 @@ async def anon(client, name):
     return await bearer(client, f"repository:{name}:pull")
 
 
-async def block(digest: str, reason: str = "blocked for the test") -> None:
+async def block(digest: str, cve: str = "CVE-2000-0001") -> None:
+    """Make every pull of ``digest`` refused, from any repository: record a
+    finding for it and put that CVE on the deny list."""
+    from sqlalchemy import select
+
+    from app.docker.policy import KEY_DOCKER_POLICY, invalidate_policy
+    from app.models import DockerFinding, Setting
+
     async with db_module.session_scope() as session:
-        await session.execute(
-            update(DockerManifest)
-            .where(DockerManifest.digest == digest)
-            .values(policy_block_reason=reason)
+        manifest = (
+            await session.execute(select(DockerManifest).where(DockerManifest.digest == digest))
+        ).scalar_one()
+        manifest.scan_status = "scanned"
+        session.add(
+            DockerFinding(manifest_id=manifest.id, scan_id=0, vuln_id=cve, pkg_name="t", severity="LOW")
         )
+        row = await session.get(Setting, KEY_DOCKER_POLICY)
+        value = dict(row.value or {}) if row else {}
+        value["deny_cves"] = sorted({*value.get("deny_cves", []), cve})
+        if row is None:
+            session.add(Setting(key=KEY_DOCKER_POLICY, value=value))
+        else:
+            row.value = value
+    await invalidate_policy()
 
 
 async def pull(client, name, ref, headers, *, accept=DOCKER_ACCEPT):

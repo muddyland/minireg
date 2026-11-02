@@ -400,6 +400,139 @@ class TestPolicy:
         assert "incident 42" in resp.json()["errors"][0]["message"]
 
 
+CRITICAL_FIXABLE = [vuln("CVE-2024-9999", "CRITICAL", fixed="2.0")]
+
+
+class TestPushBarFollowsTheRepository:
+    """The push rules apply to what local/ serves, whatever the bytes'
+    origin, and never to what an upstream repository serves. The manifest
+    row is shared by every repository holding a digest, so it cannot carry
+    the verdict."""
+
+    async def test_upstream_bytes_pushed_here_meet_the_push_bar(self, docker_env):
+        client, fake = docker_env
+        img = Image.build("upbase")
+        fake.add_image("library/upbase", "1", img)
+        h = await bearer(client, "repository:upbase:pull")
+        assert (await client.get("/v2/upbase/manifests/1", headers=h)).status_code == 200
+        sh = await scanner_headers(client)
+        _, r = await run_scan(client, sh, trivy_report(CRITICAL_FIXABLE))
+        assert r.status_code == 200, r.text
+        # The pull rules allow it (the default).
+        assert (await client.get("/v2/upbase/manifests/1", headers=h)).status_code == 200
+
+        token = await make_user()
+        ph = await bearer(client, "repository:local/team/app:pull,push", token)
+        assert (await push_image(client, "local/team/app", "1", img, ph)).status_code == 201
+        resp = await client.get("/v2/local/team/app/manifests/1", headers=ph)
+        assert resp.status_code == 403, resp.text
+        assert "push policy" in resp.json()["errors"][0]["message"]
+        # Its layers too, from there.
+        layer = img.layers[0]
+        from tests.docker_helpers import sha
+
+        assert (await client.get(f"/v2/local/team/app/blobs/{sha(layer)}", headers=ph)).status_code == 403
+        # Through the upstream nothing changed.
+        assert (await client.get("/v2/upbase/manifests/1", headers=h)).status_code == 200
+
+    async def test_upstream_bytes_pushed_here_wait_for_their_scan(self, docker_env):
+        client, fake = docker_env
+        ah = await admin(client)
+        await set_policy(client, ah, hold_seconds=0.5)
+        img = Image.build("unscanned-base")
+        fake.add_image("library/unscanned-base", "1", img)
+        h = await bearer(client, "repository:unscanned-base:pull")
+        # Upstream pulls do not wait for the scan (no strict mode)...
+        assert (await client.get("/v2/unscanned-base/manifests/1", headers=h)).status_code == 200
+        token = await make_user()
+        ph = await bearer(client, "repository:local/team/app:pull,push", token)
+        assert (await push_image(client, "local/team/app", "1", img, ph)).status_code == 201
+        # ...pulls of a pushed image do.
+        resp = await client.get("/v2/local/team/app/manifests/1", headers=ph)
+        assert resp.status_code == 503, resp.text
+        sh = await scanner_headers(client)
+        _, r = await run_scan(client, sh, trivy_report(CRITICAL_FIXABLE))
+        assert r.status_code == 200, r.text
+        assert (await client.get("/v2/local/team/app/manifests/1", headers=ph)).status_code == 403
+        assert (await client.get("/v2/unscanned-base/manifests/1", headers=h)).status_code == 200
+
+    async def test_a_push_does_not_block_upstream_pulls_of_the_same_bytes(self, docker_env):
+        client, fake = docker_env
+        img = Image.build("newrelease")
+        token = await make_user()
+        ph = await bearer(client, "repository:local/x/y:pull,push", token)
+        assert (await push_image(client, "local/x/y", "1", img, ph)).status_code == 201
+        sh = await scanner_headers(client)
+        _, r = await run_scan(client, sh, trivy_report(CRITICAL_FIXABLE))
+        assert r.status_code == 200, r.text
+        assert (await client.get("/v2/local/x/y/manifests/1", headers=ph)).status_code == 403
+
+        # The same bytes are (or later get) published upstream.
+        fake.add_image("library/newrelease", "1", img)
+        h = await bearer(client, "repository:newrelease:pull")
+        resp = await client.get("/v2/newrelease/manifests/1", headers=h)
+        assert resp.status_code == 200, resp.text
+        assert (await client.get("/v2/local/x/y/manifests/1", headers=ph)).status_code == 403
+
+        # The UI shows the verdict where it applies, and only there.
+        viewer = {"Authorization": f"Bearer {await make_user(username='viewer', scopes=('read',))}"}
+        local = (await client.get("/api/docker/repository?name=local/x/y", headers=viewer)).json()
+        assert "push policy" in local["tags"][0]["manifest"]["policy_block_reason"]
+        cached = (
+            await client.get("/api/docker/repository?name=dockerhub/library/newrelease", headers=viewer)
+        ).json()
+        assert cached["tags"][0]["manifest"]["policy_block_reason"] is None
+        stats = (await client.get("/api/docker/stats", headers=await admin(client))).json()
+        assert stats["push_blocked_images"] == 1
+
+    async def test_old_verdicts_move_to_local_repositories_on_startup(self, docker_env):
+        """Before the per-repository column, the verdict sat on the manifest
+        row. The startup data fix carries it to the local repositories and
+        clears it, so upstream pulls of those bytes stop being refused."""
+        from sqlalchemy import select, update
+
+        from app import db
+        from app.models import DockerManifest, DockerRepoManifest
+
+        client, fake = docker_env
+        img = Image.build("legacy")
+        token = await make_user()
+        ph = await bearer(client, "repository:local/old/img:pull,push", token)
+        assert (await push_image(client, "local/old/img", "1", img, ph)).status_code == 201
+        fake.add_image("library/legacy", "1", img)
+        sh = await scanner_headers(client)
+        _, r = await run_scan(client, sh, trivy_report([]))
+        assert r.status_code == 200, r.text
+        h = await bearer(client, "repository:legacy:pull")
+        assert (await client.get("/v2/legacy/manifests/1", headers=h)).status_code == 200
+        async with db.session_scope() as s:
+            await s.execute(
+                update(DockerManifest)
+                .where(DockerManifest.digest == img.digest)
+                .values(policy_block_reason="push policy: from the old column")
+            )
+
+        await db.create_schema()
+        await db.create_schema()  # idempotent
+
+        async with db.session_scope() as s:
+            m = (await s.execute(select(DockerManifest).where(DockerManifest.digest == img.digest))).scalar_one()
+            assert m.policy_block_reason is None
+            reasons = sorted(
+                (r or "")
+                for r in (
+                    await s.execute(
+                        select(DockerRepoManifest.push_block_reason).where(DockerRepoManifest.manifest_id == m.id)
+                    )
+                ).scalars()
+            )
+        assert reasons == ["", "push policy: from the old column"]
+        resp = await client.get("/v2/local/old/img/manifests/1", headers=ph)
+        assert resp.status_code == 403
+        assert "from the old column" in resp.json()["errors"][0]["message"]
+        assert (await client.get("/v2/legacy/manifests/1", headers=h)).status_code == 200
+
+
 class TestCveSearch:
     async def test_which_images_contain_a_cve(self, docker_env):
         client, fake = docker_env

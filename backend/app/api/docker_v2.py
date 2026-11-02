@@ -382,7 +382,10 @@ async def _get_manifest(
             # an unscanned image is refused until its scan lands, so the scan
             # has to be queued by the very request that gets refused.
             await _maybe_scan(session, repo, manifest, policy)
-            local = manifest.upstream_id is None
+            # The repository decides, not the shared manifest row: bytes
+            # first fetched from an upstream and then pushed here are a
+            # pushed image in this repository.
+            local = repo.is_local
             hold_seconds = 0.0
             if manifest.scan_status in pending:
                 if local and policy.push_require_scan:
@@ -458,11 +461,11 @@ def _accepts(header: str | None, media_type: str) -> bool:
 async def _maybe_scan(session: AsyncSession, repo: DockerRepository, manifest: DockerManifest, policy) -> None:
     if manifest.scan_status not in ("unscanned", "failed"):
         return
-    if not policy.scan_on_pull and manifest.upstream_id is not None:
+    if not policy.scan_on_pull and not repo.is_local:
         return
     if not policy.scans_platform(manifest.platform):
         return
-    priority = scanning.PRIORITY_PUSH if manifest.upstream_id is None else scanning.PRIORITY_PULL
+    priority = scanning.PRIORITY_PUSH if repo.is_local else scanning.PRIORITY_PULL
     await scanning.enqueue(session, manifest, repo.name, reason="pull", priority=priority)
     await session.commit()
 

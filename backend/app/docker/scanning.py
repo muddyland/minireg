@@ -437,29 +437,59 @@ async def ingest(
 async def apply_push_policy(
     session: AsyncSession, manifest: DockerManifest, policy: ImagePolicy | None = None
 ) -> None:
-    """Hold an image pushed here to the push bar, once its scan is in.
+    """Hold an image served from a local repository to the push bar, once
+    its scan is in.
 
-    The verdict is written onto the manifest, so every later pull of that
-    digest is refused with the reason, until an admin changes the policy (the
-    verdict is re-evaluated on every policy save) or a fixed image is pushed.
+    The verdict is written onto the image's link in every local repository
+    holding it, so every later pull of it from there is refused with the
+    reason, until an admin changes the policy (the verdict is re-evaluated on
+    every policy save) or a fixed image is pushed. Upstream repositories
+    holding the same digest are untouched: the push rules are not theirs,
+    and the shared manifest row is not where a verdict may live (a pusher
+    could otherwise block everyone's pulls of an upstream release by pushing
+    it here first). Called after a scan, and when a scanned image is pushed
+    into another local repository.
     """
-    if manifest.upstream_id is not None or manifest.kind != "image":
+    if manifest.kind != "image" or manifest.scan_status != "scanned":
         return
-    if manifest.scan_status != "scanned":
+    local_repos = select(DockerRepository.id).where(DockerRepository.is_local.is_(True))
+    linked = (
+        await session.execute(
+            select(DockerRepoManifest.id)
+            .where(
+                DockerRepoManifest.manifest_id == manifest.id,
+                DockerRepoManifest.repository_id.in_(local_repos),
+            )
+            .limit(1)
+        )
+    ).first()
+    if linked is None:
         return
     policy = policy or await load_policy(session)
     verdict = await evaluate_rules(session, manifest, policy, policy.push, label="push")
-    manifest.policy_block_reason = None if verdict.allowed else verdict.reason
+    await session.execute(
+        update(DockerRepoManifest)
+        .where(
+            DockerRepoManifest.manifest_id == manifest.id,
+            DockerRepoManifest.repository_id.in_(local_repos),
+        )
+        .values(push_block_reason=None if verdict.allowed else verdict.reason)
+    )
     if not verdict.allowed:
         bump("docker.push.policy_blocked")
 
 
 async def reapply_push_policy(session: AsyncSession) -> int:
     policy = await load_policy(session)
+    in_local = (
+        select(DockerRepoManifest.manifest_id)
+        .join(DockerRepository, DockerRepository.id == DockerRepoManifest.repository_id)
+        .where(DockerRepository.is_local.is_(True))
+    )
     rows = (
         await session.execute(
             select(DockerManifest).where(
-                DockerManifest.upstream_id.is_(None),
+                DockerManifest.id.in_(in_local),
                 DockerManifest.kind == "image",
                 DockerManifest.scan_status == "scanned",
             )
