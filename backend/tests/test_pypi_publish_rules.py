@@ -174,3 +174,81 @@ class TestDistributionTypes:
         egg = await upload(app_client, "eggpkg", "1.0", "eggpkg-1.0-py3.12.egg", b"egg")
         assert egg.status_code == 400
         assert (await app_client.get("/pypi/simple/eggpkg/", headers=JSON)).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# A wheel's own METADATA is held to the form
+# --------------------------------------------------------------------------- #
+def zip_of(members: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for path, text in members.items():
+            archive.writestr(path, text)
+    return buffer.getvalue()
+
+
+class TestWheelMetadata:
+    WHEEL = "mdpkg-1.0-py3-none-any.whl"
+
+    async def _upload(self, client, content, **fields):
+        return await upload(
+            client, "mdpkg", "1.0", self.WHEEL, content, filetype="bdist_wheel", **fields
+        )
+
+    async def test_wheel_for_another_project_is_refused(self, app_client):  # noqa: F811
+        content = build_wheel(
+            "mdpkg", "1.0", metadata="Metadata-Version: 2.1\nName: requests\nVersion: 1.0\n"
+        )
+        response = await self._upload(app_client, content)
+        assert response.status_code == 400
+        assert "requests" in response.text
+        sidecar = await app_client.get(f"/pypi/files/mdpkg/{self.WHEEL}.metadata")
+        assert sidecar.status_code == 404
+
+    async def test_wheel_for_another_version_is_refused(self, app_client):  # noqa: F811
+        content = build_wheel(
+            "mdpkg", "1.0", metadata="Metadata-Version: 2.1\nName: MDPkg\nVersion: 6.6.6\n"
+        )
+        response = await self._upload(app_client, content)
+        assert response.status_code == 400
+        assert "6.6.6" in response.text
+
+    async def test_malformed_wheels_are_refused(self, app_client):  # noqa: F811
+        meta = "Metadata-Version: 2.1\nName: mdpkg\nVersion: 1.0\n"
+        cases = {
+            "not a zip": b"not a zip at all",
+            "no dist-info": zip_of({"mdpkg/__init__.py": ""}),
+            "no METADATA": zip_of({"mdpkg-1.0.dist-info/WHEEL": "Wheel-Version: 1.0\n"}),
+            "two dist-infos": zip_of(
+                {
+                    "mdpkg-1.0.dist-info/METADATA": meta,
+                    "requests-1.0.dist-info/METADATA": meta.replace("mdpkg", "requests"),
+                }
+            ),
+            "dist-info of another project": zip_of({"requests-1.0.dist-info/METADATA": meta}),
+            "no Version": zip_of({"mdpkg-1.0.dist-info/METADATA": "Name: mdpkg\n"}),
+        }
+        for label, content in cases.items():
+            response = await self._upload(app_client, content)
+            assert response.status_code == 400, (label, response.text)
+        assert (await app_client.get("/pypi/simple/mdpkg/", headers=JSON)).status_code == 404
+
+    async def test_requires_python_comes_from_the_wheel(self, app_client):  # noqa: F811
+        content = build_wheel(
+            "mdpkg",
+            "1.0",
+            metadata=(
+                "Metadata-Version: 2.1\nName: mdpkg\nVersion: 1.0.0\n"
+                "Requires-Python: >=3.10\n"
+            ),
+        )
+        # An equal spelling of the version in METADATA is fine.
+        response = await self._upload(app_client, content, requires_python=">=2.7")
+        assert response.status_code == 200, response.text
+
+        doc = (await app_client.get("/pypi/simple/mdpkg/", headers=JSON)).json()
+        assert doc["files"][0]["requires-python"] == ">=3.10"
+        html = (await app_client.get("/pypi/simple/mdpkg/")).text
+        assert 'data-requires-python="&gt;=3.10"' in html
+        api = (await app_client.get("/pypi/mdpkg/json")).json()
+        assert api["info"]["requires_python"] == ">=3.10"

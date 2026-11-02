@@ -10,6 +10,7 @@ Warehouse's own rules that we reproduce:
 * every digest the client supplies must match the bytes received
 * only one sdist per release
 * only wheels and ``.tar.gz`` sdists, with a ``filetype`` that agrees
+* a wheel's own METADATA must name the same project and version
 * re-uploading an existing filename is rejected (PyPI never overwrites)
 """
 
@@ -20,6 +21,7 @@ import hashlib
 import logging
 import re
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from email.parser import Parser
 from io import BytesIO
@@ -32,6 +34,7 @@ from ..core.naming import (
     normalize_pypi_version,
     parse_dist_filename,
     parse_pypi_version,
+    pypi_versions_equal,
 )
 
 log = logging.getLogger(__name__)
@@ -275,7 +278,11 @@ def _read_metadata_member(archive: zipfile.ZipFile) -> bytes | None:
     ]
     if not candidates:
         return None
-    info = candidates[0]
+    return _read_bounded(archive, candidates[0])
+
+
+def _read_bounded(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes | None:
+    """One member's bytes, or None when it inflates past MAX_METADATA_BYTES."""
     # Trust the header enough to reject early, then bound the actual read so a
     # lying header cannot turn a 5 MB wheel into a 4 GB allocation.
     if info.file_size > MAX_METADATA_BYTES:
@@ -286,6 +293,99 @@ def _read_metadata_member(archive: zipfile.ZipFile) -> bytes | None:
         return None
     # The exact bytes: PEP 658 hashes them, so whatever is served must match.
     return data
+
+
+@dataclass(frozen=True, slots=True)
+class WheelMetadata:
+    """What an uploaded wheel says about itself."""
+
+    raw: bytes
+    requires_python: str | None
+
+
+#: What a malformed or hostile zip can raise from `zipfile` while it is opened
+#: and one member inflated.
+_ZIP_ERRORS = (
+    zipfile.BadZipFile,
+    zipfile.LargeZipFile,
+    OSError,
+    EOFError,
+    ValueError,
+    RuntimeError,  # encrypted member
+    NotImplementedError,  # unsupported compression
+    zlib.error,
+)
+
+
+def check_wheel_metadata(request: UploadRequest) -> WheelMetadata:
+    """Read an uploaded wheel's METADATA and hold it to the form.
+
+    That file is what pip installs from, and what this registry serves as the
+    PEP 658 sidecar pip resolves with. Unchecked, a wheel uploaded as
+    ``mdpkg 1.0`` could carry ``Name: requests`` or another version, and its
+    ``data-requires-python`` came from the form rather than the wheel.
+
+    Like pip, require exactly one top-level ``.dist-info`` directory, named for
+    the project; its ``METADATA`` must name the project (PEP 503 normalized)
+    and a version PEP 440-equal to the form's. Warehouse refuses a wheel
+    without METADATA too.
+    """
+    filename = request.filename
+    try:
+        with zipfile.ZipFile(BytesIO(request.content)) as archive:
+            dist_info_dirs = {
+                member.split("/", 1)[0]
+                for member in archive.namelist()
+                if "/" in member and member.split("/", 1)[0].endswith(".dist-info")
+            }
+            if len(dist_info_dirs) != 1:
+                raise UploadError(
+                    f"'{filename}' must contain exactly one .dist-info directory, "
+                    f"found {len(dist_info_dirs)}"
+                )
+            (dist_info,) = dist_info_dirs
+            try:
+                info = archive.getinfo(f"{dist_info}/METADATA")
+            except KeyError:
+                raise UploadError(f"'{filename}' has no {dist_info}/METADATA") from None
+            raw = _read_bounded(archive, info)
+    except _ZIP_ERRORS as exc:
+        raise UploadError(f"'{filename}' is not a valid wheel: {exc}") from None
+    if raw is None:
+        raise UploadError(f"{dist_info}/METADATA in '{filename}' is too large")
+
+    # pip's own rule (the canonicalized directory name starts with the
+    # project's), anchored at a "-" so `requests-1.0.dist-info` is not taken
+    # for project `req`. Matching pip rather than the escaped-name grammar
+    # keeps wheels from older build tools uploadable.
+    if not normalize_pypi_name(dist_info).startswith(request.normalized_name + "-"):
+        raise UploadError(
+            f"'{filename}' contains {dist_info}, which is not for project '{request.name}'"
+        )
+
+    metadata = _parse_metadata(raw)
+    meta_name, meta_version = metadata.get("name"), metadata.get("version")
+    if not isinstance(meta_name, str) or not isinstance(meta_version, str):
+        raise UploadError(f"METADATA in '{filename}' needs exactly one Name and one Version")
+    if normalize_pypi_name(meta_name.strip()) != request.normalized_name:
+        raise UploadError(
+            f"METADATA in '{filename}' names project '{meta_name.strip()}', "
+            f"not '{request.name}'"
+        )
+    if not pypi_versions_equal(meta_version.strip(), request.version) or (
+        parse_pypi_version(meta_version.strip()) is None
+    ):
+        raise UploadError(
+            f"METADATA in '{filename}' gives version '{meta_version.strip()}', "
+            f"not '{request.version}'"
+        )
+    requires_python = metadata.get("requires_python")
+    return WheelMetadata(
+        raw=raw,
+        requires_python=(
+            requires_python.strip() or None if isinstance(requires_python, str) else None
+        ),
+    )
 
 
 def extract_wheel_metadata_from_path(path, filename: str) -> dict[str, Any] | None:

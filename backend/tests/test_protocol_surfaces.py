@@ -46,11 +46,14 @@ RAW_SHA256 = hashlib.sha256(RAW_METADATA).hexdigest()
 WHEEL_NAME = "my_package-1.0.0-py3-none-any.whl"
 
 
-def build_wheel(metadata: bytes = RAW_METADATA) -> bytes:
+def build_wheel(metadata: bytes = RAW_METADATA, name: str = "my-package") -> bytes:
+    dist = name.replace("-", "_")
+    if name != "my-package":
+        metadata = metadata.replace(b"Name: my-package", f"Name: {name}".encode())
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("my_package-1.0.0.dist-info/METADATA", metadata)
-        archive.writestr("my_package/__init__.py", "")
+        archive.writestr(f"{dist}-1.0.0.dist-info/METADATA", metadata)
+        archive.writestr(f"{dist}/__init__.py", "")
     return buffer.getvalue()
 
 
@@ -356,7 +359,7 @@ class TestCveRefreshInvalidation:
         for name in ("my-package", "other-package"):
             data, _ = upload_form(b"", name=name)
             wheel = f"{name.replace('-', '_')}-1.0.0-py3-none-any.whl"
-            files = {"content": (wheel, build_wheel(), "application/octet-stream")}
+            files = {"content": (wheel, build_wheel(name=name), "application/octet-stream")}
             response = await app_client.post(
                 "/pypi/legacy/", data=data, files=files, headers=basic_auth(app_client)
             )

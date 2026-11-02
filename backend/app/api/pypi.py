@@ -494,6 +494,16 @@ async def upload(
     except pypi_publish.UploadError as exc:
         return upload_error(exc.message, exc.status_code)
 
+    wheel_metadata = None
+    if parsed.filetype == "bdist_wheel":
+        try:
+            wheel_metadata = await asyncio.to_thread(pypi_publish.check_wheel_metadata, parsed)
+        except pypi_publish.UploadError as exc:
+            return upload_error(exc.message, exc.status_code)
+        # pip filters on data-requires-python before it ever opens the wheel,
+        # so it has to say what the wheel says, not what the form claimed.
+        parsed.requires_python = wheel_metadata.requires_python
+
     normalized = parsed.normalized_name
 
     verdict = await PolicyEngine(session).is_name_blocked(ECOSYSTEM, normalized)
@@ -655,8 +665,6 @@ async def upload(
     else:
         blob.refcount += 1
 
-    core_metadata = pypi_publish.extract_wheel_metadata(parsed.content, parsed.filename)
-
     session.add(
         PackageFile(
             version_id=version_row.id,
@@ -672,8 +680,8 @@ async def upload(
             python_version=parsed.pyversion,
             requires_python=parsed.requires_python,
             core_metadata=(
-                pypi_publish.core_metadata_record(core_metadata["_raw_bytes"])
-                if core_metadata
+                pypi_publish.core_metadata_record(wheel_metadata.raw)
+                if wheel_metadata
                 else None
             ),
             upload_time=datetime.now(UTC),

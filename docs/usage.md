@@ -177,6 +177,10 @@ Rules that are enforced:
   eggs (PEP 715), `.zip` sdists (PEP 625) and Windows installers are refused,
   and a declared `filetype` must match the extension (`bdist_wheel` for a
   wheel, `sdist` for a `.tar.gz`).
+- A wheel must contain exactly one `.dist-info` directory with a `METADATA`
+  whose `Name` and `Version` match the upload. That file is served as the
+  PEP 658 sidecar, and its `Requires-Python` (not the form's) becomes the
+  file's `data-requires-python`. An sdist is checked by its filename only.
 - Every digest you supply must match the bytes received.
 - Only one sdist per release.
 - Versions are compared as PEP 440 does: `2.0.0` is the same release as an
