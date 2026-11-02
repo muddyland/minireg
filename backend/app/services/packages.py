@@ -12,6 +12,7 @@ consults an upstream.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -54,6 +55,12 @@ def cache_key(ecosystem: str, name: str, suffix: str = "") -> str:
 # first 255 characters of it.
 _TEXT_LIMITS = {"license": 255, "author": 512, "homepage": 1024, "latest_version": 128}
 
+#: C0 controls other than tab and newline, DEL, and the C1 range. Nothing in a
+#: description or licence needs them, and ESC is how a terminal escape sequence
+#: starts: a description carrying OSC 52 or "erase line" acts on the terminal
+#: of whoever runs `minireg search` or `curl`s the API.
+_CONTROL_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
 
 def coerce_text(value, limit: int | None = None) -> str | None:
     """Flatten an upstream field into something a text column will accept.
@@ -83,7 +90,7 @@ def coerce_text(value, limit: int | None = None) -> str | None:
     else:
         return None
 
-    text = text.strip()
+    text = _CONTROL_CHARS.sub("", text.replace("\r\n", "\n")).strip()
     if not text:
         return None
     return text[:limit] if limit else text

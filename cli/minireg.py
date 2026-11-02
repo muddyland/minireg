@@ -102,6 +102,44 @@ def severity_colour(score):
     return dim
 
 
+#: C0 controls other than tab and newline, DEL, and the C1 range. ESC (and its
+#: one-byte C1 form, CSI) starts the sequences a terminal acts on: OSC 52
+#: writes the clipboard, CSI 2K plus CR erases the line just printed (a
+#: BLOCKED marker, say), others retitle the window or remap keys.
+_CONTROL_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+#: Server fields the CLI prints as a block of lines rather than inline.
+_MULTILINE_FIELDS = frozenset({"containerd_hosts_toml"})
+
+
+def clean_text(text: str, multiline: bool = False) -> str:
+    """Server-supplied text made safe to print or write into a config file.
+
+    Package descriptions, CVE summaries, block reasons and image metadata all
+    come from upstream registries and advisories, i.e. from strangers. Only
+    tab survives, and newline where a field is meant to span lines; anywhere
+    else a newline would let the text forge lines of our own output.
+    """
+    text = _CONTROL_CHARS.sub("", text.replace("\r\n", "\n"))
+    return text if multiline else text.replace("\n", " ")
+
+
+def _clean_payload(value, key=None):
+    """Apply :func:`clean_text` to every string in a decoded API response.
+
+    Done once, where responses enter the CLI, so no print site (present or
+    future) can forget it. --json output is unaffected in substance: JSON
+    would have escaped these characters anyway.
+    """
+    if isinstance(value, str):
+        return clean_text(value, multiline=key in _MULTILINE_FIELDS)
+    if isinstance(value, list):
+        return [_clean_payload(item, key) for item in value]
+    if isinstance(value, dict):
+        return {clean_text(str(k)): _clean_payload(v, k) for k, v in value.items()}
+    return value
+
+
 def die(message: str, code: int = 1):
     print(f"{red('error')}: {message}", file=sys.stderr)
     raise SystemExit(code)
@@ -228,7 +266,7 @@ def api(
                 response.headers.get(CLI_VERSION_HEADER) or _server_cli_version
             )
             payload = response.read()
-            return json.loads(payload) if payload else None
+            return _clean_payload(json.loads(payload)) if payload else None
     except urllib.error.HTTPError as exc:
         _server_cli_version = exc.headers.get(CLI_VERSION_HEADER) or _server_cli_version
         raw = exc.read()
@@ -238,6 +276,9 @@ def api(
             detail = parsed.get("detail") or parsed.get("error") or parsed.get("message")
         except Exception:
             detail = raw.decode("utf-8", "replace")[:300] or exc.reason
+        if detail:
+            # Not always a string: FastAPI's 422 detail is a list of objects.
+            detail = clean_text(detail if isinstance(detail, str) else str(detail))
         raise ApiError(exc.code, detail) from exc
     except urllib.error.URLError as exc:
         raise ApiError(0, f"could not reach {registry}: {exc.reason}") from exc
@@ -579,7 +620,9 @@ def configure_docker(args, registry: str, token, config: dict) -> None:
         except (OSError, subprocess.TimeoutExpired) as exc:
             die(f"{tool} login failed: {exc}")
         if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout).decode(errors="replace").strip().splitlines()
+            detail = clean_text(
+                (proc.stderr or proc.stdout).decode(errors="replace").strip(), multiline=True
+            ).splitlines()
             die(f"{tool} login {host} failed: {detail[-1] if detail else 'exit ' + str(proc.returncode)}")
         print(f"  {green('✓')} {tool} login {host}  {dim('(credentials stored by ' + tool + ')')}")
         scopes = _token_scopes(registry, token, args)
@@ -1977,7 +2020,7 @@ def warn_if_outdated():
         return
     info(
         dim(
-            f"  note: this registry ships CLI {_server_cli_version}, you have "
+            f"  note: this registry ships CLI {clean_text(_server_cli_version)}, you have "
             f"{__version__} — run 'minireg update'"
         )
     )

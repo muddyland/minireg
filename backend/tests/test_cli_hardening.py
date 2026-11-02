@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import io
+import json
 import pathlib
 import re
 import shlex
 import sys
+import urllib.error
 
 import pytest
 
@@ -135,3 +138,128 @@ class TestAuditRefresh:
     def test_refresh_and_offline_contradict_each_other(self):
         with pytest.raises(SystemExit):
             cli.build_parser().parse_args(["audit", "--offline", "--refresh"])
+
+
+# --------------------------------------------------------------------------- #
+# Server-supplied text cannot drive the terminal
+# --------------------------------------------------------------------------- #
+#: OSC 52 (write the clipboard), then erase the line and return to its start,
+#: then the 8-bit CSI form. A terminal shown this prints only "looks fine".
+EVIL = "harmless\x1b]52;c;Y3VybCBldmlsfHNo\x07\x1b[2K\r\x9b2Klooks fine"
+
+
+class _Response:
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode()
+        self.headers = {}
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.fixture
+def server(monkeypatch, tmp_path):
+    """Serve canned JSON through the CLI's real `api()`, from urlopen down."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("MINIREG_TOKEN", raising=False)
+    monkeypatch.delenv("MINIREG_URL", raising=False)
+    cli.save_config({"registry": "https://reg.example", "token": "t"})
+    routes = {}
+
+    def fake_urlopen(request, timeout=None, context=None):
+        path = request.full_url.split("reg.example", 1)[1]
+        for prefix, answer in routes.items():
+            if path.startswith(prefix):
+                if isinstance(answer, Exception):
+                    raise answer
+                return _Response(answer)
+        raise AssertionError(f"unexpected request {path}")
+
+    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+    return routes
+
+
+def assert_inert(text):
+    assert "\x1b" not in text and "\x9b" not in text and "\r" not in text and "\x07" not in text
+
+
+class TestNoTerminalEscapes:
+    def test_search_descriptions(self, server, capsys):
+        server["/api/docker/images"] = {"images": [], "total": 0}
+        server["/api/search"] = {
+            "total": 1,
+            "results": [
+                {"ecosystem": "npm", "name": "evil-pkg", "latest_version": "1.0.0", "description": EVIL}
+            ],
+        }
+        cli.main(["search", "evil"])
+        out = capsys.readouterr().out
+        assert_inert(out)
+        assert "looks fine" in out
+
+    def test_info_block_reason_and_cves_cannot_hide_lines(self, server, capsys):
+        server["/api/packages/npm/evil"] = {
+            "name": "evil",
+            "ecosystem": "npm",
+            "description": "multi\nline " + EVIL,
+            "license": "MIT\x1b[8m",
+            "blocked": True,
+            "block_reason": "malware\x1b[1A\x1b[2K",
+            "versions": [
+                {"version": "1.0.0", "max_cvss": 9.8, "cves": [{"cve_id": "CVE-1\x1b]0;pwned\x07"}]},
+            ],
+            "upstreams": [{"name": "npmjs\x1b[2K", "web_url": "https://x\x1b[2K"}],
+        }
+        cli.main(["info", "evil", "--ecosystem", "npm"])
+        out = capsys.readouterr().out
+        assert_inert(out)
+        assert "BLOCKED" in out and "malware" in out
+        # A newline in a one-line field would forge a line of output.
+        assert "multi line" in out
+
+    def test_image_findings(self, server, capsys):
+        server["/api/docker/inspect"] = {
+            "pull_reference": "reg.example/evil:1\x1b[2K",
+            "repository": "evil",
+            "digest": "sha256:" + "a" * 64,
+            "image": {
+                "digest": "sha256:" + "a" * 64,
+                "scan_status": "scanned",
+                "severity_counts": {"HIGH": 1},
+                "kind": "image",
+            },
+            "verdict": {"allowed": False, "code": "DENIED", "reason": "critical CVE\x1b[1A\x1b[2K"},
+            "findings": [
+                {"severity": "HIGH", "vuln_id": "CVE-2\x1b]52;c;eA==\x07", "pkg_name": "openssl\r",
+                 "installed_version": "1", "fixed_version": "2\x1b[2K"},
+            ],
+            "findings_total": 1,
+        }
+        cli.main(["info", "--ecosystem", "docker", "evil:1"])
+        out = capsys.readouterr().out
+        assert_inert(out)
+        assert "BLOCKED" in out
+
+    def test_error_details(self, server, capsys):
+        body = io.BytesIO(b"<html>\x1b]52;c;eA==\x07 down</html>")
+        server["/api/search"] = urllib.error.HTTPError(
+            "https://reg.example/api/search", 502, "Bad Gateway", {}, body
+        )
+        server["/api/docker/images"] = {"images": [], "total": 0}
+        with pytest.raises(SystemExit):
+            cli.main(["search", "x", "--ecosystem", "npm"])
+        err = capsys.readouterr().err
+        assert_inert(err)
+        assert "down" in err
+
+    def test_multiline_fields_keep_their_lines(self):
+        payload = cli._clean_payload(
+            {"containerd_hosts_toml": "[host]\r\n  a = 1\x1b[2K\n", "note": "a\nb"}
+        )
+        assert payload == {"containerd_hosts_toml": "[host]\n  a = 1[2K\n", "note": "a b"}

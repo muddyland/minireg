@@ -12,9 +12,10 @@ import httpx
 import pytest_asyncio
 import respx
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 from app import db as db_module
-from app.models import Ecosystem, PackageRule, RuleAction, Upstream, UpstreamKind
+from app.models import Ecosystem, Package, PackageRule, RuleAction, Upstream, UpstreamKind
 from app.services.policy import invalidate_policy_cache
 from app.services.storage import BlobStore, set_store
 
@@ -484,6 +485,28 @@ class TestUpstreamMetadataShapes:
         response = await proxy_client.get("/npm/leftpad/-/leftpad-1.1.0.tgz")
         assert response.status_code == 200
         assert response.content == TARBALL
+
+    @respx.mock
+    async def test_terminal_escapes_are_not_stored(self, proxy_client):
+        """Upstream text reaches terminals (`minireg search`, `curl` of the
+        API), where ESC starts a command: OSC 52 writes the clipboard, CSI 2K
+        and CR erase what was printed. None of it belongs in a description."""
+        packument = {
+            **UPSTREAM_PACKUMENT,
+            "name": "config-chain",
+            "description": "harmless\x1b]52;c;Y3VybCBldmlsfHNo\x07\x1b[2K\r\x9b0mlooks fine\nline two",
+            "license": "MIT\x1b[8m",
+        }
+        respx.get("https://upstream.test/config-chain").mock(
+            return_value=httpx.Response(200, json=packument)
+        )
+        assert (await proxy_client.get("/npm/config-chain")).status_code == 200
+        async with db_module.session_scope() as session:
+            package = (
+                await session.execute(select(Package).where(Package.name == "config-chain"))
+            ).scalar_one()
+        assert package.description == "harmless]52;c;Y3VybCBldmlsfHNo[2K0mlooks fine\nline two"
+        assert package.license == "MIT[8m"
 
 
 class TestCoerceText:
