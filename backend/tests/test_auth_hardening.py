@@ -570,3 +570,64 @@ class TestSsoDemotionTakesBackPublish:
         assert (await sso(app_client)).status_code == 302
         row = await user_row("publisher")
         assert not row.is_admin and row.can_publish
+
+
+class TestAdminChangesEndSessions:
+    """An admin password reset -- the usual response to a compromised account
+    -- left the account's existing cookies valid for their full 12 hours,
+    and so did withdrawing its rights."""
+
+    async def _patch(self, client, username, body, headers=None):
+        uid = (await user_row(username)).id
+        return await client.patch(
+            f"/api/admin/users/{uid}", json=body, headers=headers or auth(client, "admin")
+        )
+
+    async def _cookie_works(self, client, cookie) -> bool:
+        client.cookies.clear()
+        client.cookies.set(settings.session_cookie, cookie)
+        ok = (await client.get("/api/auth/me")).status_code == 200
+        client.cookies.clear()
+        return ok
+
+    async def test_a_password_reset_ends_sessions(self, app_client):
+        cookie = await login(app_client)
+        app_client.cookies.clear()
+        resp = await self._patch(app_client, "publisher", {"password": "reset-password-12345"})
+        assert resp.status_code == 200
+        assert not await self._cookie_works(app_client, cookie)
+        await login(app_client, password="reset-password-12345")
+
+    async def test_withdrawing_publish_ends_sessions(self, app_client):
+        cookie = await login(app_client)
+        app_client.cookies.clear()
+        assert (await self._patch(app_client, "publisher", {"can_publish": False})).status_code == 200
+        assert not await self._cookie_works(app_client, cookie)
+
+    async def test_withdrawing_admin_ends_sessions(self, app_client):
+        async with db_module.session_scope() as session:
+            row = (
+                await session.execute(select(User).where(User.username == "publisher"))
+            ).scalar_one()
+            row.is_admin = True
+        cookie = await login(app_client)
+        app_client.cookies.clear()
+        assert (await self._patch(app_client, "publisher", {"is_admin": False})).status_code == 200
+        assert not await self._cookie_works(app_client, cookie)
+
+    async def test_harmless_edits_keep_sessions(self, app_client):
+        cookie = await login(app_client)
+        app_client.cookies.clear()
+        resp = await self._patch(
+            app_client, "publisher", {"full_name": "Pub Lisher", "can_publish": True}
+        )
+        assert resp.status_code == 200
+        assert await self._cookie_works(app_client, cookie)
+
+    async def test_an_admin_resetting_their_own_password_stays_signed_in(self, app_client):
+        await login(app_client, "admin", "admin-password-1234")
+        resp = await self._patch(
+            app_client, "admin", {"password": "a-brand-new-password-1"}, headers=SAME_ORIGIN
+        )
+        assert resp.status_code == 200
+        assert (await app_client.get("/api/auth/me")).status_code == 200

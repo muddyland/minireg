@@ -6,7 +6,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...config import settings
 from ...core.deps import Identity, client_ip, require_admin
-from ...core.security import encrypt_credential, hash_password
+from ...core.security import create_session_token, encrypt_credential, hash_password
 from ...core.semver import is_valid_range, parse_range
 from ...db import get_session
 from ...models import (
@@ -145,12 +145,14 @@ async def update_user(
     user_id: int,
     payload: UserUpdate,
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(get_session),
     identity: Identity = Depends(require_admin),
 ) -> dict:
     user = await session.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+    before = (user.is_admin, user.can_publish, user.is_active)
 
     # Guard against an admin locking everyone out of the instance.
     if user.id == identity.user_id and payload.is_admin is False:
@@ -185,6 +187,15 @@ async def update_user(
     if user.is_admin:
         user.can_publish = True
 
+    # A reset password or a withdrawn right ends every session the account
+    # has, as the self-service password change already did. A reset is the
+    # usual response to a compromised account, and the intruder's cookie
+    # used to survive it for the rest of its 12 hours.
+    after = (user.is_admin, user.can_publish, user.is_active)
+    withdrawn = any(was and not now for was, now in zip(before, after, strict=True))
+    if payload.password or withdrawn:
+        user.session_version = (user.session_version or 0) + 1
+
     if await _would_orphan_admins(session):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -202,6 +213,16 @@ async def update_user(
         detail={"username": user.username, "changes": changes},
     )
     await session.commit()
+    if user.id == identity.user_id and identity.method == "session":
+        # An admin resetting their own password stays signed in here.
+        from ..auth import _set_session_cookie
+
+        _set_session_cookie(
+            response,
+            create_session_token(
+                user.id, user.username, user.is_admin, session_version=user.session_version
+            ),
+        )
     return user_payload(user)
 
 

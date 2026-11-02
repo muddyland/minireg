@@ -347,6 +347,11 @@ manually if you want the link.
 
 An account with no password is SSO-only.
 
+Resetting someone's password here, or taking away their admin or publish
+permission or disabling them, signs that account out of every browser
+session. API tokens are separate: they keep working until revoked, except
+that a disabled account's tokens are refused for as long as it is disabled.
+
 ### OIDC
 
 Any compliant provider — tested with [Kanidm](https://kanidm.com/) and
