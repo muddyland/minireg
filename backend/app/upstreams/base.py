@@ -322,26 +322,54 @@ class UpstreamProvider:
     def check_body_size(self, resp: httpx.Response) -> httpx.Response:
         """Reject an oversized metadata document.
 
-        Packuments are read whole and then written to `packages.cached_document`
-        on every refresh -- the biggest public ones are already tens of
-        megabytes, and there was no ceiling at all, so a hostile upstream
-        could hand over as much as it liked and the row would follow it into
-        the database.
+        :meth:`request` already enforces ``MAX_METADATA_BYTES`` while it
+        reads, so a body that got this far fits; this stays as the explicit
+        statement at the call sites that parse a whole document, and for a
+        response that did not come through :meth:`request`.
         """
         limit = settings.max_metadata_bytes
-        if not limit:
-            return resp
-        declared = resp.headers.get("content-length")
-        if declared and declared.isdigit() and int(declared) > limit:
-            raise UpstreamError(
-                f"{self.name}: metadata document is {declared} bytes, over the "
-                f"{limit} byte limit"
-            )
-        if len(resp.content) > limit:
+        if limit and len(resp.content) > limit:
             raise UpstreamError(
                 f"{self.name}: metadata document exceeds the {limit} byte limit"
             )
         return resp
+
+    async def _read_limited(self, resp: httpx.Response) -> None:
+        """Read the body of a streamed response, refusing more than
+        ``MAX_METADATA_BYTES`` of it *decoded*.
+
+        Packuments are read whole and then written to
+        `packages.cached_document` on every refresh, so they had a ceiling --
+        checked after httpx had already read and inflated the whole body. A
+        204 KB gzip body is 200 MB in memory and a 2 MB one is past the
+        container's limit, a chunked response with no Content-Length was
+        buffered without bound, and the cargo index, cargo config.json and
+        PyPI HTML pages never checked at all. Counting here, as the bytes are
+        decoded, covers every caller.
+        """
+        limit = settings.max_metadata_bytes
+        try:
+            declared = resp.headers.get("content-length")
+            if limit and declared and declared.isdigit() and int(declared) > limit:
+                raise UpstreamError(
+                    f"{self.name}: metadata document is {declared} bytes, over the "
+                    f"{limit} byte limit"
+                )
+            parts: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if limit and total > limit:
+                    raise UpstreamError(
+                        f"{self.name}: metadata document exceeds the {limit} byte limit"
+                    )
+                parts.append(chunk)
+        except BaseException:
+            await resp.aclose()
+            raise
+        # What Response.aread() does, with the count in the middle: callers
+        # keep using .content, .text and .json() as before.
+        resp._content = b"".join(parts)
 
     async def request(
         self,
@@ -432,10 +460,10 @@ class UpstreamProvider:
                 await self._guard(current, trusted=url)
             except BlockedUrl as exc:
                 raise UpstreamError(f"{self.name}: {exc}") from exc
-            resp = await client.request(
-                method, current, headers=send, timeout=timeout, follow_redirects=False, **kwargs
-            )
+            req = client.build_request(method, current, headers=send, timeout=timeout, **kwargs)
+            resp = await client.send(req, stream=True, follow_redirects=False)
             if resp.status_code not in _REDIRECT_STATUSES or method.upper() not in ("GET", "HEAD"):
+                await self._read_limited(resp)
                 return resp
             location = resp.headers.get("location")
             await resp.aclose()

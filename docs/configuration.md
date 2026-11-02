@@ -158,7 +158,7 @@ Full guide: [Container images](containers.md).
 | Variable | Default | Notes |
 |---|---|---|
 | `MAX_PUBLISH_BYTES` | `268435456` | Rejected on `Content-Length` before the body is read. |
-| `MAX_METADATA_BYTES` | `100663296` | Largest upstream packument or index document. |
+| `MAX_METADATA_BYTES` | `100663296` | Largest upstream packument, simple page, index file or other metadata response, counted after decompression and enforced while it downloads: a response that passes it is abandoned there and the upstream treated as failed. `0` = no limit. |
 | `MAX_ARTIFACT_BYTES` | `2147483648` | Largest artifact streamed from an upstream. |
 | `STORAGE_QUOTA_BYTES` | `0` | When a download would take the blob store over this, the least recently accessed cached upstream artifacts are evicted down to 90% of it. The same runs in the hourly housekeeping. Never evicted: files published here and anything read in the last 10 minutes. An evicted artifact is fetched again on its next request. A download fails only when nothing evictable is left. Publishes are exempt. `0` disables. |
 | `DB_POOL_TIMEOUT_SECONDS` | `10` | Wait for a pooled connection before failing. |
