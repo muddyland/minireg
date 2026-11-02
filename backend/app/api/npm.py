@@ -881,8 +881,19 @@ async def update_packument(
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
     by_version = {v.version: v for v in package.versions}
-    removed = [by_version[v] for v in sorted(by_version, key=semver_key) if v not in submitted]
-    survivors = [v for v in by_version if v in submitted]
+    # Only versions the caller could have seen are removable. The packument
+    # without ?write=true hides policy-blocked versions, so a client that
+    # edited that view would otherwise retire every hidden version along with
+    # the one it meant to. A hidden version is left alone here; unpublishing
+    # it explicitly still works, through the tarball DELETE npm sends next.
+    hidden = await _blocked_versions(PolicyEngine(session), package)
+    removed = [
+        by_version[v]
+        for v in sorted(by_version, key=semver_key)
+        if v not in submitted and v not in hidden
+    ]
+    survivors = [v for v in by_version if v in submitted or v in hidden]
+    visible_survivors = [v for v in survivors if v not in hidden]
     if removed and not survivors:
         return npm_error(
             "this update would remove every version; unpublish the package instead",
@@ -918,7 +929,7 @@ async def update_packument(
         submitted_tags = body.get("dist-tags") if isinstance(body.get("dist-tags"), dict) else {}
         wanted = submitted_tags.get("latest")
         if not (isinstance(wanted, str) and wanted in survivors):
-            wanted = max_semver(survivors) or survivors[-1]
+            wanted = max_semver(visible_survivors or survivors) or survivors[-1]
         for tag_row in list(package.dist_tags):
             if tag_row.version not in removed_versions:
                 continue
@@ -1630,9 +1641,17 @@ async def _packument_response(
         npm_render.ABBREVIATED_CONTENT_TYPE if abbreviated else npm_render.FULL_CONTENT_TYPE
     )
     cache_id = packages.cache_key("npm", normalized, "abbrev" if abbreviated else "full")
+    # `?write=true` is what libnpmpublish sends before it edits the document
+    # (`npm unpublish pkg@x`, `npm deprecate`). Whether it gets the editable
+    # view depends on who is asking, so it never reads or fills the cache.
+    write_view = (
+        request.query_params.get("write") == "true"
+        and identity.is_authenticated
+        and identity.has_scope("publish")
+    )
     # Stored serialised and served as stored: a hit costs a hash for the ETag,
     # not a parse and a re-encode of the whole document.
-    cached = await cache_get_bytes(cache_id)
+    cached = None if write_view else await cache_get_bytes(cache_id)
     if cached is not None:
         audit.record_download(
             audit.DownloadEvent(
@@ -1652,6 +1671,8 @@ async def _packument_response(
     if lookup.package is None or not lookup.package.versions:
         return npm_error("Not found", status.HTTP_404_NOT_FOUND)
     package = lookup.package
+    if write_view:
+        write_view = await _may_unpublish(package, identity)
 
     # Inline CVE scan for versions we have never scanned.
     await _scan_new_versions(session, package)
@@ -1659,7 +1680,12 @@ async def _packument_response(
     document = npm_render.render_packument(package, abbreviated=abbreviated)
 
     # Drop versions blocked by CVE policy so a client cannot resolve to them.
-    blocked = await _blocked_versions(policy, package)
+    # Not from the editable view a package's owner (or an admin) asks for
+    # with ?write=true: libnpmpublish PUTs that document back, and every
+    # version missing from it is unpublished. Filtered, it made `npm
+    # unpublish pkg@x` retire every policy-hidden version too -- and with a
+    # single visible version, DELETE the whole package.
+    blocked = set() if write_view else await _blocked_versions(policy, package)
     if blocked:
         document["versions"] = {
             v: meta for v, meta in document["versions"].items() if v not in blocked
@@ -1683,7 +1709,7 @@ async def _packument_response(
     # Size-capped: the cache shares a fixed memory budget (allkeys-lru) with
     # herd-guard locks and rate-limit counters, which a few large documents
     # would evict. Large packuments are rendered per request instead.
-    if len(body) <= PACKUMENT_CACHE_MAX_BYTES:
+    if not write_view and len(body) <= PACKUMENT_CACHE_MAX_BYTES:
         await cache_set_bytes(cache_id, body, settings.meta_cache_ttl)
 
     audit.record_download(
@@ -1700,7 +1726,24 @@ async def _packument_response(
             upstream_id=lookup.upstream.id if lookup.upstream else None,
         )
     )
-    return document_response(request, body, content_type=content_type, vary_accept=True)
+    response = document_response(request, body, content_type=content_type, vary_accept=True)
+    if write_view:
+        response.headers["cache-control"] = "private, no-store"
+    return response
+
+
+async def _may_unpublish(package: Package, identity: Identity) -> bool:
+    """Whether ``identity`` may edit this package's version list."""
+    try:
+        await ownership.authorize_mutation(
+            package,
+            user_id=identity.user_id,
+            is_admin=identity.is_admin and identity.has_scope("admin"),
+            action="unpublish",
+        )
+    except ownership.PublishDenied:
+        return False
+    return True
 
 
 async def _scan_new_versions(session: AsyncSession, package: Package) -> None:

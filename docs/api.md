@@ -34,11 +34,11 @@ Mounted at `/npm`. Implements the npm registry API.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/npm/{package}` | Packument. `Accept: application/vnd.npm.install-v1+json` returns the abbreviated form |
+| `GET` | `/npm/{package}` | Packument. `Accept: application/vnd.npm.install-v1+json` returns the abbreviated form. Versions blocked by policy are left out; with `?write=true` (what `npm unpublish` and `npm deprecate` fetch) the package's owner or an admin gets every version, uncached |
 | `GET` | `/npm/{package}/{version}` | Version document; a dist-tag is accepted in place of a version |
 | `GET` | `/npm/{package}/-/{filename}` | Tarball. `immutable` cache headers |
 | `PUT` | `/npm/{package}` | Publish, deprecate, undeprecate |
-| `PUT` | `/npm/{package}/-rev/{rev}` | Version unpublish, as `npm unpublish pkg@x.y.z` sends it: the edited packument. Versions missing from the body are removed; `deprecated` edits are applied |
+| `PUT` | `/npm/{package}/-rev/{rev}` | Version unpublish, as `npm unpublish pkg@x.y.z` sends it: the edited packument. Versions missing from the body are removed, except ones policy currently blocks (unpublish those by their tarball `DELETE`); `deprecated` edits are applied |
 | `DELETE` | `/npm/{package}/-rev/{rev}` | Unpublish a package |
 | `DELETE` | `/npm/{package}/-/{filename}/-rev/{rev}` | Unpublish a version, releasing every file of that version |
 | `GET` | `/npm/-/package/{package}/dist-tags` | Read dist-tags |

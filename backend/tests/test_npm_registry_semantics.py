@@ -412,3 +412,121 @@ async def test_startup_repairs_scoped_tarball_names_stored_by_older_releases(env
     assert names == ["old-1.0.0.tgz"]
     await invalidate_package_cache("npm", "@acme/old")
     assert await _install(client, "@acme/old", "1.0.0") == b"legacy"
+
+
+# --------------------------------------------------------------------------- #
+# `npm unpublish pkg@x` and policy-hidden versions
+# --------------------------------------------------------------------------- #
+async def npm_unpublish(client, name: str, version: str, *, write: bool = True) -> str:
+    """libnpmpublish's unpublish(), step for step; returns the branch taken.
+
+    GET the packument with ?write=true; with one version left (or none) it
+    DELETEs the whole package, otherwise it drops the version and any tag
+    naming it, re-points `latest`, PUTs the document to /-rev/{rev}, then
+    DELETEs the tarball by its dist.tarball path.
+    """
+    from urllib.parse import urlsplit
+
+    from app.core.semver import SemVer
+
+    path = f"/npm/{name.replace('/', '%2f')}"
+    pkg = (await client.get(path, params={"write": "true"} if write else None)).json()
+    versions = pkg.get("versions") or {}
+    if version not in versions:
+        return "absent"
+    if len(versions) == 1:
+        response = await client.delete(f"{path}/-rev/{pkg['_rev']}")
+        assert response.status_code == 200, response.text
+        return "deleted-package"
+    dist = versions.pop(version)["dist"]
+    latest = pkg["dist-tags"].get("latest")
+    pkg["dist-tags"] = {t: v for t, v in pkg["dist-tags"].items() if v != version}
+    if latest == version:
+        pkg["dist-tags"]["latest"] = sorted(versions, key=SemVer.parse)[-1]
+    pkg.pop("_revisions", None)
+    pkg.pop("_attachments", None)
+    response = await client.put(f"{path}/-rev/{pkg['_rev']}", json=pkg)
+    assert response.status_code == 200, response.text
+    rev = (await client.get(path, params={"write": "true"})).json().get("_rev", "0")
+    tarball = urlsplit(dist["tarball"]).path
+    response = await client.delete(f"{tarball}/-rev/{rev}")
+    assert response.status_code == 200, response.text
+    return "edited"
+
+
+async def _stored_and_retired(name: str):
+    from sqlalchemy import select
+
+    from app.models import Package, PackageVersion, RetiredVersion
+
+    async with db_module.session_scope() as session:
+        stored = (
+            await session.execute(
+                select(PackageVersion.version)
+                .join(Package, Package.id == PackageVersion.package_id)
+                .where(Package.normalized_name == name)
+            )
+        ).scalars().all()
+        retired = (
+            await session.execute(
+                select(RetiredVersion.version).where(RetiredVersion.normalized_name == name)
+            )
+        ).scalars().all()
+    return sorted(stored), sorted(retired)
+
+
+async def test_npm_unpublish_leaves_policy_hidden_versions_alone(env):
+    client, tokens = env
+    as_user(client, tokens["alice"])
+    for version in ("1.0.0", "1.1.0", "2.0.0"):
+        assert (await client.put("/npm/victim", json=publish_body("victim", version))).status_code == 201
+    await _block("victim", "1.1.0")
+
+    # Installers still do not see the blocked version...
+    assert sorted((await client.get("/npm/victim")).json()["versions"]) == ["1.0.0", "2.0.0"]
+    # ...but its owner's editable view does, and is not cached for others.
+    write = await client.get("/npm/victim", params={"write": "true"})
+    assert sorted(write.json()["versions"]) == ["1.0.0", "1.1.0", "2.0.0"]
+    assert "no-store" in write.headers["cache-control"]
+    as_user(client, tokens["bob"])
+    assert sorted((await client.get("/npm/victim", params={"write": "true"})).json()["versions"]) == [
+        "1.0.0",
+        "2.0.0",
+    ]
+
+    as_user(client, tokens["alice"])
+    assert await npm_unpublish(client, "victim", "2.0.0") == "edited"
+    stored, retired = await _stored_and_retired("victim")
+    assert stored == ["1.0.0", "1.1.0"]
+    assert retired == ["2.0.0"]
+    assert (await client.get("/npm/-/package/victim/dist-tags")).json() == {"latest": "1.0.0"}
+
+
+async def test_npm_unpublish_with_one_visible_version_does_not_delete_the_package(env):
+    """Filtered down to one version, the CLI took its "only version" branch
+    and DELETEd the whole package, hidden versions and all."""
+    client, tokens = env
+    as_user(client, tokens["alice"])
+    for version in ("1.0.0", "2.0.0"):
+        assert (await client.put("/npm/solo", json=publish_body("solo", version))).status_code == 201
+    await _block("solo", "1.0.0")
+
+    assert await npm_unpublish(client, "solo", "2.0.0") == "edited"
+    stored, retired = await _stored_and_retired("solo")
+    assert stored == ["1.0.0"]
+    assert retired == ["2.0.0"]
+
+
+async def test_packument_edit_from_the_filtered_view_spares_hidden_versions(env):
+    """A client that edits the installer's (filtered) view, not the write
+    view, must not take the versions it never saw with it."""
+    client, tokens = env
+    as_user(client, tokens["alice"])
+    for version in ("1.0.0", "1.1.0", "2.0.0"):
+        assert (await client.put("/npm/oldcli", json=publish_body("oldcli", version))).status_code == 201
+    await _block("oldcli", "1.1.0")
+
+    assert await npm_unpublish(client, "oldcli", "2.0.0", write=False) == "edited"
+    stored, retired = await _stored_and_retired("oldcli")
+    assert stored == ["1.0.0", "1.1.0"]
+    assert retired == ["2.0.0"]
