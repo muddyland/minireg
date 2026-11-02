@@ -11,8 +11,12 @@ surface for anyone who asks.
 |---|---|---|
 | Bearer token | `Authorization: Bearer mrg_…` | npm, the CLI, scripts |
 | Basic (token) | `Authorization: Basic base64("__token__:mrg_…")` | pip, twine |
-| Basic (password) | `Authorization: Basic base64("user:pass")` | Clients that cannot send Bearer |
+| Basic (password) | `Authorization: Basic base64("user:pass")` | Clients that cannot send Bearer. **Read-only** |
 | Session cookie | `minireg_session` | The web UI |
+
+An account password over Basic is **read-only**: it can fetch packages
+(when `ALLOW_ANONYMOUS_READ=false`) but not publish, administer, mint tokens or
+approve a CLI login, which all answer `403`. Use an API token for those.
 
 An `Authorization` header is **authoritative**: if one is present but does not
 authenticate, the request is anonymous. It never falls back to a session
@@ -216,7 +220,8 @@ See [Container images](containers.md) for naming, the mirror, and policy.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/auth/login` | Password sign-in |
-| `POST` | `/api/auth/logout` | Sign out |
+| `POST` | `/api/auth/logout` | Sign out; the session cookie is revoked server-side, so a copy of it stops working too |
+| `POST` | `/api/auth/logout-everywhere` | End every browser session of this account, this one included (API tokens are unaffected) |
 | `GET` | `/api/auth/me` | Current identity and scopes |
 | `POST` | `/api/auth/password` | Change password |
 | `GET` | `/api/auth/tokens` | List your tokens |
@@ -226,9 +231,9 @@ See [Container images](containers.md) for naming, the mirror, and policy.
 | `GET` | `/api/auth/oidc/login` | Start the SSO flow |
 | `GET` | `/api/auth/oidc/callback` | SSO callback |
 
-Changing the password and listing, creating or revoking tokens need a
-primary credential: a session or account password, or a token with the
-`admin` scope. A leaked `read` or `publish` token gets `403` there, so it can
+Changing the password, signing out everywhere and listing, creating or
+revoking tokens need a primary credential: a browser session, or a token with the `admin` scope.
+An account password over HTTP Basic is not one (it is read-only). A leaked `read` or `publish` token gets `403` there, so it can
 neither mint a wider token nor enumerate or revoke its owner's others.
 
 ### Documentation

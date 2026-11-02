@@ -43,6 +43,10 @@ class _FakeRedis:
     def pipeline(self):
         return _FakePipeline(self)
 
+    async def decr(self, key):
+        self.counts[key] = self.counts.get(key, 0) - 1
+        return self.counts[key]
+
 
 @pytest.fixture
 def fake_redis(monkeypatch):
@@ -105,6 +109,35 @@ async def test_separate_keys_do_not_share_a_budget(fake_redis, clock):
         await cache.rate_limit("read:ip10.0.0.1", 2)
     allowed, _ = await cache.rate_limit("read:ip10.0.0.2", 2)
     assert allowed is True
+
+
+async def test_a_refund_gives_the_hit_back_to_its_own_window(fake_redis, clock):
+    """Only failed logins should stay counted; a refund returns the hit to
+    the window it was taken in, even if the clock has moved on since."""
+    clock["t"] = 1_000_019.0
+    for _ in range(2):
+        await cache.rate_limit("login:ip:x", 2, now=1_000_019.0)
+    clock["t"] = 1_000_021.0  # the next window
+    await cache.rate_limit_refund("login:ip:x", 2, now=1_000_019.0)
+    assert fake_redis.counts == {"rl:login:ip:x:60:16666": 1}
+    allowed, _ = await cache.rate_limit("login:ip:x", 2, now=1_000_019.0)
+    assert allowed is True
+
+
+async def test_a_refund_without_the_cache_uses_the_local_counter(monkeypatch, clock):
+    monkeypatch.setattr(cache, "_redis", None)
+    monkeypatch.setattr(cache.settings, "rate_limit_enabled", True)
+
+    async def no_cache():
+        return None
+
+    monkeypatch.setattr(cache, "ensure_redis", no_cache)
+    cache._local_counters.clear()
+    assert (await cache.rate_limit("login:ip:y", 1, fail_closed=True))[0] is True
+    await cache.rate_limit_refund("login:ip:y", 1, fail_closed=True)
+    assert (await cache.rate_limit("login:ip:y", 1, fail_closed=True))[0] is True
+    assert (await cache.rate_limit("login:ip:y", 1, fail_closed=True))[0] is False
+    cache._local_counters.clear()
 
 
 async def test_retry_after_counts_down_to_the_boundary(clock):

@@ -279,14 +279,19 @@ the ones that matter for that job.
   applies to approving a CLI login. Listing and revoking tokens needs a
   session or an admin-scoped token, so a leaked read-only token cannot
   enumerate or revoke the others.
+- An account password over HTTP Basic is read-only: it can fetch, but not
+  publish, administer or mint tokens.
 - Argon2id password hashing; API tokens stored as SHA-256 of the secret half
   and shown exactly once. Upstream credentials encrypted at rest, never
   returned by the API.
 - An `Authorization` header is authoritative — a rejected token never falls
-  back to a session cookie. Sessions carry a version that a password change
-  bumps, so changing it ejects every other session.
-- Login attempts limited per IP **and** per username, over Basic auth as well
-  as the login endpoint, and both outcomes audited. Those limits fall back to
+  back to a session cookie. Signing out revokes that session's cookie on the
+  server, not just in the browser. Sessions carry a version that a password
+  change or reset bumps, so it ejects every other session; **Account → Sign
+  out everywhere** does the same on demand.
+- Failed login attempts limited per IP, per username from that IP, and per
+  username overall (at a higher ceiling), over Basic auth as well as the
+  login endpoint, and both outcomes audited. Those limits fall back to
   an in-process counter rather than failing open if the cache is unreachable.
 - OIDC links to an existing local account only on a provider-verified email,
   and the login flow is bound to the browser that started it.

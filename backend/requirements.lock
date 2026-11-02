@@ -135,10 +135,6 @@ asyncpg==0.31.0 \
     --hash=sha256:f6b56b91bb0ffc328c4e3ed113136cddd9deefdf5f79ab448598b9772831df44 \
     --hash=sha256:f890de5e1e4f7e14023619399a471ce4b71f5418cd67a51853b9910fdfa73696
     # via -r requirements.txt
-authlib==1.8.0 \
-    --hash=sha256:88aebbd9af6757e14e912d5dc007ae1dc1f3e27e3b2152ce7c552ee2c3b3c121 \
-    --hash=sha256:f3ecd5f1da737262fb53bf1a4d95c4ea1ad9dd509316587a255c99ab1838a4f0
-    # via -r requirements.txt
 certifi==2026.10.19 \
     --hash=sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae \
     --hash=sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b
@@ -302,8 +298,6 @@ cryptography==50.0.1 \
     --hash=sha256:ff838d62ec1bfce4f9ba7fa16f4a7b554cd8d0c299e6be37502161a660c84eef
     # via
     #   -r requirements.txt
-    #   authlib
-    #   joserfc
     #   pyjwt
 fastapi==0.141.1 \
     --hash=sha256:bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3 \
@@ -480,10 +474,6 @@ itsdangerous==2.2.0 \
     --hash=sha256:c6242fc49e35958c8b15141343aa660db5fc54d4f13a1db01a3f5891b98700ef \
     --hash=sha256:e0050c0b7da1eea53ffaf149c0cfbb5c6e2e2b69c4bef22c81fa6eb73e5f6173
     # via -r requirements.txt
-joserfc==1.7.5 \
-    --hash=sha256:add2c2c84e8373b084d526a8b53daba5d7a513a118cd2dcd9fc9f979d0922159 \
-    --hash=sha256:d5ff536e658e17664f8c1b1ab60dc4aa62aa973fcef1edd33cc44bda45d6f5ea
-    # via authlib
 orjson==3.12.0 \
     --hash=sha256:010811c1b69773450a01cef97727a67b223242f350b77d4ca000e59a9ef2155a \
     --hash=sha256:01efac2074fffb4cb1ea3fab7861e9d0f2a26913854a972f5ac760525dbdaf6e \

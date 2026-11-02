@@ -191,6 +191,19 @@ the caller. Your reverse proxy must append rather than overwrite for this to
 be correct, which is what the nginx snippet in
 [installation](installation.md) does.
 
+`RATE_LIMIT_LOGIN_PER_MINUTE` counts **failed** password attempts (the login
+form, HTTP Basic with a password, and the current-password check when
+changing it); a correct password is not counted, so a client that sends its
+password on every request never throttles itself. Failures are capped per
+client address, per account from one address, and per account from all
+addresses together at ten times the limit. Someone guessing at your username
+therefore throttles only their own address until the guessing is spread over
+many addresses, at which point the account itself is throttled for the rest
+of the minute. Failed container-registry logins (`docker login`, `/v2`) are
+counted per address against the same limit and answered `429` beyond it;
+they are audited once per address and token per minute, so a loop of bad
+logins cannot grow the audit log without bound.
+
 Login and CLI device-flow limits fall back to an in-process counter when the
 cache is unreachable, rather than failing open — a cache outage should not
 open the door to password guessing.
@@ -337,6 +350,11 @@ manually if you want the link.
 
 An account with no password is SSO-only.
 
+Resetting someone's password here, or taking away their admin or publish
+permission or disabling them, signs that account out of every browser
+session. API tokens are separate: they keep working until revoked, except
+that a disabled account's tokens are refused for as long as it is disabled.
+
 ### OIDC
 
 Any compliant provider — tested with [Kanidm](https://kanidm.com/) and
@@ -421,10 +439,20 @@ Issuer* field.
 
 Group membership is re-applied on **every** sign-in, so removing someone from
 the admin group demotes them the next time they log in — you do not have to
-touch the local account.
+touch the local account. Admins may publish, so promotion switches publishing
+on for an account that did not have it; demotion switches it off again,
+unless an admin has since set **Can publish** on the account by hand.
+Accounts promoted by a release before this rule existed cannot be told
+apart and keep publishing after demotion; untick it under **Users** if that
+is not wanted.
 
 An OIDC login whose email matches an existing local account links to it rather
-than creating a duplicate.
+than creating a duplicate — only when the provider says the email is
+verified. From then on the account signs in through the provider only: its
+local password is removed and the sessions it had are ended, so the
+provider's group checks and disabling cannot be sidestepped with the old
+password. Its API tokens keep working. Accounts linked by an earlier release
+lose their password the same way on the first start after upgrading.
 
 When a new SSO account's `preferred_username` is already taken, it gets a
 numeric suffix (`alice-2`) rather than failing, and the existing account is

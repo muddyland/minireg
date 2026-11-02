@@ -11,15 +11,23 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..core.cache import rate_limit, rate_limit_retry_after
-from ..core.deps import Identity, client_ip, require_primary_credential, require_user, resolve_identity
+from ..core.deps import (
+    Identity,
+    begin_login_attempt,
+    client_ip,
+    forgive_login_attempt,
+    require_primary_credential,
+    require_user,
+    resolve_identity,
+)
 from ..core.security import (
     create_session_token,
     create_state_token,
+    decode_session_token,
     decode_state_token,
     generate_token,
     hash_password,
@@ -27,7 +35,7 @@ from ..core.security import (
     verify_password,
 )
 from ..db import get_session
-from ..models import ApiToken, AuthProvider, User
+from ..models import ApiToken, AuthProvider, RevokedSession, User
 from ..services import audit, oidc
 
 log = logging.getLogger(__name__)
@@ -112,24 +120,25 @@ async def login(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     ip = client_ip(request)
-    # Throttle by IP *and* username so neither a single source nor a single
-    # account can be brute-forced. Fail closed: with the cache down these fall
-    # back to an in-process counter instead of letting every guess through.
-    # The Basic-auth path in core/deps.py shares these buckets and already did.
-    for key in (f"login:ip:{ip}", f"login:user:{payload.username}"):
-        allowed, _ = await rate_limit(key, settings.rate_limit_login_per_minute, fail_closed=True)
-        if not allowed:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="too many login attempts; try again shortly",
-                headers={"Retry-After": str(rate_limit_retry_after())},
-            )
+    # Throttle by IP, by account and by the pair, so neither a single source
+    # nor a single account can be brute-forced, while a stranger guessing at
+    # someone's name only throttles their own address. Only failures count.
+    # Fail closed: with the cache down these fall back to an in-process
+    # counter. The Basic-auth path in core/deps.py shares these buckets.
+    started = await begin_login_attempt(
+        ip or "unknown", payload.username, detail="too many login attempts; try again shortly"
+    )
 
     user = (
         await session.execute(select(User).where(User.username == payload.username))
     ).scalar_one_or_none()
 
-    if user is None or not verify_password(payload.password, user.password_hash):
+    # Always pay for one argon2 verify -- against a dummy hash when there is
+    # no such user -- so the response time does not say which usernames exist.
+    password_ok = verify_password(payload.password, user.password_hash if user else None)
+    # An SSO account signs in through its identity provider only, so that
+    # the provider's group checks and disabling apply to every sign-in.
+    if user is None or not password_ok or user.provider != AuthProvider.local:
         await audit.record_audit(
             session,
             audit.LOGIN_FAILED,
@@ -159,6 +168,7 @@ async def login(
         await session.commit()
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account is disabled")
 
+    await forgive_login_attempt(ip or "unknown", payload.username, started)
     if needs_rehash(user.password_hash or ""):
         user.password_hash = hash_password(payload.password)
 
@@ -190,7 +200,14 @@ async def logout(
     session: AsyncSession = Depends(get_session),
     identity: Identity = Depends(resolve_identity),
 ) -> dict:
+    """Sign this browser out, and revoke its session cookie server-side.
+
+    Deleting the cookie alone left any copy of it (from a shared machine, a
+    proxy log, malware) valid for the rest of its lifetime.
+    """
     if identity.is_authenticated:
+        if identity.method == "session":
+            await _revoke_session_cookie(session, request, identity)
         await audit.record_audit(
             session,
             audit.LOGOUT,
@@ -203,13 +220,68 @@ async def logout(
     return {"ok": True}
 
 
+async def _revoke_session_cookie(
+    session: AsyncSession, request: Request, identity: Identity
+) -> None:
+    """List the presented session cookie as revoked until it would expire."""
+    payload = decode_session_token(request.cookies.get(settings.session_cookie) or "")
+    if payload is None:
+        return
+    now = datetime.now(UTC)
+    # Opportunistic pruning keeps the table at "sign-outs in the last TTL".
+    await session.execute(delete(RevokedSession).where(RevokedSession.expires_at < now))
+    jti = payload.get("jti")
+    if not jti:
+        # Issued before cookies carried an id, so it cannot be listed on its
+        # own: end every session of this user instead of leaving it valid.
+        user = identity.user
+        assert user is not None
+        user.session_version = (user.session_version or 0) + 1
+        return
+    expires = datetime.fromtimestamp(int(payload.get("exp") or 0), UTC)
+    if expires > now and await session.get(RevokedSession, str(jti)[:64]) is None:
+        session.add(RevokedSession(jti=str(jti)[:64], expires_at=expires))
+
+
+@router.post("/logout-everywhere")
+async def logout_everywhere(
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+    identity: Identity = Depends(require_primary_credential),
+) -> dict:
+    """End every browser session of this account, this one included.
+
+    API tokens are not affected; revoke those individually.
+    """
+    user = identity.user
+    assert user is not None
+    user.session_version = (user.session_version or 0) + 1
+    await audit.record_audit(
+        session,
+        audit.LOGOUT_EVERYWHERE,
+        actor_user_id=user.id,
+        actor_username=user.username,
+        ip=client_ip(request),
+    )
+    await session.commit()
+    response.delete_cookie(settings.session_cookie, path="/")
+    return {"ok": True}
+
+
 @router.get("/me")
 async def me(identity: Identity = Depends(require_user)) -> dict:
     assert identity.user is not None
     return {
         "user": _user_payload(identity.user),
         "auth_method": identity.method,
-        "scopes": (identity.token.scopes if identity.token else ["read", "publish", "admin"]),
+        "scopes": (
+            identity.token.scopes
+            if identity.token
+            else ["read"]
+            if identity.is_password_basic
+            else ["read", "publish", "admin"]
+        ),
     }
 
 
@@ -227,10 +299,27 @@ async def change_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="password is managed by the identity provider",
         )
+    # The current-password check is a password oracle for whoever holds the
+    # session (a stolen cookie, an unlocked laptop), so it is throttled and
+    # audited exactly like the login form, on the same buckets.
+    ip = client_ip(request)
+    started = await begin_login_attempt(ip or "unknown", user.username)
     if not verify_password(payload.current_password, user.password_hash):
+        await audit.record_audit(
+            session,
+            audit.LOGIN_FAILED,
+            actor_user_id=user.id,
+            actor_username=user.username,
+            success=False,
+            ip=ip,
+            user_agent=request.headers.get("user-agent"),
+            detail={"reason": "wrong current password", "method": "password change"},
+        )
+        await session.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="current password is incorrect"
         )
+    await forgive_login_attempt(ip or "unknown", user.username, started)
 
     # Everything signed in as this user stops working. Changing a password
     # after a suspected compromise has to actually eject the intruder.
@@ -242,7 +331,7 @@ async def change_password(
         "auth.password.changed",
         actor_user_id=user.id,
         actor_username=user.username,
-        ip=client_ip(request),
+        ip=ip,
     )
     await session.commit()
 
@@ -653,12 +742,40 @@ async def oidc_callback(
         ).scalars().all()
         # An ambiguous match is not a match. Email is not unique in this
         # schema, and picking one arbitrarily is how you link the wrong person.
-        if len(candidates) == 1:
+        if len(candidates) == 1 and candidates[0].is_active:
             user = candidates[0]
             user.oidc_issuer = profile.issuer
             user.oidc_subject = profile.subject
             user.provider = AuthProvider.oidc
+            # From here the identity provider decides who this is. A local
+            # password left in place kept working beside SSO -- after the
+            # IdP disabled the person or took them out of the required
+            # group -- and could no longer be changed or reset, since both
+            # paths refuse an OIDC account. Drop it, and every session it
+            # may have opened.
+            user.password_hash = None
+            user.session_version = (user.session_version or 0) + 1
             log.info("linked local account '%s' to OIDC subject", user.username)
+        elif len(candidates) == 1:
+            # A disabled account is not linked; it is refused below.
+            user = candidates[0]
+
+    # Disabled here means disabled, whatever the provider says. The callback
+    # used to audit a successful SSO login and hand out a cookie (one the
+    # session check then refused) for an account an admin had switched off.
+    if user is not None and not user.is_active:
+        await audit.record_audit(
+            session,
+            audit.LOGIN_FAILED,
+            actor_user_id=user.id,
+            actor_username=user.username,
+            success=False,
+            ip=ip,
+            user_agent=request.headers.get("user-agent"),
+            detail={"method": "oidc", "reason": "account disabled", "subject": profile.subject},
+        )
+        await session.commit()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account is disabled")
 
     created = False
     if user is None:
@@ -683,10 +800,17 @@ async def oidc_callback(
         created = True
 
     # Group membership is authoritative on every login, so revoking a group in
-    # Authentik takes effect immediately here.
+    # Authentik takes effect immediately here. Admins may publish; when that
+    # is the only reason this account can, demotion takes it away again --
+    # it used to stay, so a demoted admin kept publishing.
     user.is_admin = profile.is_admin
     if profile.is_admin:
-        user.can_publish = True
+        if not user.can_publish:
+            user.can_publish = True
+            user.publish_via_oidc_admin = True
+    elif user.publish_via_oidc_admin:
+        user.can_publish = False
+        user.publish_via_oidc_admin = False
     user.email = profile.email or user.email
     user.full_name = profile.full_name or user.full_name
     user.last_login_at = datetime.now(UTC)

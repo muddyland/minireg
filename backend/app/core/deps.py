@@ -6,6 +6,7 @@ Client credential shapes we must accept, because the tooling is not negotiable:
 * pip  -> ``Authorization: Basic base64("__token__:<token>")`` (PyPI convention)
          and ``Basic base64("<user>:<token>")``
 * twine -> same as pip
+* cargo -> ``Authorization: <token>`` (no scheme, RFC 3139)
 * UI   -> session JWT in an HttpOnly cookie
 """
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import ipaddress
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -23,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..core.cache import rate_limit, rate_limit_retry_after
+from ..core.cache import rate_limit, rate_limit_refund, rate_limit_retry_after
 from ..core.security import (
     decode_session_token,
     extract_bearer,
@@ -32,9 +34,18 @@ from ..core.security import (
     verify_token_secret,
 )
 from ..db import get_session
-from ..models import ApiToken, User
+from ..models import ApiToken, AuthProvider, RevokedSession, User
 
 log = logging.getLogger(__name__)
+
+
+#: Identity.method for an account password sent over HTTP Basic.
+PASSWORD_BASIC = "basic_password"
+#: Why a password-over-Basic request was refused something beyond reading.
+PASSWORD_BASIC_READ_ONLY = (
+    "an account password over HTTP Basic is read-only; use an API token "
+    "(or sign in in the browser) for this"
+)
 
 
 @dataclass(slots=True)
@@ -43,7 +54,7 @@ class Identity:
 
     user: User | None = None
     token: ApiToken | None = None
-    method: str = "anonymous"  # session|token|basic|anonymous
+    method: str = "anonymous"  # session|token|basic|basic_password|anonymous
 
     @property
     def is_authenticated(self) -> bool:
@@ -65,10 +76,25 @@ class Identity:
     def token_id(self) -> int | None:
         return self.token.id if self.token else None
 
+    @property
+    def is_password_basic(self) -> bool:
+        """An account password sent over HTTP Basic, not a token."""
+        return self.method == PASSWORD_BASIC
+
     def has_scope(self, scope: str) -> bool:
-        """Session logins carry full user authority; tokens are scope-limited."""
+        """Session logins carry full user authority; tokens are scope-limited.
+
+        An account password over HTTP Basic is read-only. It exists for
+        clients that cannot send a bearer token and only need to fetch;
+        publishing, admin actions and minting tokens need a token or a
+        browser session, as the docs have always promised. Treating it as a
+        session meant a password in a pip.conf could publish and mint itself
+        an admin token.
+        """
         if self.user is None:
             return False
+        if self.is_password_basic:
+            return scope == "read"
         if self.token is None:
             return True
         return self.token_has_scope(scope)
@@ -275,6 +301,66 @@ async def _token_identity(session: AsyncSession, presented: str) -> Identity | N
     return Identity(user=user, token=token, method="token")
 
 
+#: An account's failed logins from *all* addresses together may reach this
+#: many times RATE_LIMIT_LOGIN_PER_MINUTE before the account is throttled
+#: everywhere. Per address it is throttled at the plain limit.
+LOGIN_ACCOUNT_CEILING_FACTOR = 10
+
+
+def _login_buckets(ip: str, username: str) -> list[tuple[str, int]]:
+    """The fixed-window buckets one password attempt is counted in.
+
+    Per address, so one source cannot guess at many accounts; per account
+    *and* address, so one source cannot guess at one account; and per
+    account overall at a much higher ceiling, so a botnet spreading guesses
+    over many addresses is still capped. The account bucket used to be the
+    plain limit on its own: ten wrong guesses a minute from anywhere locked
+    the real owner out of every client.
+    """
+    per_minute = settings.rate_limit_login_per_minute
+    name = username[:150]
+    return [
+        (f"login:ip:{ip}", per_minute),
+        (f"login:user:{name}:ip:{ip}", per_minute),
+        (f"login:user:{name}", per_minute * LOGIN_ACCOUNT_CEILING_FACTOR),
+    ]
+
+
+async def begin_login_attempt(
+    ip: str, username: str, *, detail: str = "too many login attempts"
+) -> float:
+    """Count a password attempt against the login buckets, or raise 429.
+
+    The attempt is counted *before* the password is checked, so a burst of
+    concurrent guesses cannot all pass the limit before any is counted. Call
+    :func:`forgive_login_attempt` with the returned timestamp when the
+    password turns out to be right: only failures stay counted, so a client
+    sending its password on every request never throttles itself. Fails
+    closed (an in-process counter) when the cache is down.
+    """
+    started = time.time()
+    taken: list[tuple[str, int]] = []
+    for key, limit in _login_buckets(ip, username):
+        allowed, _ = await rate_limit(key, limit, fail_closed=True, now=started)
+        taken.append((key, limit))
+        if not allowed:
+            # Refused before any password was checked: not an attempt.
+            for k, lim in taken:
+                await rate_limit_refund(k, lim, fail_closed=True, now=started)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=detail,
+                headers={"Retry-After": str(rate_limit_retry_after())},
+            )
+    return started
+
+
+async def forgive_login_attempt(ip: str, username: str, started: float) -> None:
+    """Un-count an attempt from :func:`begin_login_attempt` that succeeded."""
+    for key, limit in _login_buckets(ip, username):
+        await rate_limit_refund(key, limit, fail_closed=True, now=started)
+
+
 async def _basic_password_identity(
     session: AsyncSession, request: Request, username: str, password: str
 ) -> Identity:
@@ -284,33 +370,29 @@ async def _basic_password_identity(
     login endpoint's protections: without them it was an unthrottled,
     unlogged password oracle that also cost a full argon2 verify per guess.
 
-    The resulting identity is marked ``basic_password`` and carries no token,
-    which :meth:`Identity.has_scope` treats as full user authority. That is
-    correct for a password -- it is the user's primary credential -- but it is
-    also why the guessing has to be as expensive here as it is at /auth/login.
+    The resulting identity is marked ``basic_password`` and carries no token.
+    :meth:`Identity.has_scope` grants it ``read`` and nothing else, and
+    :func:`require_primary_credential` refuses it, so a password sent this
+    way can fetch packages but cannot publish, administer or mint tokens.
     """
-    from ..core.cache import rate_limit
     from ..core.security import verify_password
     from ..services.audit import LOGIN_FAILED, record_audit
 
     ip = client_ip(request) or "unknown"
-    for key, limit in (
-        (f"login:ip:{ip}", settings.rate_limit_login_per_minute),
-        (f"login:user:{username[:150]}", settings.rate_limit_login_per_minute),
-    ):
-        allowed, _ = await rate_limit(key, limit, fail_closed=True)
-        if not allowed:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="too many login attempts",
-                headers={"Retry-After": str(rate_limit_retry_after())},
-            )
+    started = await begin_login_attempt(ip, username)
 
     user = (
         await session.execute(select(User).where(User.username == username))
     ).scalar_one_or_none()
-    if user and user.is_active and verify_password(password, user.password_hash):
-        return Identity(user=user, method="basic_password")
+    # Verify before looking at anything else, so an unknown or disabled
+    # account costs the same argon2 work as a real one. Skipping it answered
+    # unknown names in microseconds, which enumerates accounts.
+    password_ok = verify_password(password, user.password_hash if user else None)
+    # An SSO account's password is not ours to check: the identity provider
+    # decides who may sign in, and a leftover local password bypassed it.
+    if user and user.is_active and password_ok and user.provider == AuthProvider.local:
+        await forgive_login_attempt(ip, username, started)
+        return Identity(user=user, method=PASSWORD_BASIC)
 
     with contextlib.suppress(Exception):
         await record_audit(
@@ -322,6 +404,19 @@ async def _basic_password_identity(
             detail={"method": "basic"},
         )
     return Identity()
+
+
+async def session_revoked(session: AsyncSession, payload: dict) -> bool:
+    """Whether this session cookie was signed out (see RevokedSession).
+
+    Cookies issued before sessions carried a ``jti`` cannot be listed; they
+    run out within SESSION_TTL_SECONDS of the upgrade, and signing one out
+    falls back to ending all of the user's sessions.
+    """
+    jti = payload.get("jti")
+    if not jti:
+        return False
+    return await session.get(RevokedSession, str(jti)[:64]) is not None
 
 
 async def resolve_identity(
@@ -359,6 +454,14 @@ async def resolve_identity(
                 return await _basic_password_identity(session, request, username, password)
             return Identity()
 
+        # Cargo (RFC 3139) sends the token as the whole header value, with
+        # no scheme. Anything shaped like one of our tokens is tried as one;
+        # other unknown schemes stay anonymous.
+        raw = auth_header.strip()
+        if raw.startswith(f"{settings.token_prefix}_") and " " not in raw:
+            identity = await _token_identity(session, raw)
+            return identity or Identity()
+
         # An Authorization scheme we do not implement.
         return Identity()
 
@@ -370,7 +473,12 @@ async def resolve_identity(
             # The version in the cookie must still match the user row: a
             # password change or a sign-out-everywhere bumps it, which is what
             # makes a stateless session revocable.
-            if user and user.is_active and payload.get("sv", 0) == user.session_version:
+            if (
+                user
+                and user.is_active
+                and payload.get("sv", 0) == user.session_version
+                and not await session_revoked(session, payload)
+            ):
                 # The cookie is the one credential a browser attaches on its
                 # own, so it is the only one a cross-site request can ride.
                 reject_cross_site(request)
@@ -486,6 +594,8 @@ async def require_admin(identity: Identity = Depends(resolve_identity)) -> Ident
         )
     if not identity.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin privileges required")
+    if identity.is_password_basic:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PASSWORD_BASIC_READ_ONLY)
     if not identity.has_scope("admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="token lacks the 'admin' scope"
@@ -504,6 +614,9 @@ async def require_primary_credential(
     asking for ``admin`` and be handed one, because the check only ever looked
     at whether the *owner* was an admin. Scoping a token is only meaningful if
     the token cannot widen itself.
+
+    An account password over HTTP Basic is refused too: it is read-only, and
+    a password lifted from a client config must not be able to mint tokens.
     """
     if identity.user is None:
         raise HTTPException(
@@ -511,6 +624,8 @@ async def require_primary_credential(
             detail="authentication required",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if identity.is_password_basic:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PASSWORD_BASIC_READ_ONLY)
     if identity.token is not None and not identity.token_has_scope("admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -529,6 +644,11 @@ async def require_publish(identity: Identity = Depends(resolve_identity)) -> Ide
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="an API token is required to publish",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+    if identity.is_password_basic:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="account passwords cannot publish; use an API token with the 'publish' scope",
         )
     if not identity.can_publish:
         raise HTTPException(

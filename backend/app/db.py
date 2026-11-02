@@ -108,6 +108,20 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "require_digest", "BOOLEAN NOT NULL DEFAULT TRUE"),
     ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
     ("api_tokens", "docker_repo_prefixes", "JSONB"),
+    ("users", "publish_via_oidc_admin", "BOOLEAN NOT NULL DEFAULT FALSE"),
+]
+
+# One-off corrections to existing rows, applied at startup after the columns
+# above exist. Each must be idempotent (a no-op once applied) and portable
+# between SQLite and PostgreSQL.
+DATA_FIXES: list[str] = [
+    # An OIDC login used to link a local account by email but leave its
+    # password in place, so the password kept working beside SSO -- past an
+    # IdP group removal or a disabled IdP account. Linked accounts sign in
+    # through the provider only; their old password and every session that
+    # may have come from it go.
+    "UPDATE users SET password_hash = NULL, session_version = session_version + 1 "
+    "WHERE provider = 'oidc' AND password_hash IS NOT NULL",
 ]
 
 
@@ -117,11 +131,11 @@ async def create_schema() -> None:
 
     Kept idempotent so container restarts are safe.
     """
+    from sqlalchemy import text
+
     engine = get_engine()
     async with engine.begin() as conn:
         if engine.dialect.name == "postgresql":
-            from sqlalchemy import text
-
             # Replicas all run this on boot. Concurrent CREATE ... IF NOT
             # EXISTS is not actually safe in Postgres -- two sessions can both
             # pass the existence check and one then fails on a duplicate --
@@ -132,13 +146,15 @@ async def create_schema() -> None:
         await conn.run_sync(Base.metadata.create_all)
 
         if engine.dialect.name == "postgresql":
-            from sqlalchemy import text
-
             for table, column, coltype in ADDITIVE_COLUMNS:
                 await conn.execute(
                     text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {coltype}")
                 )
 
+        for stmt in DATA_FIXES:
+            await conn.execute(text(stmt))
+
+        if engine.dialect.name == "postgresql":
             # Trigram index powers substring package search without a full scan.
             for stmt in (
                 # Matches the index create_all builds from `index=True` on
