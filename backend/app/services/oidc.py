@@ -365,6 +365,22 @@ def _extract_groups(claims: dict) -> list[str]:
     return []
 
 
+def _claim_is_true(value: object) -> bool:
+    """A boolean claim, read strictly.
+
+    ``bool()`` made any non-empty string true, so a provider (or a claim
+    mapping) that sends ``"false"`` -- some do send JSON strings -- counted as
+    a verified email, which is what lets an OIDC login link onto an existing
+    account. Only ``true`` itself, or the string ``"true"`` in any case,
+    counts.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return False
+
+
 def build_profile(claims: dict, userinfo: dict | None = None) -> OidcProfile:
     merged = {**(userinfo or {}), **claims}
     # Groups may live in either document; union them.
@@ -389,7 +405,7 @@ def build_profile(claims: dict, userinfo: dict | None = None) -> OidcProfile:
         email=merged.get("email"),
         # Only a provider-asserted verified email may be used to link an
         # existing local account; see the callback in api/auth.py.
-        email_verified=bool(merged.get("email_verified")),
+        email_verified=_claim_is_true(merged.get("email_verified")),
         full_name=merged.get("name") or merged.get("given_name"),
         groups=groups,
         raw_claims=merged,

@@ -427,3 +427,43 @@ class TestLinkedAccountsLoseTheirPassword:
         assert (await user_row("publisher")).session_version == version + 1
         # Local accounts keep their passwords.
         assert (await user_row("admin")).password_hash
+
+
+class TestEmailVerifiedIsReadStrictly:
+    """email_verified went through bool(), so the string "false" counted as
+    verified and linked the attacker's subject onto the matching account."""
+
+    @pytest.mark.parametrize(
+        ("value", "verified"),
+        [
+            (True, True),
+            ("true", True),
+            ("TRUE", True),
+            (False, False),
+            ("false", False),
+            ("False", False),
+            ("0", False),
+            ("no", False),
+            (1, False),
+            (None, False),
+            ({}, False),
+        ],
+    )
+    def test_claim_values(self, value, verified):
+        from app.services.oidc import build_profile
+
+        claims = {"sub": "s", "iss": "https://idp.example", "email": "x@test"}
+        if value is not None:
+            claims["email_verified"] = value
+        assert build_profile(claims, {}).email_verified is verified
+
+    async def test_string_false_does_not_link(self, app_client, provider):
+        provider.update(
+            {"sub": "evil", "preferred_username": "evil", "email": "admin@test", "email_verified": "false"}
+        )
+        assert (await sso(app_client)).status_code == 302
+        admin = await user_row("admin")
+        assert admin.oidc_subject is None
+        assert admin.provider == AuthProvider.local
+        # A separate account was made for the subject instead.
+        assert (await user_row("evil")).oidc_subject == "evil"
