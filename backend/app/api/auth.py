@@ -240,10 +240,27 @@ async def change_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="password is managed by the identity provider",
         )
+    # The current-password check is a password oracle for whoever holds the
+    # session (a stolen cookie, an unlocked laptop), so it is throttled and
+    # audited exactly like the login form, on the same buckets.
+    ip = client_ip(request)
+    started = await begin_login_attempt(ip or "unknown", user.username)
     if not verify_password(payload.current_password, user.password_hash):
+        await audit.record_audit(
+            session,
+            audit.LOGIN_FAILED,
+            actor_user_id=user.id,
+            actor_username=user.username,
+            success=False,
+            ip=ip,
+            user_agent=request.headers.get("user-agent"),
+            detail={"reason": "wrong current password", "method": "password change"},
+        )
+        await session.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="current password is incorrect"
         )
+    await forgive_login_attempt(ip or "unknown", user.username, started)
 
     # Everything signed in as this user stops working. Changing a password
     # after a suspected compromise has to actually eject the intruder.
@@ -255,7 +272,7 @@ async def change_password(
         "auth.password.changed",
         actor_user_id=user.id,
         actor_username=user.username,
-        ip=client_ip(request),
+        ip=ip,
     )
     await session.commit()
 

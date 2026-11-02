@@ -192,7 +192,8 @@ be correct, which is what the nginx snippet in
 [installation](installation.md) does.
 
 `RATE_LIMIT_LOGIN_PER_MINUTE` counts **failed** password attempts (the login
-form and HTTP Basic with a password); a correct password is not counted, so a client that sends its
+form, HTTP Basic with a password, and the current-password check when
+changing it); a correct password is not counted, so a client that sends its
 password on every request never throttles itself. Failures are capped per
 client address, per account from one address, and per account from all
 addresses together at ten times the limit. Someone guessing at your username

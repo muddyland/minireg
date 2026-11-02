@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from app import db as db_module
 from app.config import settings
 from app.core import cache, security
-from app.models import ApiToken, Package, User
+from app.models import ApiToken, AuditLog, Package, User
 from tests import test_integration as _integration
 from tests.test_integration import auth, npm_publish_body
 
@@ -47,6 +47,29 @@ async def count(model, *where) -> int:
         if where:
             stmt = stmt.where(*where)
         return (await session.execute(stmt)).scalar_one()
+
+
+@pytest.fixture
+def login_throttle(monkeypatch):
+    """Login limiting on, on the in-process fallback, in a frozen window.
+
+    The clock is pinned a second into a window: the counters reset on every
+    minute boundary, and a test that crossed one would see its count vanish.
+    """
+    import time
+
+    monkeypatch.setattr(settings, "rate_limit_enabled", True)
+    monkeypatch.setattr(settings, "rate_limit_login_per_minute", 3)
+    start = (int(time.time()) // 60) * 60 + 1.0
+    monkeypatch.setattr(cache.time, "time", lambda: start)
+
+    async def no_cache():
+        return None
+
+    monkeypatch.setattr(cache, "ensure_redis", no_cache)
+    cache._local_counters.clear()
+    yield
+    cache._local_counters.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -187,18 +210,8 @@ class TestLoginThrottleCountsOnlyFailures:
     real user out of every client."""
 
     @pytest.fixture(autouse=True)
-    def throttled(self, monkeypatch):
-        monkeypatch.setattr(settings, "rate_limit_enabled", True)
-        monkeypatch.setattr(settings, "rate_limit_login_per_minute", 3)
-
-        async def no_cache():
-            return None
-
-        # The in-process fallback the login buckets use with the cache down.
-        monkeypatch.setattr(cache, "ensure_redis", no_cache)
-        cache._local_counters.clear()
-        yield
-        cache._local_counters.clear()
+    def throttled(self, login_throttle):
+        return login_throttle
 
     @staticmethod
     def frm(ip):
@@ -265,3 +278,44 @@ class TestLoginThrottleCountsOnlyFailures:
             "/api/auth/me", headers={**password_basic(), **self.frm("198.51.100.8")}
         )
         assert resp.status_code == 429
+
+
+# --------------------------------------------------------------------------- #
+class TestChangePasswordIsThrottled:
+    """POST /api/auth/password checked the current password with no limit
+    and no audit row, so a stolen session cookie was an unlimited, silent
+    oracle for the account's password."""
+
+    async def test_wrong_guesses_are_throttled_and_audited(self, app_client, login_throttle):
+        await login(app_client)
+        codes = []
+        for n in range(4):
+            resp = await app_client.post(
+                "/api/auth/password",
+                json={"current_password": f"guess-{n}", "new_password": "a-new-password-123"},
+                headers=SAME_ORIGIN,
+            )
+            codes.append(resp.status_code)
+        assert codes == [401, 401, 401, 429]
+        async with db_module.session_scope() as session:
+            rows = (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "auth.login.failed",
+                        AuditLog.actor_username == "publisher",
+                    )
+                )
+            ).scalars().all()
+        assert len(rows) == 3
+        assert all(r.detail["method"] == "password change" for r in rows)
+
+    async def test_the_right_password_still_changes_it(self, app_client):
+        await login(app_client)
+        resp = await app_client.post(
+            "/api/auth/password",
+            json={"current_password": "publisher-password-1", "new_password": "a-new-password-123"},
+            headers=SAME_ORIGIN,
+        )
+        assert resp.status_code == 200
+        app_client.cookies.clear()
+        await login(app_client, password="a-new-password-123")
