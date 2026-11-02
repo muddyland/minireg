@@ -337,10 +337,21 @@ async def get_dist_tags(
     if verdict.blocked:
         return npm_error(verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
 
-    # A tag pointing at a blocked version is a download the client is about to
-    # be refused, so filter the same set the packument filters. `latest` is
-    # re-pointed at the newest version that survives rather than dropped, which
-    # is what lets `npm install pkg` degrade to an installable release.
+    return json_response(await _visible_dist_tags(session, policy, package))
+
+
+async def _visible_dist_tags(
+    session: AsyncSession, policy: PolicyEngine, package: Package
+) -> dict[str, str]:
+    """The dist-tags as the packument serves them.
+
+    A tag pointing at a blocked version is a download the client is about to
+    be refused, so filter the same set the packument filters. `latest` is
+    re-pointed at the newest version that survives rather than dropped, which
+    is what lets `npm install pkg` degrade to an installable release. The
+    dist-tags endpoint and `GET /{pkg}/{tag}` both answer from this map, so
+    neither can disagree with the packument about where a tag points.
+    """
     version_rows = await _version_columns(session, package.id)
     blocked = await _blocked_from_rows(policy, package.normalized_name, version_rows)
     tags = {t.tag: t.version for t in package.dist_tags if t.version not in blocked}
@@ -349,7 +360,7 @@ async def get_dist_tags(
         fallback = max_semver(survivors) if survivors else None
         if fallback:
             tags["latest"] = fallback
-    return json_response(tags)
+    return tags
 
 
 @router.put("/-/package/{package_name:path}/dist-tags/{tag}")
@@ -1528,19 +1539,27 @@ async def _version_response(
             )
         ).scalar_one_or_none()
 
+    policy = PolicyEngine(session)
     resolved = version
     version_row = await load_version(version)
     if version_row is None:
-        # A dist-tag is also accepted here, e.g. GET /lodash/latest.
-        tag = next((t for t in package.dist_tags if t.tag == version), None)
-        resolved = tag.version if tag else (package.latest_version if version == "latest" else None)
+        # A dist-tag is also accepted here, e.g. GET /lodash/latest. It
+        # resolves through the same policy-filtered map the packument and
+        # the dist-tags endpoint serve: resolving the raw tag answered 403
+        # for `latest` while both of those pointed it at a surviving release.
+        tags = await _visible_dist_tags(session, policy, package)
+        resolved = tags.get(version)
+        if resolved is None:
+            # A tag whose target is blocked is gone from that map; resolve it
+            # raw so the policy check below explains the refusal.
+            resolved = next((t.version for t in package.dist_tags if t.tag == version), None)
         if resolved is None:
             return npm_error("version not found", status.HTTP_404_NOT_FOUND)
         version_row = await load_version(resolved)
     if version_row is None:
         return npm_error("version not found", status.HTTP_404_NOT_FOUND)
 
-    verdict = await PolicyEngine(session).evaluate(
+    verdict = await policy.evaluate(
         ECOSYSTEM,
         package.normalized_name,
         resolved,

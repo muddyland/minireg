@@ -108,3 +108,51 @@ async def test_publish_document_dist_tags_follow_the_same_rules(env):
         assert response.status_code == 400, (tag, response.text)
     # Nothing was created by the refused publishes.
     assert (await client.get("/npm/doctags")).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# GET /{pkg}/{tag} agrees with the packument
+# --------------------------------------------------------------------------- #
+async def _block(pattern: str, version_spec: str) -> None:
+    from app.models import Ecosystem, PackageRule, RuleAction
+
+    async with db_module.session_scope() as session:
+        session.add(
+            PackageRule(
+                ecosystem=Ecosystem.npm,
+                pattern=pattern,
+                action=RuleAction.block,
+                version_spec=version_spec,
+                reason=f"blocked {pattern}@{version_spec}",
+            )
+        )
+    await invalidate_policy_cache()
+
+
+async def test_version_route_resolves_latest_like_the_packument(env):
+    """With `latest` blocked, the packument and the dist-tags endpoint point
+    it at the newest surviving release, but GET /pkg/latest answered 403."""
+    client, tokens = env
+    as_user(client, tokens["alice"])
+    for version in ("1.0.0", "2.0.0"):
+        assert (await client.put("/npm/vdoc", json=publish_body("vdoc", version))).status_code == 201
+    body = publish_body("vdoc", "3.0.0-rc.1")
+    body["dist-tags"] = {"next": "3.0.0-rc.1"}
+    assert (await client.put("/npm/vdoc", json=body)).status_code == 201
+    await _block("vdoc", "2.0.0 || 3.0.0-rc.1")
+
+    packument = (await client.get("/npm/vdoc")).json()
+    assert packument["dist-tags"] == {"latest": "1.0.0"}
+    assert (await client.get("/npm/-/package/vdoc/dist-tags")).json() == {"latest": "1.0.0"}
+
+    latest = await client.get("/npm/vdoc/latest")
+    assert latest.status_code == 200, latest.text
+    assert latest.json()["version"] == "1.0.0"
+
+    # A blocked version asked for by number, or a tag that only names a
+    # blocked version, is still refused with the policy's reason.
+    assert (await client.get("/npm/vdoc/2.0.0")).status_code == 403
+    nxt = await client.get("/npm/vdoc/next")
+    assert nxt.status_code == 403
+    assert "blocked" in nxt.json()["error"]
+    assert (await client.get("/npm/vdoc/nonesuch")).status_code == 404
