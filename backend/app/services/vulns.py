@@ -53,6 +53,23 @@ def dedupe_by_cve(entries: list[dict]) -> list[dict]:
     return sorted(merged.values(), key=lambda e: e.get("cvss_score") or 0, reverse=True)
 
 
+def _installable_version(ecosystem: str, value) -> bool:
+    """A fixed version a client may be told to upgrade to.
+
+    It comes from advisory data, and the CLI writes it into requirements.txt
+    and package.json and prints it inside `cargo update` commands. Anything
+    that is not a well-formed version for the ecosystem -- a newline, a quote
+    or a shell metacharacter included -- is dropped here rather than offered.
+    """
+    from ..core.naming import is_valid_semver, parse_pypi_version
+
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if ecosystem == "pypi":
+        return parse_pypi_version(value) is not None
+    return is_valid_semver(value)
+
+
 def lowest_clearing_version(
     ecosystem: str, cves: list[dict], current_version: str | None = None
 ) -> str | None:
@@ -63,7 +80,9 @@ def lowest_clearing_version(
     lowest. Returns None when no CVE names a fix -- there is nothing to
     upgrade to -- or when the current version already clears them all.
     """
-    fixes = [c["fixed_version"] for c in cves if c.get("fixed_version")]
+    fixes = [
+        c["fixed_version"] for c in cves if _installable_version(ecosystem, c.get("fixed_version"))
+    ]
     if not fixes:
         return None
 

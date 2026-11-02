@@ -130,6 +130,8 @@ index-url = https://__token__:<token>@registry.example.com/pypi/simple/
 
 Over plain HTTP add `trusted-host = registry.example.com` to silence pip's
 warning. Do this only on a trusted network; the token is in cleartext.
+Never add it for an https registry: for https, `trusted-host` makes pip skip
+certificate verification.
 
 ### uv
 
@@ -219,7 +221,10 @@ replace-with = "minireg"
 registry = "sparse+https://registry.example.com/cargo/index/"
 ```
 
-Then `cargo build` as usual. `minireg configure` writes exactly this block.
+Then `cargo build` as usual. `minireg configure` writes the equivalent with
+`[registries.minireg]` in place of `[source.minireg]`, plus your token in
+`~/.cargo/credentials.toml`, because cargo only attaches a credential to a
+registry entry (see [the CLI](cli.md#configuring-package-managers)).
 
 Two details are load-bearing:
 

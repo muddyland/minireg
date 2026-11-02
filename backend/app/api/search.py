@@ -229,7 +229,14 @@ async def client_config(identity: Identity = Depends(require_user)) -> dict:
     the configured public URL rather than documenting them statically.
     """
     base = settings.public_url
-    host = base.split("://", 1)[-1]
+    scheme, _, host = base.partition("://")
+    # pip's `trusted-host` is not just a warning silencer: for an https index
+    # it mounts an adapter that skips certificate verification. Only a plain
+    # http registry needs it (pip refuses http indexes otherwise); on https it
+    # would let anyone on the path impersonate the registry.
+    pip_conf_lines = ["[global]", f"index-url = {base}/pypi/simple/"]
+    if scheme == "http":
+        pip_conf_lines.append(f"trusted-host = {host.split('/')[0].split(':')[0]}")
 
     return {
         "public_url": base,
@@ -249,18 +256,12 @@ async def client_config(identity: Identity = Depends(require_user)) -> dict:
         },
         "pip": {
             "index_url": f"{base}/pypi/simple/",
-            "pip_conf": "\n".join(
-                [
-                    "[global]",
-                    f"index-url = {base}/pypi/simple/",
-                    f"trusted-host = {host.split(':')[0]}",
-                ]
-            ),
+            "pip_conf": "\n".join(pip_conf_lines),
             "commands": [
                 f"pip config set global.index-url {base}/pypi/simple/",
                 f"pip install --index-url {base}/pypi/simple/ <package>",
             ],
-            "authenticated_index_url": f"https://__token__:<your-token>@{host}/pypi/simple/",
+            "authenticated_index_url": f"{scheme}://__token__:<your-token>@{host}/pypi/simple/",
         },
         "twine": {
             "repository_url": f"{base}/pypi/legacy/",

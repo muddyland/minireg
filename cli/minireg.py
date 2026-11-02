@@ -51,7 +51,7 @@ if sys.version_info < MIN_PYTHON:
     )
     raise SystemExit(1)
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 DEFAULT_TIMEOUT = 30
 USER_AGENT = f"minireg-cli/{__version__}"
@@ -100,6 +100,44 @@ def severity_colour(score):
     if score >= 4.0:
         return yellow
     return dim
+
+
+#: C0 controls other than tab and newline, DEL, and the C1 range. ESC (and its
+#: one-byte C1 form, CSI) starts the sequences a terminal acts on: OSC 52
+#: writes the clipboard, CSI 2K plus CR erases the line just printed (a
+#: BLOCKED marker, say), others retitle the window or remap keys.
+_CONTROL_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+#: Server fields the CLI prints as a block of lines rather than inline.
+_MULTILINE_FIELDS = frozenset({"containerd_hosts_toml"})
+
+
+def clean_text(text: str, multiline: bool = False) -> str:
+    """Server-supplied text made safe to print or write into a config file.
+
+    Package descriptions, CVE summaries, block reasons and image metadata all
+    come from upstream registries and advisories, i.e. from strangers. Only
+    tab survives, and newline where a field is meant to span lines; anywhere
+    else a newline would let the text forge lines of our own output.
+    """
+    text = _CONTROL_CHARS.sub("", text.replace("\r\n", "\n"))
+    return text if multiline else text.replace("\n", " ")
+
+
+def _clean_payload(value, key=None):
+    """Apply :func:`clean_text` to every string in a decoded API response.
+
+    Done once, where responses enter the CLI, so no print site (present or
+    future) can forget it. --json output is unaffected in substance: JSON
+    would have escaped these characters anyway.
+    """
+    if isinstance(value, str):
+        return clean_text(value, multiline=key in _MULTILINE_FIELDS)
+    if isinstance(value, list):
+        return [_clean_payload(item, key) for item in value]
+    if isinstance(value, dict):
+        return {clean_text(str(k)): _clean_payload(v, k) for k, v in value.items()}
+    return value
 
 
 def die(message: str, code: int = 1):
@@ -228,7 +266,7 @@ def api(
                 response.headers.get(CLI_VERSION_HEADER) or _server_cli_version
             )
             payload = response.read()
-            return json.loads(payload) if payload else None
+            return _clean_payload(json.loads(payload)) if payload else None
     except urllib.error.HTTPError as exc:
         _server_cli_version = exc.headers.get(CLI_VERSION_HEADER) or _server_cli_version
         raw = exc.read()
@@ -238,6 +276,9 @@ def api(
             detail = parsed.get("detail") or parsed.get("error") or parsed.get("message")
         except Exception:
             detail = raw.decode("utf-8", "replace")[:300] or exc.reason
+        if detail:
+            # Not always a string: FastAPI's 422 detail is a list of objects.
+            detail = clean_text(detail if isinstance(detail, str) else str(detail))
         raise ApiError(exc.code, detail) from exc
     except urllib.error.URLError as exc:
         raise ApiError(0, f"could not reach {registry}: {exc.reason}") from exc
@@ -372,22 +413,17 @@ def _npmrc_path() -> Path:
     return Path.home() / ".npmrc"
 
 
-def _upsert_lines(path: Path, lines: list[str], marker: str) -> None:
-    """Replace our managed block, leaving anything else in the file alone."""
-    begin = f"# >>> {marker} >>>"
-    end = f"# <<< {marker} <<<"
-    block = "\n".join([begin, *lines, end])
+def _markers(marker: str) -> tuple[str, str]:
+    return f"# >>> {marker} >>>", f"# <<< {marker} <<<"
 
-    existing = path.read_text() if path.is_file() else ""
-    if begin in existing and end in existing:
-        pattern = re.compile(
-            re.escape(begin) + r".*?" + re.escape(end), re.DOTALL
-        )
-        updated = pattern.sub(block, existing)
-    else:
-        separator = "" if not existing or existing.endswith("\n") else "\n"
-        updated = f"{existing}{separator}{block}\n"
 
+def _without_block(existing: str, marker: str) -> str:
+    """``existing`` with our managed block (and its line break) cut out."""
+    begin, end = _markers(marker)
+    return re.sub(re.escape(begin) + r".*?" + re.escape(end) + r"\n?", "", existing, flags=re.DOTALL)
+
+
+def _write_private(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Create with 0600 from the start. Writing then chmod'ing leaves the file
     # world-readable for the moment in between, and these files hold an API
@@ -397,13 +433,108 @@ def _upsert_lines(path: Path, lines: list[str], marker: str) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w") as handle:
-            handle.write(updated)
+            handle.write(text)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
     os.chmod(path, 0o600)
+
+
+def _upsert_lines(path: Path, lines: list[str], marker: str) -> None:
+    """Replace our managed block, leaving anything else in the file alone."""
+    begin, end = _markers(marker)
+    block = "\n".join([begin, *lines, end])
+
+    existing = path.read_text() if path.is_file() else ""
+    if begin in existing and end in existing:
+        pattern = re.compile(
+            re.escape(begin) + r".*?" + re.escape(end), re.DOTALL
+        )
+        # A function, not a replacement string: a backslash in the block
+        # (a token from MINIREG_TOKEN, say) must not be read as an escape.
+        updated = pattern.sub(lambda _m: block, existing)
+    else:
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        updated = f"{existing}{separator}{block}\n"
+    _write_private(path, updated)
+
+
+_INI_SECTION_RE = re.compile(r"^\s*\[([^\]]*)\]")
+_INI_OPTION_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)\s*[=:]")
+
+
+def _ini_key(name: str) -> str:
+    # pip reads `index_url` and `index-url` as the same option.
+    return name.strip().lower().replace("_", "-")
+
+
+def plan_pip_conf(existing: str, settings: list[str], marker: str = "minireg"):
+    """``existing`` pip.conf with ``settings`` in our block under ``[global]``.
+
+    pip reads the file with configparser, where an option belongs to the
+    section above it. The block used to be appended at the end of the file,
+    which put index-url in whatever section came last (``[freeze]``,
+    ``[install]``) whenever the file had one after ``[global]``. It now goes
+    directly under the ``[global]`` header, or at the end with its own header
+    when there is none. Returns ``(text, None)``, or ``(None, conflict)``
+    when the user's own ``[global]`` already sets one of these options: a
+    second copy is a DuplicateOptionError, which stops pip reading its config
+    at all.
+    """
+    begin, end = _markers(marker)
+    outside = _without_block(existing, marker)
+    lines = outside.splitlines(keepends=True)
+    header = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if (m := _INI_SECTION_RE.match(line)) and m.group(1).strip() == "global"
+        ),
+        None,
+    )
+    if header is None:
+        separator = "" if not outside or outside.endswith("\n") else "\n"
+        block = "\n".join([begin, "[global]", *settings, end])
+        return f"{outside}{separator}{block}\n", None
+
+    ours = {_ini_key(s.split("=", 1)[0]) for s in settings}
+    for line in lines[header + 1 :]:
+        if _INI_SECTION_RE.match(line):
+            break
+        option = _INI_OPTION_RE.match(line)
+        if option and _ini_key(option.group(1)) in ours:
+            return None, option.group(1)
+
+    if not lines[header].endswith("\n"):
+        lines[header] += "\n"
+    lines.insert(header + 1, "\n".join([begin, *settings, end]) + "\n")
+    return "".join(lines), None
+
+
+def _toml_conflict(path: Path, lines: list[str]) -> bool:
+    """True (and says so) when ``path`` already defines, outside our block, a
+    table our block defines. TOML forbids defining a table twice, and cargo
+    then refuses to read its config at all."""
+    if not path.is_file():
+        return False
+    outside = _without_block(path.read_text(), "minireg")
+    ours = {line.strip() for line in lines if line.strip().startswith("[")}
+    theirs = {
+        line.split("#", 1)[0].strip()
+        for line in outside.splitlines()
+        if line.strip().startswith("[")
+    }
+    clash = sorted(ours & theirs)
+    if clash:
+        info(
+            yellow(
+                f"  {path} already has {', '.join(clash)}; cargo not configured. "
+                "Remove it and re-run."
+            )
+        )
+    return bool(clash)
 
 
 def cmd_configure(args):
@@ -430,9 +561,14 @@ def cmd_configure(args):
 
     host = registry.split("://", 1)[-1]
     changed = []
+    # Every URL is built from the address given to `minireg login` (as
+    # configure_docker does), not taken from the server's PUBLIC_URL. The
+    # credentials below are scoped to that address; behind a split horizon or
+    # a port-forward PUBLIC_URL names another host, and npm would then send
+    # no token to the registry it was told to use.
 
     if "npm" in wanted:
-        lines = [f"registry={client['npm']['registry']}"]
+        lines = [f"registry={registry}/npm/"]
         if token:
             lines.append(f"//{host}/npm/:_authToken={token}")
         else:
@@ -447,56 +583,75 @@ def cmd_configure(args):
         pip_conf = Path(
             os.environ.get("XDG_CONFIG_HOME") or os.path.join(Path.home(), ".config")
         ) / "pip" / "pip.conf"
-        index_url = client["pip"]["index_url"]
+        index_url = f"{registry}/pypi/simple/"
         if token:
             # pip has no auth-token header; credentials go in the URL.
             scheme, _, rest = index_url.partition("://")
             index_url = f"{scheme}://__token__:{urllib.parse.quote(token, safe='')}@{rest}"
         # A second `[global]` section makes configparser raise
-        # DuplicateSectionError, which breaks pip completely -- so only emit
-        # the header when the file does not already have one outside our block.
+        # DuplicateSectionError, which breaks pip completely; plan_pip_conf
+        # puts our lines under the existing header instead.
         existing_conf = pip_conf.read_text() if pip_conf.is_file() else ""
-        outside = re.sub(
-            r"# >>> minireg >>>.*?# <<< minireg <<<", "", existing_conf, flags=re.DOTALL
-        )
-        lines = []
-        if not re.search(r"^\s*\[global\]", outside, re.M):
-            lines.append("[global]")
-        lines.append(f"index-url = {index_url}")
+        lines = [f"index-url = {index_url}"]
         if registry.startswith("http://"):
-            lines.append(f"trusted-host = {host.split(':')[0]}")
-        if args.dry_run:
+            lines.append(f"trusted-host = {urllib.parse.urlsplit(registry).hostname}")
+        updated, conflict = plan_pip_conf(existing_conf, lines)
+        if updated is None:
+            info(
+                yellow(
+                    f"  {pip_conf} already sets {conflict} under [global]; not changed. "
+                    "Remove that line and re-run, or point it at the registry yourself."
+                )
+            )
+        elif args.dry_run:
             print(f"\n{bold(str(pip_conf))}\n" + "\n".join(lines))
         else:
-            _upsert_lines(pip_conf, lines, "minireg")
+            _write_private(pip_conf, updated)
             changed.append(str(pip_conf))
 
     if "cargo" in wanted:
-        cargo_conf = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo")) / "config.toml"
+        cargo_home = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo"))
+        cargo_conf = cargo_home / "config.toml"
+        cargo_creds = cargo_home / "credentials.toml"
         cargo = client.get("cargo")
         if not cargo:
             info(dim("  registry does not serve a cargo index; skipping"))
         else:
-            # Source replacement, not a `[registries]` entry: it redirects every
-            # crates.io dependency without editing a single Cargo.toml. No token
-            # is written -- cargo only sends credentials to an index that
-            # declares `auth-required`, and a read-only mirror does not.
+            # Source replacement redirects every crates.io dependency without
+            # editing a single Cargo.toml. The replacement is a `[registries]`
+            # entry rather than a `[source]` one because only a registry can
+            # carry a credential: with anonymous reads off, cargo refuses a
+            # `[source.minireg]` ("authenticated registries require a
+            # credential-provider"), even with `[registries.minireg]` beside
+            # it. The token goes in credentials.toml, as `cargo login` would
+            # put it. Cargo sends it only to an index whose config.json says
+            # `auth-required`, so with anonymous reads on it stays unused.
             lines = [
                 "[source.crates-io]",
                 'replace-with = "minireg"',
                 "",
-                "[source.minireg]",
-                f'registry = "{cargo["registry"]}"',
+                "[registries.minireg]",
+                f'index = "sparse+{registry}/cargo/index/"',
+                'credential-provider = "cargo:token"',
             ]
+            cred_lines = ["[registries.minireg]", f"token = {json.dumps(token)}"] if token else []
             if args.dry_run:
                 print(f"\n{bold(str(cargo_conf))}\n" + "\n".join(lines))
-            else:
+                if token:
+                    print(f"\n{bold(str(cargo_creds))}\n[registries.minireg]\ntoken = \"…\"")
+            elif not (
+                _toml_conflict(cargo_conf, lines)
+                or (token and _toml_conflict(cargo_creds, cred_lines))
+            ):
                 # The managed block goes at the end of the file on first write.
                 # That matters for TOML in a way it does not for npmrc: these
                 # are table headers, so anything following them would be read as
-                # part of `[source.minireg]`.
+                # part of `[registries.minireg]`.
                 _upsert_lines(cargo_conf, lines, "minireg")
                 changed.append(str(cargo_conf))
+                if token:
+                    _upsert_lines(cargo_creds, cred_lines, "minireg")
+                    changed.append(str(cargo_creds))
 
     if "docker" in wanted:
         configure_docker(args, registry, token, config)
@@ -579,7 +734,9 @@ def configure_docker(args, registry: str, token, config: dict) -> None:
         except (OSError, subprocess.TimeoutExpired) as exc:
             die(f"{tool} login failed: {exc}")
         if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout).decode(errors="replace").strip().splitlines()
+            detail = clean_text(
+                (proc.stderr or proc.stdout).decode(errors="replace").strip(), multiline=True
+            ).splitlines()
             die(f"{tool} login {host} failed: {detail[-1] if detail else 'exit ' + str(proc.returncode)}")
         print(f"  {green('✓')} {tool} login {host}  {dim('(credentials stored by ' + tool + ')')}")
         scopes = _token_scopes(registry, token, args)
@@ -1147,7 +1304,12 @@ def audit_request(registry, token, ecosystem, packages, args) -> dict:
             registry,
             "/api/cli/audit",
             "POST",
-            {"ecosystem": ecosystem, "packages": chunk, "scan_unknown": not args.offline},
+            {
+                "ecosystem": ecosystem,
+                "packages": chunk,
+                "scan_unknown": not args.offline,
+                "refresh": bool(getattr(args, "refresh", False)),
+            },
             token=token,
             timeout=180,
             insecure=args.insecure,
@@ -1387,13 +1549,66 @@ _REQ_PIN_RE = re.compile(
 _NPM_RANGE_RE = re.compile(r"^(?P<op>[\^~]|>=|>)?(?P<version>\d.*)$")
 
 
+#: What a fix version must look like before it goes into a file or a printed
+#: command. It comes from the server, which takes it from advisory data, and
+#: it is spliced into requirements.txt lines, package.json strings and shell
+#: commands: a newline there adds a line (`--extra-index-url https://evil`),
+#: a quote adds JSON keys, a `;` adds a command. PEP 440 for PyPI (the
+#: spec's permissive pattern, minus surrounding whitespace), semver for npm
+#: and cargo.
+_FIX_VERSION_RE = {
+    "pypi": re.compile(
+        r"v?(?:[0-9]+!)?[0-9]+(?:\.[0-9]+)*"
+        r"(?:[-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?"
+        r"(?:-[0-9]+|[-_.]?(?:post|rev|r)[-_.]?[0-9]*)?"
+        r"(?:[-_.]?dev[-_.]?[0-9]*)?"
+        r"(?:\+[a-z0-9]+(?:[-_.][a-z0-9]+)*)?",
+        re.IGNORECASE,
+    ),
+    "npm": re.compile(
+        r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+        r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    ),
+}
+_FIX_VERSION_RE["cargo"] = _FIX_VERSION_RE["npm"]
+#: Package names that are safe to print inside a suggested command.
+_COMMAND_SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def valid_fix_version(ecosystem: str, version) -> bool:
+    pattern = _FIX_VERSION_RE.get(ecosystem)
+    return bool(pattern and isinstance(version, str) and pattern.fullmatch(version))
+
+
+def usable_fixes(ecosystem: str, findings: list[dict]) -> list[dict]:
+    """The findings whose fix version may be written or printed; says which
+    were dropped rather than silently treating them as unfixable."""
+    usable = []
+    for finding in findings:
+        version = finding.get("fix_version")
+        if not version:
+            continue
+        if valid_fix_version(ecosystem, version) and _COMMAND_SAFE_NAME_RE.fullmatch(
+            finding.get("name") or ""
+        ):
+            usable.append(finding)
+        else:
+            info(
+                yellow(
+                    f"    ignoring a malformed fix version for {finding.get('name')!r}: "
+                    f"{version!r}"
+                )
+            )
+    return usable
+
+
 def _print_cargo_fix_advice(path: Path, findings: list[dict]) -> int:
     """Hand back the `cargo update` lines that would clear what we found.
 
     Returns how many were printed, so the caller can tell "we told you what to
     run" apart from "there is nothing to do".
     """
-    fixes = sorted({(f["name"], f["fix_version"]) for f in findings if f.get("fix_version")})
+    fixes = sorted({(f["name"], f["fix_version"]) for f in usable_fixes("cargo", findings)})
     if not fixes:
         if findings:
             print(f"    {dim(path.name)}: nothing with a published fix")
@@ -1402,6 +1617,85 @@ def _print_cargo_fix_advice(path: Path, findings: list[dict]) -> int:
     for name, version in fixes:
         print(f"      cargo update -p {name} --precise {version}")
     return len(fixes)
+
+
+#: Lockfiles another tool owns, and the command that raises one package in
+#: each. Editing them by hand would leave the lock disagreeing with its
+#: hashes and with pyproject.toml / Pipfile, so --fix hands back the command.
+_PYPI_TOOL_ADVICE = {
+    "poetry.lock": ("poetry", 'poetry add "{name}>={version}"'),
+    "uv.lock": ("uv", 'uv lock --upgrade-package "{name}=={version}"'),
+    "Pipfile.lock": ("pipenv", 'pipenv upgrade "{name}>={version}"'),
+}
+
+
+def _print_tool_fix_advice(path: Path, findings: list[dict], tool: str, template: str) -> int:
+    """Like the cargo advice, for a PyPI lockfile owned by `tool`."""
+    fixes = sorted({(f["name"], f["fix_version"]) for f in usable_fixes("pypi", findings)})
+    if not fixes:
+        if findings:
+            print(f"    {dim(path.name)}: nothing with a published fix")
+        return 0
+    print(f"    {dim(path.name)}: run these — {tool} owns the lockfile")
+    for name, version in fixes:
+        print(f"      {template.format(name=name, version=version)}")
+    return len(fixes)
+
+
+_PEP440_PARTS_RE = re.compile(
+    r"v?(?:(?P<epoch>[0-9]+)!)?(?P<release>[0-9]+(?:\.[0-9]+)*)"
+    r"(?:[-_.]?(?P<pre_l>a|b|c|rc|alpha|beta|pre|preview)[-_.]?(?P<pre_n>[0-9]*))?"
+    r"(?P<post>-(?P<post_n1>[0-9]+)|[-_.]?(?:post|rev|r)[-_.]?(?P<post_n2>[0-9]*))?"
+    r"(?P<dev>[-_.]?dev[-_.]?(?P<dev_n>[0-9]*))?"
+    r"(?:\+[a-z0-9]+(?:[-_.][a-z0-9]+)*)?",
+    re.IGNORECASE,
+)
+_PRE_RANK = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2, "pre": 2, "preview": 2}
+
+
+def _version_key(ecosystem: str, version: str):
+    """A sort key for one version, or None when it cannot be read.
+
+    Enough of PEP 440 / semver precedence to tell whether a pin is already at
+    or above a fix; not a general implementation (local versions and build
+    metadata are ignored, as they are for precedence).
+    """
+    if ecosystem == "pypi":
+        m = _PEP440_PARTS_RE.fullmatch(version or "")
+        if m is None:
+            return None
+        release = [int(x) for x in m.group("release").split(".")]
+        while len(release) > 1 and release[-1] == 0:
+            release.pop()
+        post = m.group("post_n1") or m.group("post_n2")
+        has_post = m.group("post") is not None
+        if m.group("pre_l"):
+            pre = (0, _PRE_RANK[m.group("pre_l").lower()], int(m.group("pre_n") or 0))
+        elif m.group("dev") and not has_post:
+            pre = (-1,)
+        else:
+            pre = (1,)
+        post_key = (int(post or 0),) if has_post else (-1,)
+        dev_key = (0, int(m.group("dev_n") or 0)) if m.group("dev") else (1,)
+        return (int(m.group("epoch") or 0), tuple(release), pre, post_key, dev_key)
+    m = re.fullmatch(
+        r"(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", version or ""
+    )
+    if m is None:
+        return None
+    numbers = tuple(int(x or 0) for x in m.group(1, 2, 3))
+    if not m.group(4):
+        return (numbers, (1,))
+    idents = tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in m.group(4).split("."))
+    return (numbers, (0, idents))
+
+
+def version_at_least(ecosystem: str, current: str, target: str):
+    """True/False when ``current >= target``; None when either is unreadable."""
+    a, b = _version_key(ecosystem, current), _version_key(ecosystem, target)
+    if a is None or b is None:
+        return None
+    return a >= b
 
 
 def normalize_key(ecosystem: str, name: str) -> str:
@@ -1418,9 +1712,22 @@ def normalize_key(ecosystem: str, name: str) -> str:
     return name.lower()
 
 
-def plan_requirements_fix(path: Path, fixes: dict) -> tuple[str, list[str]]:
-    """Return the rewritten requirements.txt and a description of each change."""
-    original = path.read_text()
+def _new_fix_report() -> dict:
+    """What a planner found for each fix: pinned at all, already high enough,
+    or pinned to something it could not compare."""
+    return {"pinned": set(), "already": [], "uncompared": []}
+
+
+def plan_requirements_fix(
+    path: Path, fixes: dict, report: dict | None = None, text: str | None = None
+) -> tuple[str, list[str]]:
+    """Return the rewritten requirements.txt and a description of each change.
+
+    ``text`` plans on top of an earlier plan for the same file. ``report``,
+    if given, is filled in as by :func:`_new_fix_report`.
+    """
+    original = path.read_text() if text is None else text
+    report = _new_fix_report() if report is None else report
     changes = []
     out = []
 
@@ -1431,8 +1738,21 @@ def plan_requirements_fix(path: Path, fixes: dict) -> tuple[str, list[str]]:
             out.append(line)
             continue
 
-        target = fixes.get(normalize_key("pypi", match.group("name")))
-        if not target or target == match.group("version"):
+        key = normalize_key("pypi", match.group("name"))
+        target = fixes.get(key)
+        if not valid_fix_version("pypi", target):
+            out.append(line)
+            continue
+        report["pinned"].add(key)
+        current = match.group("version")
+        at_least = version_at_least("pypi", current, target)
+        if at_least is None:
+            # Never guess: rewriting an unreadable pin could be a downgrade.
+            report["uncompared"].append(f"{match.group('name')}=={current} (fix: {target})")
+            out.append(line)
+            continue
+        if at_least:
+            report["already"].append(f"{match.group('name')}=={current}")
             out.append(line)
             continue
 
@@ -1446,8 +1766,11 @@ def plan_requirements_fix(path: Path, fixes: dict) -> tuple[str, list[str]]:
     return "".join(out), changes
 
 
-def plan_package_json_fix(path: Path, fixes: dict) -> tuple[str, list[str], list[str]]:
+def plan_package_json_fix(
+    path: Path, fixes: dict, report: dict | None = None
+) -> tuple[str, list[str], list[str]]:
     """Rewrite package.json dependency ranges. Returns (text, changes, skipped)."""
+    report = _new_fix_report() if report is None else report
     original = path.read_text()
     try:
         data = json.loads(original)
@@ -1465,16 +1788,19 @@ def plan_package_json_fix(path: Path, fixes: dict) -> tuple[str, list[str], list
     ):
         for name, spec in (data.get(section) or {}).items():
             target = fixes.get(normalize_key("npm", name))
-            if not target or not isinstance(spec, str):
+            if not valid_fix_version("npm", target) or not isinstance(spec, str):
                 continue
 
+            report["pinned"].add(normalize_key("npm", name))
             match = _NPM_RANGE_RE.match(spec.strip())
             if match is None:
                 # A tag, git URL or file: path -- not something we can safely
                 # bump by rewriting a version number.
                 skipped.append(f"{name} ({spec})")
                 continue
-            if match.group("version") == target:
+            if version_at_least("npm", match.group("version"), target):
+                # Already at or above the fix: raising "to" it would lower it.
+                report["already"].append(f"{name} {spec}")
                 continue
 
             new_spec = f"{match.group('op') or ''}{target}"
@@ -1503,12 +1829,98 @@ def render_diff(path: Path, before: str, after: str) -> str:
         )
     )
 
+def _add_plan(plans, target: Path, before, after, changes, ecosystem, fixes) -> None:
+    entry = plans.get(target.resolve())
+    if entry is None:
+        plans[target.resolve()] = {
+            "target": target,
+            "before": before,
+            "after": after,
+            "changes": list(changes),
+            "ecosystem": ecosystem,
+            "fixes": dict(fixes),
+        }
+    else:
+        entry["after"] = after
+        entry["changes"].extend(changes)
+        entry["fixes"].update(fixes)
+
+
+def _plan_requirements_tree(plans: dict, target: Path, fixes: dict, report: dict) -> None:
+    """Plan ``target``, then the same-directory files it ``-r`` includes.
+
+    The audit merges a plain include (``-r common.txt``) into the file that
+    includes it, so a finding reported under requirements.txt can be pinned
+    in common.txt. That pin is rewritten where it lives -- the plan shows
+    that file's own name -- instead of the including file being reported as
+    already fixed.
+    """
+    queue = [target]
+    visited: set[Path] = set()
+    while queue:
+        current = queue.pop(0)
+        resolved = current.resolve()
+        if resolved in visited or not current.is_file():
+            continue
+        visited.add(resolved)
+        remaining = {k: v for k, v in fixes.items() if k not in report["pinned"]}
+        if not remaining:
+            return
+        earlier = plans.get(resolved)
+        before = earlier["after"] if earlier else current.read_text()
+        after, changes = plan_requirements_fix(current, remaining, report, text=before)
+        if changes and "--hash=" in before:
+            # Editing a version invalidates every recorded hash, and we
+            # cannot recompute them without downloading the artifacts.
+            info(
+                f"    {yellow('skip')} {current.name}: it pins hashes; "
+                "regenerate it with pip-compile instead"
+            )
+        elif changes:
+            original = earlier["before"] if earlier else before
+            _add_plan(plans, current, original, after, changes, "pypi", remaining)
+        for raw in before.splitlines():
+            include = _INCLUDE_RE.match(raw.split("#", 1)[0].strip())
+            if include:
+                child = (current.parent / include.group("file")).resolve()
+                if child.parent == target.parent.resolve():
+                    queue.append(child)
+
+
+def _report_unplanned(target: Path, ecosystem: str, fixes: dict, report: dict) -> None:
+    """Say plainly what --fix did not change, and why."""
+    if report["already"]:
+        print(
+            f"    {dim(target.name)}: already at or above the fixed version: "
+            + ", ".join(report["already"])
+        )
+    for entry in report["uncompared"]:
+        info(f"    {yellow('check')} {target.name}: could not compare {entry}; change it by hand")
+    missing = sorted(
+        f"{name}>={version}" for name, version in fixes.items() if name not in report["pinned"]
+    )
+    if not missing:
+        return
+    if ecosystem == "npm":
+        info(
+            f"    {yellow('not declared')} in {target.name}: {', '.join(missing)} -- "
+            "a transitive dependency; raise it through its parent or an `overrides` entry"
+        )
+    else:
+        info(
+            f"    {yellow('no exact pin')} in {target.name} or the files it includes: "
+            f"{', '.join(missing)} -- raise it by hand"
+        )
+
+
 def apply_fixes(args, registry, token, root: Path, per_source) -> None:
     """Propose (and optionally write) dependency bumps that clear the CVEs."""
     print()
     print(f"  {bold('Remediation')}")
 
-    planned = []
+    # Planned rewrites by file, so a file reached twice (an include shared by
+    # two requirements files) is planned once, on top of its earlier plan.
+    plans: dict[Path, dict] = {}
     # Sources we cannot rewrite but did give the user something actionable, so
     # the "nothing to change" line below does not contradict advice we just
     # printed.
@@ -1522,11 +1934,22 @@ def apply_fixes(args, registry, token, root: Path, per_source) -> None:
             # exact invocations instead of guessing at the file.
             advised += _print_cargo_fix_advice(path, findings)
             continue
+        if ecosystem == "pypi" and path.name in _PYPI_TOOL_ADVICE:
+            # Same reasoning: poetry, uv and pipenv own their lockfiles, and
+            # the requirement that has to rise lives in pyproject.toml or
+            # Pipfile. There used to be no branch here, so the lockfile itself
+            # was "planned", matched no requirements line, and was reported
+            # as already at or above the fixed versions.
+            tool, template = _PYPI_TOOL_ADVICE[path.name]
+            advised += _print_tool_fix_advice(path, findings, tool, template)
+            continue
+        if ecosystem == "pypi" and not _is_requirements_name(path.name):
+            info(f"    {yellow('skip')} {path.name}: --fix only rewrites requirements files")
+            continue
 
         fixable = {
             normalize_key(ecosystem, f["name"]): f["fix_version"]
-            for f in findings
-            if f.get("fix_version")
+            for f in usable_fixes(ecosystem, findings)
         }
         unfixable = [f for f in findings if f.get("cves") and not f.get("fix_version")]
 
@@ -1541,30 +1964,25 @@ def apply_fixes(args, registry, token, root: Path, per_source) -> None:
             info(f"    {yellow('skip')} {path.name}: {target.name} not found next to it")
             continue
 
-        before = target.read_text()
+        report = _new_fix_report()
         if target.name == "package.json":
-            after, changes, skipped = plan_package_json_fix(target, fixable)
+            before = target.read_text()
+            after, changes, skipped = plan_package_json_fix(target, fixable, report)
+            for entry in skipped:
+                info(dim(f"    could not rewrite {entry}"))
+            if changes:
+                _add_plan(plans, target, before, after, changes, ecosystem, fixable)
         else:
-            if "--hash=" in before:
-                # Editing a version invalidates every recorded hash, and we
-                # cannot recompute them without downloading the artifacts.
-                info(
-                    f"    {yellow('skip')} {target.name}: it pins hashes; "
-                    "regenerate it with pip-compile instead"
-                )
-                continue
-            after, changes = plan_requirements_fix(target, fixable)
-            skipped = []
+            _plan_requirements_tree(plans, target, fixable, report)
 
-        for entry in skipped:
-            info(dim(f"    could not rewrite {entry}"))
-        if not changes:
-            print(f"    {dim(target.name)}: already at or above the fixed versions")
-            continue
-
-        planned.append((target, before, after, changes, ecosystem, fixable))
+        _report_unplanned(target, ecosystem, fixable, report)
         for entry in unfixable:
             print(f"    {red('no fix')} {entry['name']}@{entry['version']}")
+
+    planned = [
+        (p["target"], p["before"], p["after"], p["changes"], p["ecosystem"], p["fixes"])
+        for p in plans.values()
+    ]
 
     if not planned:
         if not advised:
@@ -1982,7 +2400,7 @@ def warn_if_outdated():
         return
     info(
         dim(
-            f"  note: this registry ships CLI {_server_cli_version}, you have "
+            f"  note: this registry ships CLI {clean_text(_server_cli_version)}, you have "
             f"{__version__} — run 'minireg update'"
         )
     )
@@ -2013,9 +2431,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--insecure", action="store_true", help="skip TLS verification (development only)"
     )
+    # The same two options again on every subcommand, so they can follow it
+    # (`minireg login --url ...`, the documented first command) as well as
+    # precede it. SUPPRESS as the default: a subcommand that was not given
+    # them must leave the top-level values alone rather than reset them.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--url", default=argparse.SUPPRESS, help="registry URL (defaults to the stored one)"
+    )
+    common.add_argument(
+        "--insecure",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="skip TLS verification (development only)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    login = sub.add_parser("login", help="authenticate via the browser")
+    login = sub.add_parser("login", parents=[common], help="authenticate via the browser")
     login.add_argument("--no-browser", action="store_true", help="do not open a browser")
     login.add_argument(
         "--scopes",
@@ -2024,18 +2456,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     login.set_defaults(func=cmd_login)
 
-    sub.add_parser("logout", help="forget the stored token").set_defaults(func=cmd_logout)
+    sub.add_parser("logout", parents=[common], help="forget the stored token").set_defaults(
+        func=cmd_logout
+    )
 
-    update = sub.add_parser("update", help="update this CLI from the registry")
+    update = sub.add_parser("update", parents=[common], help="update this CLI from the registry")
     update.add_argument(
         "--check", action="store_true", help="report whether an update exists, exit 1 if so"
     )
     update.add_argument("--force", action="store_true", help="reinstall even if versions match")
     update.set_defaults(func=cmd_update)
-    sub.add_parser("whoami", help="show the current identity").set_defaults(func=cmd_whoami)
+    sub.add_parser("whoami", parents=[common], help="show the current identity").set_defaults(
+        func=cmd_whoami
+    )
 
     configure = sub.add_parser(
-        "configure", help="point npm / pip / cargo / docker at the registry"
+        "configure", parents=[common], help="point npm / pip / cargo / docker at the registry"
     )
     configure.add_argument(
         "target",
@@ -2051,7 +2487,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     configure.set_defaults(func=cmd_configure)
 
-    audit_cmd = sub.add_parser("audit", help="check this project's dependencies for CVEs")
+    audit_cmd = sub.add_parser("audit", parents=[common], help="check this project's dependencies for CVEs")
     audit_cmd.add_argument("path", nargs="?", default=".", help="project directory or lockfile")
     audit_cmd.add_argument(
         "--fail-on",
@@ -2075,8 +2511,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="treat dependencies that could not be checked as acceptable",
     )
-    audit_cmd.add_argument(
+    freshness = audit_cmd.add_mutually_exclusive_group()
+    freshness.add_argument(
         "--offline", action="store_true", help="do not scan packages the registry has not seen"
+    )
+    freshness.add_argument(
+        "--refresh",
+        action="store_true",
+        help="re-query OSV even for versions the registry has already scanned",
     )
     audit_cmd.add_argument(
         "--fix",
@@ -2107,13 +2549,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit_cmd.set_defaults(func=cmd_audit)
 
-    search = sub.add_parser("search", help="search the registry")
+    search = sub.add_parser("search", parents=[common], help="search the registry")
     search.add_argument("query")
     search.add_argument("--ecosystem", choices=["npm", "pypi", "cargo", "docker"])
     search.add_argument("--limit", type=int, default=25)
     search.set_defaults(func=cmd_search)
 
-    info_cmd = sub.add_parser("info", help="show a package or container image")
+    info_cmd = sub.add_parser("info", parents=[common], help="show a package or container image")
     info_cmd.add_argument("package", help="package name, or an image reference with --ecosystem docker")
     info_cmd.add_argument(
         "--ecosystem",

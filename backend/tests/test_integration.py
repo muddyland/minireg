@@ -814,6 +814,31 @@ class TestAdminApi:
         # The credential itself must never be returned.
         assert "super-secret-token" not in created.text
 
+    async def test_upstream_rename_is_validated(self, app_client):
+        """Renames get the create route's bounds, and a clash with another
+        upstream's (unique) name is a 409, not a database error."""
+        ah = auth(app_client, "admin")
+        ids = []
+        for name, url in (("one", "https://registry.npmjs.org"), ("two", "https://upstream.test")):
+            created = await app_client.post(
+                "/api/admin/upstreams",
+                json={"name": name, "ecosystem": "npm", "kind": "npm", "url": url},
+                headers=ah,
+            )
+            assert created.status_code == 201, created.text
+            ids.append(created.json()["id"])
+
+        clash = await app_client.patch(f"/api/admin/upstreams/{ids[1]}", json={"name": "one"}, headers=ah)
+        assert clash.status_code == 409
+        for bad in ("", "x" * 101):
+            resp = await app_client.patch(f"/api/admin/upstreams/{ids[1]}", json={"name": bad}, headers=ah)
+            assert resp.status_code == 422, bad
+
+        renamed = await app_client.patch(f"/api/admin/upstreams/{ids[1]}", json={"name": "three"}, headers=ah)
+        assert renamed.status_code == 200
+        names = {u["name"] for u in (await app_client.get("/api/admin/upstreams", headers=ah)).json()["upstreams"]}
+        assert {"one", "three"} <= names and "two" not in names
+
     async def test_cve_policy_roundtrip(self, app_client):
         response = await app_client.put(
             "/api/admin/settings/cve-policy",
@@ -912,6 +937,33 @@ class TestClientConfig:
         assert body["pip"]["index_url"] == "http://registry.test/pypi/simple/"
         assert body["twine"]["repository_url"] == "http://registry.test/pypi/legacy/"
         assert "registry.test/npm/:_authToken" in body["npm"]["npmrc"]
+
+    async def test_pip_trusted_host_only_for_plain_http(self, app_client, monkeypatch):
+        """pip's `trusted-host` turns certificate verification off for an
+        https index (pip mounts its InsecureHTTPAdapter for the host), so a
+        copied pip.conf must only carry it when the registry is plain http,
+        where pip needs it to use the index at all."""
+        import configparser
+
+        from app.config import settings
+
+        def parsed(body):
+            conf = configparser.ConfigParser()
+            conf.read_string(body["pip"]["pip_conf"])
+            return conf
+
+        body = (await app_client.get("/api/client-config", headers=auth(app_client))).json()
+        assert parsed(body).get("global", "trusted-host") == "registry.test"
+        assert body["pip"]["authenticated_index_url"].startswith("http://__token__:")
+
+        monkeypatch.setattr(settings, "public_url", "https://registry.example.com:8443")
+        body = (await app_client.get("/api/client-config", headers=auth(app_client))).json()
+        conf = parsed(body)
+        assert conf.get("global", "index-url") == "https://registry.example.com:8443/pypi/simple/"
+        assert not conf.has_option("global", "trusted-host")
+        assert body["pip"]["authenticated_index_url"] == (
+            "https://__token__:<your-token>@registry.example.com:8443/pypi/simple/"
+        )
 
     async def test_cargo_stanza_is_client_ready(self, app_client):
         """The Client setup page renders these keys directly, so the contract
