@@ -383,3 +383,87 @@ class TestStoredAdvisoryRefresh:
             result = await scan("lib", "1.0.0")
         assert result.scanned is True
         assert result.max_score == pytest.approx(6.1)
+
+
+# --------------------------------------------------------------------------- #
+# "No advisories" is told apart from "advisories scoring 0.0"
+# --------------------------------------------------------------------------- #
+class TestAdvisoryPresence:
+    async def _verdict(self, version_id, policy):
+        from app.models import Setting
+        from app.services.policy import KEY_CVE_POLICY, PolicyEngine
+
+        async with db_module.session_scope() as session:
+            await session.merge(Setting(key=KEY_CVE_POLICY, value=policy))
+        async with db_module.session_scope() as session:
+            row = await session.get(PackageVersion, version_id)
+            engine = PolicyEngine(session)
+            return await engine.evaluate(
+                "npm",
+                "lib",
+                row.version,
+                max_cvss=row.max_cvss,
+                has_fix=row.has_fix,
+                scanned=bool(row.scanned_at),
+                has_advisories=row.has_advisories,
+            )
+
+    async def test_scan_records_whether_anything_was_found(self, db):
+        clean_id = await seed_version("lib", "1.0.0")
+        zero_id = await seed_version("lib", "2.0.0")
+        no_impact = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N"
+        with respx.mock(assert_all_called=False) as router:
+            router.post(f"{OSV}/v1/querybatch").mock(
+                side_effect=[
+                    httpx.Response(200, json={"results": [{}]}),
+                    httpx.Response(
+                        200,
+                        json={"results": [{"vulns": [{"id": "GHSA-zero", "modified": None}]}]},
+                    ),
+                ]
+            )
+            router.get(f"{OSV}/v1/vulns/GHSA-zero").mock(
+                return_value=httpx.Response(
+                    200, json=record("GHSA-zero", package="lib", vector=no_impact)
+                )
+            )
+            await scan("lib", "1.0.0")
+            await scan("lib", "2.0.0")
+
+        policy = {"enabled": True, "min_score": 0.0, "max_score": 10.0}
+        async with db_module.session_scope() as session:
+            clean = await session.get(PackageVersion, clean_id)
+            zero = await session.get(PackageVersion, zero_id)
+            assert (clean.max_cvss, clean.has_advisories) == (0.0, False)
+            assert (zero.max_cvss, zero.has_advisories) == (0.0, True)
+        assert (await self._verdict(clean_id, policy)).allowed
+        assert (await self._verdict(zero_id, policy)).blocked
+
+    async def test_upgrade_backfills_versions_scanned_before_the_column(self, db):
+        version_id = await seed_version(
+            "lib", "1.0.0", max_cvss=0.0, scanned_at=datetime.now(UTC)
+        )
+        clean_id = await seed_version("lib", "2.0.0", max_cvss=0.0, scanned_at=datetime.now(UTC))
+        await seed_advisory(
+            "GHSA-zero",
+            score=0.0,
+            modified=datetime(2026, 1, 1, tzinfo=UTC),
+            raw=record("GHSA-zero", package="lib"),
+            link_to=[version_id],
+        )
+        await db_module.create_schema()  # what every start runs
+        await db_module.create_schema()  # and again: idempotent
+        async with db_module.session_scope() as session:
+            assert (await session.get(PackageVersion, version_id)).has_advisories is True
+            assert (await session.get(PackageVersion, clean_id)).has_advisories is False
+
+
+class TestCvePolicyZeroRange:
+    def test_clean_is_never_in_range(self):
+        policy = CvePolicy(enabled=True, min_score=0.0, max_score=10.0, block_unscored=True)
+        assert not policy.blocks(0.0, scanned=True, has_advisories=False)
+        assert not policy.blocks(0.0, scanned=True)  # callers that cannot tell
+        assert policy.blocks(0.0, scanned=True, has_advisories=True)
+        assert policy.blocks(5.0, scanned=True, has_advisories=False)
+        assert policy.blocks(None, scanned=True)
+        assert policy.blocks(None, scanned=False)

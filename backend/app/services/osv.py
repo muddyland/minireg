@@ -383,6 +383,11 @@ class ScanResult:
     def severity(self) -> str | None:
         return severity_label(self.max_score)
 
+    @property
+    def has_advisories(self) -> bool:
+        """Whether the scan found anything; see ``CvePolicy.blocks``."""
+        return bool(self.cves)
+
 
 #: Up to this many packages are invalidated one prefix-SCAN each; above it, a
 #: single SCAN over every rendered document is cheaper.
@@ -841,9 +846,14 @@ class OsvScanner:
             )
             if version_row is None or version_row.scanned_at is None:
                 continue
-            if version_row.max_cvss != score or version_row.has_fix != fixable[version_id]:
+            if (
+                version_row.max_cvss != score
+                or version_row.has_fix != fixable[version_id]
+                or not version_row.has_advisories
+            ):
                 version_row.max_cvss = score
                 version_row.has_fix = fixable[version_id]
+                version_row.has_advisories = True
                 await self._note_changed(version_row)
         await self.session.flush()
 
@@ -1002,9 +1012,11 @@ class OsvScanner:
             version_row.max_cvss != result.max_score
             or version_row.scanned_at is None
             or version_row.has_fix != result.has_fix
+            or version_row.has_advisories != result.has_advisories
         )
         version_row.max_cvss = result.max_score
         version_row.has_fix = result.has_fix
+        version_row.has_advisories = result.has_advisories
         version_row.scanned_at = datetime.now(UTC)
 
         existing_links = {

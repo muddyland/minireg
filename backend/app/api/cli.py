@@ -527,6 +527,7 @@ async def audit_packages(
         max_cvss = None
         has_fix = False
         scanned = False
+        has_advisories: bool | None = None
 
         if entry is not None:
             _name, version_row = entry
@@ -534,12 +535,14 @@ async def audit_packages(
             max_cvss = version_row.max_cvss
             has_fix = version_row.has_fix
             scanned = version_row.scanned_at is not None
+            has_advisories = version_row.has_advisories
         else:
             result = scanned_now.get((item.name, item.version))
             if result is not None and getattr(result, "scanned", False):
                 scanned = True
                 max_cvss = result.max_score
                 has_fix = result.has_fix
+                has_advisories = bool(result.cves)
                 cves = dedupe_by_cve(
                     [
                         {
@@ -571,6 +574,7 @@ async def audit_packages(
             max_cvss=max_cvss,
             has_fix=has_fix,
             scanned=scanned,
+            has_advisories=has_advisories,
         )
 
         if cves or verdict.blocked:

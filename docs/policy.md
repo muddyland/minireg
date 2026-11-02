@@ -116,6 +116,11 @@ Blocks versions whose highest CVSS base score falls inside a range.
 | 0.0 – 10.0 | Anything with a CVE |
 | 4.0 – 6.9 | Medium only (unusual, but supported) |
 
+A version with no advisories at all is never blocked by the range, even one
+starting at 0.0: a clean scan is recorded as a score of 0.0, but it is
+recorded as clean too. A version whose advisories all score 0.0 (a CVSS
+vector declaring no impact) is in a range that starts at 0.0.
+
 It is a *range*, not a threshold, so you can block medium severity while
 allowing critical. That sounds backwards but is occasionally what you want —
 for example when criticals are individually reviewed and accepted while the

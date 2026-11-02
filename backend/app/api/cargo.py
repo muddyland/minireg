@@ -207,6 +207,7 @@ async def download(
         max_cvss=version_row.max_cvss,
         has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
+        has_advisories=version_row.has_advisories,
     )
     if verdict.blocked:
         audit.record_download(
@@ -314,6 +315,7 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
             max_cvss=version_row.max_cvss,
             has_fix=version_row.has_fix,
             scanned=bool(version_row.scanned_at),
+            has_advisories=version_row.has_advisories,
         )
         if verdict.blocked:
             blocked.add(version_row.version)

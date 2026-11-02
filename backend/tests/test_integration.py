@@ -576,6 +576,27 @@ class TestCvePolicy:
         await self._set_version_score(10.0)
         assert (await app_client.get("/npm/test-pkg")).status_code == 200
 
+    async def test_zero_to_ten_does_not_block_a_clean_version(self, app_client):
+        """A clean scan is stored as 0.0; the documented "0-10 blocks anything
+        with a CVE" range used to block every clean package as well."""
+        await app_client.put("/npm/test-pkg", json=npm_publish_body(), headers=auth(app_client))
+        await self._set_policy(min_score=0.0, max_score=10.0)
+        await self._set_version_score(0.0)
+        assert (await app_client.get("/npm/test-pkg")).status_code == 200
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 200
+
+    async def test_zero_to_ten_blocks_an_advisory_that_scores_zero(self, app_client):
+        from sqlalchemy import update
+
+        from app.models import PackageVersion
+
+        await app_client.put("/npm/test-pkg", json=npm_publish_body(), headers=auth(app_client))
+        await self._set_policy(min_score=0.0, max_score=10.0)
+        await self._set_version_score(0.0)
+        async with db_module.session_scope() as session:
+            await session.execute(update(PackageVersion).values(has_advisories=True))
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 403
+
     async def _score_one_version(self, version, score):
         from datetime import UTC, datetime
 

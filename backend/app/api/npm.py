@@ -188,6 +188,7 @@ async def _version_columns(session: AsyncSession, package_id: int) -> list:
                     PackageVersion.version,
                     PackageVersion.max_cvss,
                     PackageVersion.has_fix,
+                    PackageVersion.has_advisories,
                     PackageVersion.scanned_at,
                 ).where(PackageVersion.package_id == package_id)
             )
@@ -674,6 +675,7 @@ async def get_tarball(
         max_cvss=version_row.max_cvss if version_row else None,
         has_fix=bool(version_row and version_row.has_fix),
         scanned=bool(version_row and version_row.scanned_at),
+        has_advisories=bool(version_row and version_row.has_advisories),
     )
     if verdict.blocked:
         audit.record_download(
@@ -1086,6 +1088,7 @@ async def _handle_publish(
             max_cvss=scan.max_score,
             has_fix=scan.has_fix,
             scanned=scan.scanned,
+            has_advisories=scan.has_advisories,
         )
         if cve_verdict.blocked:
             # Capture the actor before the rollback expires the ORM objects
@@ -1121,6 +1124,8 @@ async def _handle_publish(
             is_local=True,
             published_at=datetime.now(UTC),
             max_cvss=scan.max_score,
+            has_fix=scan.has_fix,
+            has_advisories=scan.has_advisories,
             scanned_at=datetime.now(UTC) if scan.scanned else None,
         )
         session.add(version_row)
@@ -1527,6 +1532,7 @@ async def _version_response(
         max_cvss=version_row.max_cvss,
         has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
+        has_advisories=version_row.has_advisories,
     )
     if verdict.blocked:
         return npm_error(verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
@@ -1700,7 +1706,7 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
 
 async def _blocked_from_rows(policy: PolicyEngine, normalized: str, rows) -> set[str]:
     """``rows`` are PackageVersion entities or column rows with ``version``,
-    ``max_cvss``, ``has_fix`` and ``scanned_at``."""
+    ``max_cvss``, ``has_fix``, ``has_advisories`` and ``scanned_at``."""
     blocked: set[str] = set()
     for version_row in rows:
         verdict = await policy.evaluate(
@@ -1710,6 +1716,7 @@ async def _blocked_from_rows(policy: PolicyEngine, normalized: str, rows) -> set
             max_cvss=version_row.max_cvss,
             has_fix=version_row.has_fix,
             scanned=bool(version_row.scanned_at),
+            has_advisories=version_row.has_advisories,
         )
         if verdict.blocked:
             blocked.add(version_row.version)

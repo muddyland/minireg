@@ -93,10 +93,11 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 # a rename, a type change) would need a real migration and is deliberately not
 # handled by this mechanism.
 # Known limitation, stated plainly: this is not a migration framework. It
-# handles additive columns and nothing else -- a drop, a rename, a type change
-# or a backfill needs a real migration, applied by hand. If the schema starts
-# needing those regularly, adopt alembic and baseline it against the current
-# tables rather than extending this list.
+# handles additive columns and the idempotent backfills in DATA_FIXES, and
+# nothing else -- a drop, a rename or a type change needs a real migration,
+# applied by hand. If the schema starts needing those regularly, adopt
+# alembic and baseline it against the current tables rather than extending
+# this list.
 ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "web_url_template", "VARCHAR(512)"),
     ("device_authorizations", "requested_scopes", "JSONB"),
@@ -108,6 +109,20 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "require_digest", "BOOLEAN NOT NULL DEFAULT TRUE"),
     ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
     ("api_tokens", "docker_repo_prefixes", "JSONB"),
+    ("package_versions", "has_advisories", "BOOLEAN NOT NULL DEFAULT FALSE"),
+]
+
+# Backfills for the columns above, run after them on every start. Each must be
+# idempotent (it runs again on every boot) and portable SQL (SQLite runs it
+# too). Keep the WHERE narrow so a re-run touches no rows.
+DATA_FIXES: list[str] = [
+    # has_advisories: a version scanned before the column existed has its
+    # advisories in package_vulnerabilities. Only a 0.0 maximum consults the
+    # flag, so this is what keeps "advisories that all score 0.0" from
+    # reading as clean after the upgrade.
+    "UPDATE package_versions SET has_advisories = TRUE "
+    "WHERE has_advisories = FALSE "
+    "AND id IN (SELECT version_id FROM package_vulnerabilities)",
 ]
 
 
@@ -168,6 +183,14 @@ async def create_schema() -> None:
                         stmt.split(" ON ")[0],
                         exc,
                     )
+
+        # Backfills run on every dialect: the SQL is portable, and a fresh
+        # database (where create_all already made the columns) has nothing
+        # for them to touch.
+        from sqlalchemy import text
+
+        for fix in DATA_FIXES:
+            await conn.execute(text(fix))
 
 
 async def dispose_engine() -> None:
