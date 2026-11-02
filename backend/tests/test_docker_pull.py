@@ -123,6 +123,66 @@ class TestManifests:
         resp = await client.get("/v2/app/manifests/latest", headers=headers)
         assert resp.headers["docker-content-digest"] == new.digest
         assert resp.headers["x-minireg-cache"] == "fetched"
+        # Fetched by the digest the HEAD reported, not by the tag again: the
+        # bytes stored are the ones the HEAD named, verified against it.
+        assert fake.calls[f"manifest_get:library/app:{new.digest}"] == 1
+        assert fake.calls["manifest_get:library/app:latest"] == 1  # the cold fetch only
+
+    async def test_moved_tag_without_a_head_digest_is_refetched_by_tag(self, docker_env, monkeypatch):
+        import httpx
+
+        from app.config import settings
+
+        client, fake = docker_env
+        old, new = Image.build("v1"), Image.build("v2")
+        fake.add_image("library/app", "latest", old)
+        headers = await anon(client, "app")
+        await client.get("/v2/app/manifests/latest", headers=headers)
+        fake.add_image("library/app", "latest", new)
+        default = fake._manifest
+
+        def no_digest_on_head(request):
+            resp = default(request)
+            if request.method == "HEAD" and resp.status_code == 200:
+                headers = {k: v for k, v in resp.headers.items() if k != "docker-content-digest"}
+                return httpx.Response(200, headers=headers)
+            return resp
+
+        fake.manifest_hook = no_digest_on_head
+        monkeypatch.setattr(settings, "docker_tag_ttl_seconds", 0)
+        resp = await client.get("/v2/app/manifests/latest", headers=headers)
+        assert resp.headers["docker-content-digest"] == new.digest
+        assert fake.calls["manifest_get:library/app:latest"] == 2
+
+    async def test_tag_moved_twice_falls_back_to_the_tag(self, docker_env, monkeypatch):
+        """The HEAD's digest is gone by the time of the GET (the tag moved
+        again): fetch the tag rather than drop it."""
+        import httpx
+
+        from app.config import settings
+
+        client, fake = docker_env
+        old, new = Image.build("v1"), Image.build("v2")
+        fake.add_image("library/app", "latest", old)
+        headers = await anon(client, "app")
+        await client.get("/v2/app/manifests/latest", headers=headers)
+        fake.add_image("library/app", "latest", new)
+        gone = "sha256:" + "e" * 64
+        default = fake._manifest
+
+        def head_names_a_vanished_digest(request):
+            resp = default(request)
+            if request.method == "HEAD" and resp.status_code == 200:
+                headers = {**dict(resp.headers), "docker-content-digest": gone}
+                return httpx.Response(200, headers=headers)
+            return resp
+
+        fake.manifest_hook = head_names_a_vanished_digest
+        monkeypatch.setattr(settings, "docker_tag_ttl_seconds", 0)
+        resp = await client.get("/v2/app/manifests/latest", headers=headers)
+        assert resp.status_code == 200
+        assert resp.headers["docker-content-digest"] == new.digest
+        assert fake.calls[f"manifest_get:library/app:{gone}"] == 1
 
     async def test_concurrent_revalidations_collapse(self, docker_env):
         from datetime import UTC, datetime, timedelta

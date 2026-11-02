@@ -270,8 +270,10 @@ everywhere, deny one of its CVEs.
 - **Tags are revalidated with HEAD.** A cached tag is served as-is for
   `DOCKER_TAG_TTL_SECONDS` (default 600). After that, the next pull checks
   the upstream with a HEAD request, which doesn't count against Docker Hub's
-  pull quota. The manifest is fetched again, by digest, only when the tag has
-  moved.
+  pull quota. The manifest is fetched again only when the tag has moved, by
+  the digest the HEAD reported, so the bytes stored are the ones it named.
+  (An upstream whose HEAD gives no digest is fetched by tag.) A tag that
+  moved to an image this upstream already served costs no fetch at all.
 - **Digests never expire.** A digest is immutable, so `image@sha256:…` is
   never revalidated.
 - **Serve-stale.** When the upstream is down, times out or returns 429, the

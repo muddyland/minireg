@@ -518,6 +518,7 @@ async def _revalidate(
     # No transaction held across the network (see open_blob).
     await session.commit()
     try:
+        moved_to: str | None = None
         if cached is not None and store.exists(cached.digest):
             probe = await client.manifest(target.remote, tag, head=True)
             if probe.digest and probe.digest == cached.digest:
@@ -525,7 +526,8 @@ async def _revalidate(
                 await session.commit()
                 bump("docker.manifest", result="revalidated")
                 return ServedManifest(cached, await _body(cached, head), "revalidated", tag)
-            if probe.digest:
+            if probe.digest and is_digest(probe.digest):
+                moved_to = probe.digest
                 known = await _manifest_row(session, probe.digest)
                 if (
                     known is not None
@@ -540,12 +542,22 @@ async def _revalidate(
                     await session.commit()
                     bump("docker.manifest", result="revalidated")
                     return ServedManifest(known, await _body(known, head), "revalidated", tag)
-        # Cold, or the tag moved: one GET. By digest when the HEAD gave us
-        # one, so the bytes we store are exactly the ones we verify.
-        resp = await client.manifest(target.remote, tag)
+        # Cold, or the tag moved: one GET. When the HEAD named the digest it
+        # moved to, by that digest, so the bytes stored are exactly the ones
+        # the HEAD reported and are verified against it. By tag on a cold
+        # fetch, after a HEAD without a usable digest, or when the digest is
+        # already gone again (the tag moved twice); then the response's own
+        # digest header is what the bytes are checked against.
+        resp = None
+        expected = moved_to
+        if moved_to:
+            with contextlib.suppress(UpstreamNotFound):
+                resp = await client.manifest(target.remote, moved_to)
+        if resp is None:
+            resp = await client.manifest(target.remote, tag)
+            expected = resp.digest if resp.digest and is_digest(resp.digest) else None
         if resp.body is None:
             raise UpstreamUnavailable(f"{client.name}: empty manifest")
-        expected = resp.digest if resp.digest and is_digest(resp.digest) else None
         manifest = await store_manifest(
             session, resp.body, resp.media_type, expected_digest=expected, upstream_id=target.upstream.id
         )
