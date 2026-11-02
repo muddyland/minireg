@@ -994,6 +994,17 @@ async def publish(
 
     if parsed.intent == "deprecate":
         return await _handle_deprecate(session, request, identity, parsed)
+    if not parsed.versions:
+        # No versions (with or without attachments) is nothing to publish.
+        # This used to reach _handle_publish, which created an empty local
+        # package owned by the caller: a name squat that answered 404 for
+        # everyone, and for a cached upstream package in a reserved namespace
+        # a flip to `is_local` that froze it. npm's own unpublish never PUTs
+        # an empty document; it DELETEs /{pkg}/-rev/{rev}.
+        return npm_error(
+            "publish document carries no versions; nothing to publish",
+            status.HTTP_400_BAD_REQUEST,
+        )
     return await _handle_publish(session, request, identity, parsed)
 
 
@@ -1056,28 +1067,7 @@ async def _handle_publish(
         return npm_error(denied.reason, denied.status_code)
 
     package = grant.package
-    if package is None:
-        package = Package(
-            ecosystem=ECOSYSTEM,
-            name=parsed.name,
-            normalized_name=normalized,
-            is_local=True,
-            owner_user_id=grant.owner_user_id,
-        )
-        # Initialise the collections so SQLAlchemy treats them as loaded.
-        # Touching an unloaded relationship on a brand-new instance would
-        # trigger a lazy load, which is illegal on an async session.
-        package.versions = []
-        package.dist_tags = []
-        session.add(package)
-        await session.flush()
-    package.is_local = True
-    if package.owner_user_id is None:
-        package.owner_user_id = grant.owner_user_id
-    if parsed.description:
-        package.description = parsed.description
-
-    existing = {v.version for v in package.versions}
+    existing = {v.version for v in package.versions} if package is not None else set()
     store = get_store()
     published: list[str] = []
 
@@ -1140,6 +1130,31 @@ async def _handle_publish(
             )
             return npm_error(cve_verdict.reason or "blocked by CVE policy", status.HTTP_403_FORBIDDEN)
         staged.append((version, meta, attachment, scan))
+
+    # Only now, with every version staged and every check passed, does the
+    # name become a local package. Creating the row (or flipping a cached
+    # upstream row to `is_local`) before this point let a document with no
+    # publishable version claim the name.
+    if package is None:
+        package = Package(
+            ecosystem=ECOSYSTEM,
+            name=parsed.name,
+            normalized_name=normalized,
+            is_local=True,
+            owner_user_id=grant.owner_user_id,
+        )
+        # Initialise the collections so SQLAlchemy treats them as loaded.
+        # Touching an unloaded relationship on a brand-new instance would
+        # trigger a lazy load, which is illegal on an async session.
+        package.versions = []
+        package.dist_tags = []
+        session.add(package)
+        await session.flush()
+    package.is_local = True
+    if package.owner_user_id is None:
+        package.owner_user_id = grant.owner_user_id
+    if parsed.description:
+        package.description = parsed.description
 
     for version, meta, attachment, scan in staged:
         stored = await store.put_bytes(attachment.data)

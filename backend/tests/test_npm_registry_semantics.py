@@ -178,3 +178,95 @@ async def test_build_metadata_cannot_reuse_a_withdrawn_or_taken_version(env):
         assert "build metadata" in response.json()["error"]
 
     assert sorted((await client.get("/npm/tomb")).json()["versions"]) == ["1.1.0"]
+
+
+# --------------------------------------------------------------------------- #
+# A publish with nothing in it claims nothing
+# --------------------------------------------------------------------------- #
+async def _package_row(name: str):
+    from sqlalchemy import select
+
+    from app.models import Ecosystem, Package
+
+    async with db_module.session_scope() as session:
+        return (
+            await session.execute(
+                select(Package).where(
+                    Package.ecosystem == Ecosystem.npm, Package.normalized_name == name
+                )
+            )
+        ).scalar_one_or_none()
+
+
+async def _reserve(patterns: list[str]) -> None:
+    from app.models import Setting
+
+    async with db_module.session_scope() as session:
+        session.add(Setting(key="publish_namespaces", value={"npm": patterns}))
+    await invalidate_policy_cache()
+
+
+async def _cache_upstream_row(name: str, versions=("1.0.0",)) -> None:
+    """A package as the proxy path leaves it: not local, no owner."""
+    from datetime import UTC, datetime
+
+    from app.models import DistTag, Ecosystem, Package, PackageVersion
+
+    async with db_module.session_scope() as session:
+        package = Package(
+            ecosystem=Ecosystem.npm,
+            name=name,
+            normalized_name=name,
+            is_local=False,
+            latest_version=versions[-1],
+            cached_at=datetime.now(UTC),
+        )
+        session.add(package)
+        await session.flush()
+        for version in versions:
+            session.add(
+                PackageVersion(
+                    package_id=package.id,
+                    version=version,
+                    normalized_version=version,
+                    metadata_json={"name": name, "version": version},
+                )
+            )
+        session.add(DistTag(package_id=package.id, tag="latest", version=versions[-1]))
+
+
+async def test_publish_without_versions_does_not_create_or_claim_a_name(env):
+    client, tokens = env
+    as_user(client, tokens["alice"])
+    for body in (
+        {"name": "squatted-name"},
+        {"name": "squatted-name", "versions": {}, "_attachments": {}},
+        # Attachments but no version to attach them to.
+        {
+            "name": "squatted-name",
+            "_attachments": publish_body("squatted-name", "1.0.0")["_attachments"],
+        },
+    ):
+        response = await client.put("/npm/squatted-name", json=body)
+        assert response.status_code == 400, response.text
+    assert await _package_row("squatted-name") is None
+
+    # The name is still free for whoever publishes a real version first.
+    as_user(client, tokens["bob"])
+    real = await client.put("/npm/squatted-name", json=publish_body("squatted-name", "1.0.0"))
+    assert real.status_code == 201, real.text
+
+
+async def test_empty_publish_does_not_freeze_a_cached_package_in_a_reserved_namespace(env):
+    """In a reserved namespace the grant hands back the cached upstream row;
+    an empty PUT flipped it to `is_local`, after which it was never
+    refreshed from upstream again."""
+    client, tokens = env
+    await _reserve(["@corp/*"])
+    await _cache_upstream_row("@corp/lib")
+
+    as_user(client, tokens["alice"])
+    response = await client.put("/npm/@corp%2flib", json={"name": "@corp/lib"})
+    assert response.status_code == 400, response.text
+    row = await _package_row("@corp/lib")
+    assert row is not None and row.is_local is False and row.owner_user_id is None
