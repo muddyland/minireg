@@ -72,6 +72,21 @@ def parse_pypi_version(version: str) -> Version | None:
         return None
 
 
+def pypi_versions_equal(a: str, b: str) -> bool:
+    """PEP 440 equality: ``2.0``, ``2.0.0`` and ``v2.0`` are one version.
+
+    :func:`normalize_pypi_version` keeps trailing zeros, so its output is a
+    storage key, not an identity. pip treats ``2.0`` and ``2.0.0`` as the same
+    release, so anything deciding whether a release already exists has to
+    compare with this. Non-conforming versions fall back to their normalized
+    spelling.
+    """
+    parsed_a, parsed_b = parse_pypi_version(a), parse_pypi_version(b)
+    if parsed_a is not None and parsed_b is not None:
+        return parsed_a == parsed_b
+    return normalize_pypi_version(a) == normalize_pypi_version(b)
+
+
 def sort_pypi_versions(versions: list[str]) -> list[str]:
     """Ascending PEP 440 order; unparseable versions sort first, lexically."""
 

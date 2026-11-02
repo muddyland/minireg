@@ -174,6 +174,10 @@ Rules that are enforced:
 - The filename must agree with the declared name and version.
 - Every digest you supply must match the bytes received.
 - Only one sdist per release.
+- Versions are compared as PEP 440 does: `2.0.0` is the same release as an
+  existing `2.0`, so its files join that release (and the one-sdist rule
+  spans both spellings). Files cannot be added to a release mirrored from an
+  upstream, under any spelling of its version.
 - Re-uploading an existing filename is rejected. PyPI never overwrites, and
   neither does this.
 

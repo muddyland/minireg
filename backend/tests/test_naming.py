@@ -16,6 +16,7 @@ from app.core.naming import (
     npm_scope,
     npm_tarball_filename,
     parse_dist_filename,
+    pypi_versions_equal,
     sort_pypi_versions,
     sort_semver,
 )
@@ -90,6 +91,26 @@ class TestPEP440Versions:
     def test_non_pep440_falls_back_not_raises(self):
         # Legacy upstream files must stay reachable even with junk versions.
         assert normalize_pypi_version("not-a-version") == "not-a-version"
+
+    @pytest.mark.parametrize(
+        ("a", "b", "equal"),
+        [
+            ("2.0", "2.0.0", True),
+            ("2", "2.0.0.0", True),
+            ("v1.0", "1.0.0", True),
+            ("1.0+local", "1.0.0+local", True),
+            ("1.0", "1.0.1", False),
+            ("1.0", "1.0.post0", False),
+            ("1.0", "1.0+local", False),
+            ("not-a-version", "not-a-version", True),
+            ("not-a-version", "1.0", False),
+        ],
+    )
+    def test_equality_ignores_trailing_zeros(self, a, b, equal):
+        # The storage key keeps them, so "is this the same release" cannot be
+        # answered by comparing keys.
+        assert pypi_versions_equal(a, b) is equal
+        assert pypi_versions_equal(b, a) is equal
 
     def test_ordering(self):
         versions = ["1.0", "1.0.1", "0.9", "2.0a1", "2.0", "1.0.post1", "1.0.dev1"]
