@@ -508,6 +508,25 @@ class TestUpstreamMetadataShapes:
         assert package.description == "harmless]52;c;Y3VybCBldmlsfHNo[2K0mlooks fine\nline two"
         assert package.license == "MIT[8m"
 
+    @respx.mock
+    async def test_only_http_homepages_are_stored(self, proxy_client):
+        """The UI links the homepage; a `javascript:` one is a script
+        waiting for a click (the UI checks too, this is the second fence)."""
+        for name, homepage, stored in (
+            ("config-chain", "javascript:alert(document.cookie)", None),
+            ("leftpad", "https://github.com/x/leftpad", "https://github.com/x/leftpad"),
+        ):
+            packument = {**UPSTREAM_PACKUMENT, "name": name, "homepage": homepage}
+            respx.get(f"https://upstream.test/{name}").mock(
+                return_value=httpx.Response(200, json=packument)
+            )
+            assert (await proxy_client.get(f"/npm/{name}")).status_code == 200
+            async with db_module.session_scope() as session:
+                package = (
+                    await session.execute(select(Package).where(Package.name == name))
+                ).scalar_one()
+            assert package.homepage == stored
+
 
 class TestCoerceText:
     def test_shapes(self):

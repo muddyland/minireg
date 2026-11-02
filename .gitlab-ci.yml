@@ -111,6 +111,8 @@ build:frontend:
   extends: .node_base
   stage: test
   script:
+    # Unit tests for the plain-JS helpers (node's built-in runner, no deps).
+    - npm test
     - npm run build
     # vite writes into backend/app/static, which the image copies in. If the
     # build silently produced nothing, the image would ship an empty SPA.

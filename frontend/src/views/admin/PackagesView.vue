@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue'
 import api from '@/api/client'
 import { errorMessage } from '@/utils/errors'
 import { formatBytes, formatDate, formatNumber, severityClass } from '@/utils/format'
+import { safeHttpUrl } from '@/utils/url'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const packages = ref([])
@@ -221,8 +222,8 @@ onMounted(load)
           <div class="row-tight">
             <template v-for="source in detail.upstreams" :key="source.id ?? 'local'">
               <a
-                v-if="source.web_url"
-                :href="source.web_url"
+                v-if="safeHttpUrl(source.web_url)"
+                :href="safeHttpUrl(source.web_url)"
                 target="_blank"
                 rel="noopener noreferrer"
                 class="badge badge-accent"

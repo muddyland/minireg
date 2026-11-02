@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue'
 import api from '@/api/client'
 import { errorMessage } from '@/utils/errors'
 import { formatDate, severityClass } from '@/utils/format'
+import { safeHttpUrl } from '@/utils/url'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const vulns = ref([])
@@ -318,7 +319,8 @@ onMounted(load)
           <h4 class="small mt">References</h4>
           <ul class="small">
             <li v-for="ref in detail.vulnerability.references.slice(0, 8)" :key="ref.url">
-              <a :href="ref.url" target="_blank" rel="noopener noreferrer">{{ ref.url }}</a>
+              <a v-if="safeHttpUrl(ref.url)" :href="safeHttpUrl(ref.url)" target="_blank" rel="noopener noreferrer">{{ ref.url }}</a>
+              <span v-else>{{ ref.url }}</span>
             </li>
           </ul>
         </template>

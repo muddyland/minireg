@@ -96,6 +96,18 @@ def coerce_text(value, limit: int | None = None) -> str | None:
     return text[:limit] if limit else text
 
 
+def coerce_http_url(value, limit: int | None = None) -> str | None:
+    """A link from upstream metadata (a homepage), kept only if it is http(s).
+
+    The web UI renders it as a link, and anything else -- `javascript:`,
+    `data:` -- is either a script waiting for a click or useless to a reader.
+    """
+    text = coerce_text(value, limit)
+    if text and text.lower().startswith(("http://", "https://")):
+        return text
+    return None
+
+
 def coerce_keywords(value) -> list[str]:
     """Keywords are a list by convention, but a string in the wild."""
     if isinstance(value, str):
@@ -389,7 +401,7 @@ async def persist_remote_package(
     _set(
         package,
         "homepage",
-        coerce_text(remote.homepage, _TEXT_LIMITS["homepage"]) or package.homepage,
+        coerce_http_url(remote.homepage, _TEXT_LIMITS["homepage"]) or package.homepage,
     )
     _set(package, "license", coerce_text(remote.license, _TEXT_LIMITS["license"]) or package.license)
     keywords = coerce_keywords(remote.keywords)

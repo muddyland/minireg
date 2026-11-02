@@ -11,6 +11,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import api from '@/api/client'
 import CodeBlock from '@/components/CodeBlock.vue'
 import { errorMessage } from '@/utils/errors'
+import { safeHttpUrl } from '@/utils/url'
 import { useAuthStore } from '@/stores/auth'
 import {
   SEVERITIES,
@@ -431,7 +432,7 @@ watch(filters, loadFindings)
                           <template v-else>—</template>
                         </span>
                         <span class="dim">Advisory</span>
-                        <span><a v-if="f.url" :href="f.url" target="_blank" rel="noopener noreferrer">{{ f.url }}</a><template v-else>—</template></span>
+                        <span><a v-if="safeHttpUrl(f.url)" :href="safeHttpUrl(f.url)" target="_blank" rel="noopener noreferrer">{{ f.url }}</a><template v-else>{{ f.url || '—' }}</template></span>
                       </div>
                     </td>
                   </tr>
@@ -600,7 +601,7 @@ watch(filters, loadFindings)
             <ul class="kv-list mono small">
               <li v-for="(v, k) in config.labels" :key="k">
                 <span class="kv-k">{{ k }}</span>=<span class="kv-v">
-                  <a v-if="/^https?:\/\//.test(v || '')" :href="v" target="_blank" rel="noopener noreferrer">{{ v }}</a>
+                  <a v-if="safeHttpUrl(v)" :href="safeHttpUrl(v)" target="_blank" rel="noopener noreferrer">{{ v }}</a>
                   <template v-else>{{ v }}</template>
                 </span>
               </li>
