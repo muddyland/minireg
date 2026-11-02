@@ -186,6 +186,27 @@ class TestManifests:
         assert resp.json()["errors"][0]["code"] == "TOOMANYREQUESTS"
         assert resp.headers.get("retry-after") == "60"
 
+    async def test_a_failed_request_does_not_break_the_upstream(self, docker_env):
+        """The registry client is cached per upstream and outlives the
+        request that built it. A request that failed after touching the
+        database rolled back and expired the Upstream row the client held;
+        the next request through the client then died reading it
+        (DetachedInstanceError, a 500), and kept dying until a restart."""
+        client, fake = docker_env
+        img = Image.build("alpine")
+        fake.add_image("library/alpine", "3.20", img)
+        fake.add_image("library/other", "1", Image.build("other"))
+        headers = await anon(client, "alpine")
+        assert (await client.get("/v2/alpine/manifests/3.20", headers=headers)).status_code == 200
+        reg._clients.clear()
+        fake.fail_with = 503
+        other = await anon(client, "other")
+        # Unconfirmed: the digest is held, but not in this repository.
+        assert (await client.get(f"/v2/other/manifests/{img.digest}", headers=other)).status_code == 502
+        fake.fail_with = None
+        resp = await client.get("/v2/other/manifests/1", headers=other)
+        assert resp.status_code == 200, resp.text
+
     async def test_missing_tag_is_negatively_cached(self, docker_env):
         client, fake = docker_env
         fake.add_image("library/alpine", "3.20", Image.build("alpine"))

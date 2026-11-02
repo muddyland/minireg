@@ -240,6 +240,150 @@ class TestMountFollowsPolicy:
         assert resp.status_code == 404
 
 
+def hub_401_for(fake, prefix: str) -> None:
+    """Answer manifest requests for repositories under ``prefix`` the way
+    Docker Hub answers for a repository that does not exist: 401, which
+    minireg reads as "the upstream refused", not "not found"."""
+    default = fake._manifest
+
+    def hook(request):
+        import httpx
+
+        repo, _ = fake._split(request.url.path, "/manifests/")
+        if repo.startswith(prefix):
+            if not fake._authed(request):
+                return fake._challenge(request, repo)
+            return httpx.Response(401, json={"errors": [{"code": "UNAUTHORIZED"}]})
+        return default(request)
+
+    fake.manifest_hook = hook
+
+
+class TestUnconfirmedDigestsStayPut:
+    """A digest minireg holds is linked into another repository only when
+    that repository's upstream confirms it. An upstream that fails, or lies
+    in a HEAD, confirms nothing."""
+
+    async def test_a_quarantined_local_image_is_not_served_through_a_failing_proxy_name(
+        self, docker_env, no_scan_gate
+    ):
+        client, fake = docker_env
+        token = await make_user()
+        ph = await bearer(client, "repository:local/team/app:pull,push", token)
+        img = Image.build("secret-local", layer_sizes=(700,))
+        assert (await push_image(client, "local/team/app", "1", img, ph)).status_code == 201
+        async with db_module.session_scope() as s:
+            await s.execute(
+                update(DockerRepository).where(DockerRepository.name == "local/team/app").values(quarantined=True)
+            )
+        assert (await client.get("/v2/local/team/app/manifests/1", headers=ph)).status_code == 403
+
+        hub_401_for(fake, "nosuch/")
+        reader = await make_user(username="reader", scopes=("read",))
+        rh = await bearer(client, "repository:nosuch/thing:pull", reader)
+        for _ in range(2):  # and nothing was linked by the first attempt
+            resp = await client.get(f"/v2/nosuch/thing/manifests/{img.digest}", headers=rh)
+            assert resp.status_code == 502, resp.text
+            assert resp.json()["errors"][0]["code"] == "UNAVAILABLE"
+        for digest in img.blobs:
+            resp = await client.get(f"/v2/nosuch/thing/blobs/{digest}", headers=rh)
+            assert resp.status_code == 404, digest
+            assert resp.json()["errors"][0]["code"] == "BLOB_UNKNOWN"
+
+    async def test_an_upstream_outage_does_not_link_another_repositorys_image(self, docker_env):
+        client, fake = docker_env
+        img = Image.build("q2")
+        fake.add_image("library/q2", "1", img)
+        fake.add_image("library/other", None, Image.build("unrelated"))
+        h = await anon(client, "q2")
+        assert (await pull(client, "q2", "1", h)).status_code == 200
+        async with db_module.session_scope() as s:
+            await s.execute(update(DockerRepository).values(quarantined=True))
+
+        fake.fail_with = 503
+        other = await anon(client, "other")
+        resp = await pull(client, "other", img.digest, other)
+        assert resp.status_code == 502
+        assert (await client.get(f"/v2/other/blobs/{sha(img.layers[0])}", headers=other)).status_code == 404
+
+    async def test_serve_stale_by_digest_still_works_where_the_image_lives(self, docker_env):
+        client, fake = docker_env
+        img = Image.build("lives-here")
+        fake.add_image("library/home", "1", img)
+        h = await anon(client, "home")
+        assert (await pull(client, "home", "1", h)).status_code == 200
+        fake.fail_with = 503
+        resp = await pull(client, "home", img.digest, h)
+        assert resp.status_code == 200 and resp.content == img.manifest
+
+    async def test_a_head_naming_a_local_digest_does_not_link_it(self, docker_env, no_scan_gate):
+        """A hostile upstream repository moves its tag, in the HEAD only, to
+        the digest of a private image pushed here."""
+        from datetime import UTC, datetime, timedelta
+
+        import httpx
+
+        from app.models import DockerTag
+
+        client, fake = docker_env
+        token = await make_user()
+        ph = await bearer(client, "repository:local/team/private:pull,push", token)
+        secret = Image.build("private", layer_sizes=(900,))
+        assert (await push_image(client, "local/team/private", "1", secret, ph)).status_code == 201
+
+        decoy = Image.build("decoy")
+        fake.add_image("evil/x", "t", decoy)
+        h = await anon(client, "evil/x")
+        assert (await pull(client, "evil/x", "t", h)).status_code == 200
+        default = fake._manifest
+
+        def lying_head(request):
+            if request.method == "HEAD" and request.url.path.endswith("/evil/x/manifests/t"):
+                if not fake._authed(request):
+                    return fake._challenge(request, "evil/x")
+                fake.calls["manifest_head"] += 1
+                return httpx.Response(
+                    200,
+                    headers={"content-type": OCI_MANIFEST, "docker-content-digest": secret.digest,
+                             "content-length": str(len(secret.manifest))},
+                )
+            return default(request)
+
+        fake.manifest_hook = lying_head
+        async with db_module.session_scope() as s:
+            await s.execute(update(DockerTag).values(checked_at=datetime.now(UTC) - timedelta(days=1)))
+
+        resp = await pull(client, "evil/x", "t", h)
+        assert resp.headers.get("docker-content-digest") != secret.digest
+        assert resp.content != secret.manifest
+        assert (await pull(client, "evil/x", secret.digest, h)).status_code != 200
+        for digest in secret.blobs:
+            assert (await client.get(f"/v2/evil/x/blobs/{digest}", headers=h)).status_code == 404, digest
+
+    async def test_a_tag_moving_to_a_digest_of_the_same_upstream_costs_no_get(self, docker_env):
+        """The shortcut the HEAD check exists for still works: a tag moved to
+        an image this upstream already served needs no manifest GET."""
+        from datetime import UTC, datetime, timedelta
+
+        from app.models import DockerTag
+
+        client, fake = docker_env
+        v1, v2 = Image.build("v1"), Image.build("v2")
+        fake.add_image("library/app", "latest", v1)
+        fake.add_image("library/app-next", "1", v2)
+        h = await anon(client, "app")
+        assert (await pull(client, "app", "latest", h)).status_code == 200
+        assert (await pull(client, "app-next", "1", await anon(client, "app-next"))).status_code == 200
+        fake.add_image("library/app", "latest", v2)
+        async with db_module.session_scope() as s:
+            await s.execute(update(DockerTag).values(checked_at=datetime.now(UTC) - timedelta(days=1)))
+        gets = fake.calls["manifest_get"]
+        resp = await pull(client, "app", "latest", h)
+        assert resp.headers["docker-content-digest"] == v2.digest
+        assert resp.headers["x-minireg-cache"] == "revalidated"
+        assert fake.calls["manifest_get"] == gets
+
+
 # --------------------------------------------------------------------------- #
 class TestAcceptNegotiation:
     async def test_real_client_accept_headers_work(self, docker_env):

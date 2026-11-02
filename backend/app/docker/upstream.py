@@ -34,10 +34,12 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from sqlalchemy import inspect as sa_inspect
 
 from ..config import settings
 from ..core.metrics import bump, gauge
@@ -153,7 +155,14 @@ class RegistryClient:
     """One upstream registry."""
 
     def __init__(self, upstream: Upstream) -> None:
-        self.upstream = upstream
+        # A plain copy, not the row: the client is cached across requests
+        # and outlives the session that loaded the row. A rollback in that
+        # session (any request that failed after touching the database)
+        # expires the row, and every later read of it through this client
+        # raised DetachedInstanceError.
+        self.upstream: Any = SimpleNamespace(
+            **{attr.key: getattr(upstream, attr.key) for attr in sa_inspect(Upstream).column_attrs}
+        )
         self.name = upstream.name
         extra = upstream.extra or {}
         if upstream.kind == UpstreamKind.gitlab_oci:

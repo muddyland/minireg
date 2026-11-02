@@ -255,6 +255,16 @@ repository that names it is refused. A layer shared with an allowed image is
 still served. So a blocked image cannot be reassembled by fetching its layers
 by digest, under its own name or any other.
 
+A manifest minireg already holds for one repository is linked into another
+only when that repository's upstream confirms it has the digest: it answers
+the request by digest with the same bytes. An upstream that is down, rate
+limiting or refusing access (Docker Hub answers 401 for a repository that
+doesn't exist) confirms nothing, so the pull fails rather than serving the
+copy held for someone else. Quarantine is per repository: an image that a
+quarantined repository shares with another repository stays available
+there, provided that repository's upstream confirms it. To refuse an image
+everywhere, deny one of its CVEs.
+
 ## Caching and upstream rate limits
 
 - **Tags are revalidated with HEAD.** A cached tag is served as-is for
@@ -266,7 +276,8 @@ by digest, under its own name or any other.
   never revalidated.
 - **Serve-stale.** When the upstream is down, times out or returns 429, the
   cached copy of the tag is served. The response carries
-  `X-Minireg-Cache: stale` and `Warning: 110 - "Response is Stale"`.
+  `X-Minireg-Cache: stale` and `Warning: 110 - "Response is Stale"`. Only
+  what that repository already holds is served stale.
 - **Negative caching.** When the upstream says an image or tag doesn't exist,
   that answer is remembered for a short while (default 60 seconds). A typo
   in a CI matrix then doesn't turn into a stream of upstream requests.

@@ -362,7 +362,10 @@ async def _manifest_by_digest(
 
     # Known digest, not yet seen in this repository: content is verified by
     # digest either way, but make the upstream confirm the repository has it
-    # so one repository cannot be used to serve another's images.
+    # so one repository cannot be used to serve another's images. Only that
+    # confirmation links it here; an upstream that cannot be asked (down,
+    # rate limiting, or answering 401 as Docker Hub does for a repository
+    # that does not exist) confirms nothing.
     client = client_for(target.upstream)
     if await _negative_hit(target, digest):
         raise RegistryError("MANIFEST_UNKNOWN", f"manifest {digest} not found upstream")
@@ -386,10 +389,13 @@ async def _manifest_by_digest(
         await _remember_missing(target, digest)
         raise RegistryError("MANIFEST_UNKNOWN", f"manifest {digest} not found upstream") from exc
     except (UpstreamUnavailable, BlockedTarget) as exc:
-        if have_bytes and row is not None:
-            # Same bytes, verified by digest; serve rather than fail.
-            await link(session, repo, row)
-            await session.commit()
+        # Serve stale only what this repository already holds (a peer may
+        # have linked it while we waited). Linking bytes we merely have,
+        # from another repository or a local push, would hand them -- and,
+        # through blob_in_repo, every layer they name -- to any repository
+        # name whose upstream fails, past that repository's quarantine.
+        row = await _manifest_row(session, digest)
+        if row is not None and store.exists(digest) and await _linked(session, repo, row):
             bump("docker.manifest", result="stale")
             return ServedManifest(row, await _body(row, head), "stale")
         raise _unavailable(exc, f"manifest {digest}") from exc
@@ -467,6 +473,36 @@ async def _manifest_by_tag(
         return await _revalidate(session, target, repo, tag, row, head=head)
 
 
+async def _reusable(
+    session: AsyncSession, target: Target, repo: DockerRepository, manifest: DockerManifest
+) -> bool:
+    """May a tag that moved to ``manifest`` take it without a GET?
+
+    The HEAD's digest header is only the upstream's word; no bytes were
+    verified against it. That word is enough for a digest this upstream has
+    already served (this repository's own, or another repository's of the
+    same upstream). It is not enough for bytes that came from elsewhere --
+    a local push, a different upstream: a hostile repository could name a
+    private image's digest and have it, and its layers, linked under its own
+    name. Those are fetched by digest, which makes the upstream produce
+    them.
+    """
+    if await _linked(session, repo, manifest):
+        return True
+    return (
+        await session.execute(
+            select(DockerRepoManifest.id)
+            .join(DockerRepository, DockerRepository.id == DockerRepoManifest.repository_id)
+            .where(
+                DockerRepoManifest.manifest_id == manifest.id,
+                DockerRepository.upstream_id == target.upstream.id,
+                DockerRepository.is_local.is_(False),
+            )
+            .limit(1)
+        )
+    ).first() is not None
+
+
 async def _revalidate(
     session: AsyncSession,
     target: Target,
@@ -491,9 +527,14 @@ async def _revalidate(
                 return ServedManifest(cached, await _body(cached, head), "revalidated", tag)
             if probe.digest:
                 known = await _manifest_row(session, probe.digest)
-                if known is not None and store.exists(known.digest):
-                    # Moved to a digest we already hold (another repo, or a
-                    # rollback): no GET needed.
+                if (
+                    known is not None
+                    and store.exists(known.digest)
+                    and await _reusable(session, target, repo, known)
+                ):
+                    # Moved to a digest this upstream already gave us (a
+                    # rollback, or another repository of the same upstream):
+                    # no GET needed.
                     await link(session, repo, known)
                     await set_tag(session, repo, tag, known)
                     await session.commit()
