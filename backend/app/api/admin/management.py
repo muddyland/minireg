@@ -307,7 +307,9 @@ class UpstreamCreate(BaseModel):
 
 
 class UpstreamUpdate(BaseModel):
-    name: str | None = None
+    # Same bounds as on create and the column: an empty name used to slip
+    # through, and an over-long one was a database error rather than a 422.
+    name: str | None = Field(default=None, min_length=1, max_length=100)
     url: str | None = None
     tier: int | None = Field(default=None, ge=1, le=100)
     priority: int | None = Field(default=None, ge=0, le=10000)
@@ -550,7 +552,7 @@ async def update_upstream(
     if updates.get("url"):
         updates["url"] = _validated_upstream_url(updates["url"])
     if upstream.ecosystem == Ecosystem.docker:
-        if updates.get("name") and updates["name"] != upstream.name:
+        if updates.get("name") is not None and updates["name"] != upstream.name:
             # The name is the first path segment of every image it serves and
             # part of each cached repository's canonical name. Renaming would
             # break every client reference and orphan the cache.
@@ -578,6 +580,16 @@ async def update_upstream(
         if value is not None and getattr(upstream, field) != value:
             changes[field] = value
             setattr(upstream, field, value)
+    if "name" in changes:
+        # Names are unique; renaming onto another upstream's name is a
+        # conflict to report, not a 500 from the commit below.
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            await session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="an upstream with that name already exists"
+            ) from exc
 
     if payload.credential is not None:
         # An empty string clears the stored credential.
