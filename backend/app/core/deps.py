@@ -333,7 +333,11 @@ async def _basic_password_identity(
     user = (
         await session.execute(select(User).where(User.username == username))
     ).scalar_one_or_none()
-    if user and user.is_active and verify_password(password, user.password_hash):
+    # Verify before looking at anything else, so an unknown or disabled
+    # account costs the same argon2 work as a real one. Skipping it answered
+    # unknown names in microseconds, which enumerates accounts.
+    password_ok = verify_password(password, user.password_hash if user else None)
+    if user and user.is_active and password_ok:
         return Identity(user=user, method=PASSWORD_BASIC)
 
     with contextlib.suppress(Exception):

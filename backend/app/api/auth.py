@@ -129,7 +129,10 @@ async def login(
         await session.execute(select(User).where(User.username == payload.username))
     ).scalar_one_or_none()
 
-    if user is None or not verify_password(payload.password, user.password_hash):
+    # Always pay for one argon2 verify -- against a dummy hash when there is
+    # no such user -- so the response time does not say which usernames exist.
+    password_ok = verify_password(payload.password, user.password_hash if user else None)
+    if user is None or not password_ok:
         await audit.record_audit(
             session,
             audit.LOGIN_FAILED,

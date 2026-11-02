@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import base64
 
+import pytest
 from sqlalchemy import func, select
 
 from app import db as db_module
 from app.config import settings
+from app.core import security
 from app.models import ApiToken, Package, User
 from tests import test_integration as _integration
 from tests.test_integration import auth, npm_publish_body
@@ -117,3 +119,60 @@ class TestPasswordBasicIsReadOnly:
             headers=auth(app_client),
         )
         assert resp.status_code in (200, 201), resp.text
+
+
+# --------------------------------------------------------------------------- #
+class TestEveryLoginPaysForOneVerify:
+    """An unknown (or, over Basic, a disabled) account skipped argon2 and
+    answered in microseconds, while a real one took ~60 ms: a reliable
+    oracle for which usernames exist."""
+
+    @pytest.fixture
+    def verifies(self, monkeypatch):
+        real = security._hasher
+        calls: list[str] = []
+
+        class Counting:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def verify(self, hashed, password):
+                calls.append(hashed)
+                return real.verify(hashed, password)
+
+        monkeypatch.setattr(security, "_hasher", Counting())
+        return calls
+
+    async def _disable(self, username):
+        async with db_module.session_scope() as session:
+            user = (
+                await session.execute(select(User).where(User.username == username))
+            ).scalar_one()
+            user.is_active = False
+
+    async def test_login_endpoint(self, app_client, verifies):
+        await self._disable("reader")
+        for username in ("nobody-here", "publisher", "reader"):
+            verifies.clear()
+            resp = await app_client.post(
+                "/api/auth/login", json={"username": username, "password": "wrong-password"}
+            )
+            assert resp.status_code == 401
+            assert len(verifies) == 1, username
+
+    async def test_basic_password(self, app_client, verifies):
+        await self._disable("reader")
+        for username in ("nobody-here", "publisher", "reader"):
+            verifies.clear()
+            resp = await app_client.get(
+                "/api/auth/me", headers=password_basic(username, "wrong-password")
+            )
+            assert resp.status_code == 401
+            assert len(verifies) == 1, username
+        # A disabled account is refused even with its right password.
+        verifies.clear()
+        resp = await app_client.get(
+            "/api/auth/me", headers=password_basic("reader", "reader-password-12345")
+        )
+        assert resp.status_code == 401
+        assert len(verifies) == 1
