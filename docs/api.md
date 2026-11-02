@@ -220,7 +220,8 @@ See [Container images](containers.md) for naming, the mirror, and policy.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/auth/login` | Password sign-in |
-| `POST` | `/api/auth/logout` | Sign out |
+| `POST` | `/api/auth/logout` | Sign out; the session cookie is revoked server-side, so a copy of it stops working too |
+| `POST` | `/api/auth/logout-everywhere` | End every browser session of this account, this one included (API tokens are unaffected) |
 | `GET` | `/api/auth/me` | Current identity and scopes |
 | `POST` | `/api/auth/password` | Change password |
 | `GET` | `/api/auth/tokens` | List your tokens |
@@ -230,8 +231,8 @@ See [Container images](containers.md) for naming, the mirror, and policy.
 | `GET` | `/api/auth/oidc/login` | Start the SSO flow |
 | `GET` | `/api/auth/oidc/callback` | SSO callback |
 
-Changing the password and listing, creating or revoking tokens need a
-primary credential: a browser session, or a token with the `admin` scope.
+Changing the password, signing out everywhere and listing, creating or
+revoking tokens need a primary credential: a browser session, or a token with the `admin` scope.
 An account password over HTTP Basic is not one (it is read-only). A leaked `read` or `publish` token gets `403` there, so it can
 neither mint a wider token nor enumerate or revoke its owner's others.
 

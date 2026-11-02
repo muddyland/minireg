@@ -124,9 +124,11 @@ class User(Base):
     password_hash: Mapped[str | None] = mapped_column(String(255))
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # Bumped whenever every existing session for this user must stop working:
-    # a password change, or an explicit "sign out everywhere". Sessions are
-    # stateless JWTs, so without a version to compare against, logging out or
-    # changing a password left a stolen cookie valid for its full 12 hours.
+    # a password change or reset, a withdrawn right, linking to an SSO
+    # subject, or an explicit "sign out everywhere". Sessions are stateless
+    # JWTs, so without a version to compare against, a password change left a
+    # stolen cookie valid for its full 12 hours. Signing out of one browser
+    # revokes just that session instead, through RevokedSession.
     session_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     can_publish: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -177,6 +179,24 @@ class ApiToken(Base):
     docker_repo_prefixes: Mapped[list] = mapped_column(JSONType, default=list)
 
     user: Mapped[User] = relationship(back_populates="tokens")
+
+
+class RevokedSession(Base):
+    """A session cookie signed out before it expired.
+
+    Session cookies are stateless JWTs, so deleting one from the browser that
+    signs out does nothing to a copy of it -- that copy stayed valid for the
+    rest of its 12 hours. Each cookie carries a random ``jti``; signing out
+    records it here until the cookie would have expired anyway, and the
+    session check refuses any cookie listed. Kept in the database rather
+    than the cache so that a cache outage cannot bring a signed-out session
+    back. Expired rows are pruned on the next sign-out.
+    """
+
+    __tablename__ = "revoked_sessions"
+
+    jti: Mapped[str] = mapped_column(String(64), primary_key=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class DeviceAuthorization(Base):

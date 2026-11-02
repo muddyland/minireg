@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
@@ -27,6 +27,7 @@ from ..core.deps import (
 from ..core.security import (
     create_session_token,
     create_state_token,
+    decode_session_token,
     decode_state_token,
     generate_token,
     hash_password,
@@ -34,7 +35,7 @@ from ..core.security import (
     verify_password,
 )
 from ..db import get_session
-from ..models import ApiToken, AuthProvider, User
+from ..models import ApiToken, AuthProvider, RevokedSession, User
 from ..services import audit, oidc
 
 log = logging.getLogger(__name__)
@@ -199,7 +200,14 @@ async def logout(
     session: AsyncSession = Depends(get_session),
     identity: Identity = Depends(resolve_identity),
 ) -> dict:
+    """Sign this browser out, and revoke its session cookie server-side.
+
+    Deleting the cookie alone left any copy of it (from a shared machine, a
+    proxy log, malware) valid for the rest of its lifetime.
+    """
     if identity.is_authenticated:
+        if identity.method == "session":
+            await _revoke_session_cookie(session, request, identity)
         await audit.record_audit(
             session,
             audit.LOGOUT,
@@ -208,6 +216,55 @@ async def logout(
             ip=client_ip(request),
         )
         await session.commit()
+    response.delete_cookie(settings.session_cookie, path="/")
+    return {"ok": True}
+
+
+async def _revoke_session_cookie(
+    session: AsyncSession, request: Request, identity: Identity
+) -> None:
+    """List the presented session cookie as revoked until it would expire."""
+    payload = decode_session_token(request.cookies.get(settings.session_cookie) or "")
+    if payload is None:
+        return
+    now = datetime.now(UTC)
+    # Opportunistic pruning keeps the table at "sign-outs in the last TTL".
+    await session.execute(delete(RevokedSession).where(RevokedSession.expires_at < now))
+    jti = payload.get("jti")
+    if not jti:
+        # Issued before cookies carried an id, so it cannot be listed on its
+        # own: end every session of this user instead of leaving it valid.
+        user = identity.user
+        assert user is not None
+        user.session_version = (user.session_version or 0) + 1
+        return
+    expires = datetime.fromtimestamp(int(payload.get("exp") or 0), UTC)
+    if expires > now and await session.get(RevokedSession, str(jti)[:64]) is None:
+        session.add(RevokedSession(jti=str(jti)[:64], expires_at=expires))
+
+
+@router.post("/logout-everywhere")
+async def logout_everywhere(
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+    identity: Identity = Depends(require_primary_credential),
+) -> dict:
+    """End every browser session of this account, this one included.
+
+    API tokens are not affected; revoke those individually.
+    """
+    user = identity.user
+    assert user is not None
+    user.session_version = (user.session_version or 0) + 1
+    await audit.record_audit(
+        session,
+        audit.LOGOUT_EVERYWHERE,
+        actor_user_id=user.id,
+        actor_username=user.username,
+        ip=client_ip(request),
+    )
+    await session.commit()
     response.delete_cookie(settings.session_cookie, path="/")
     return {"ok": True}
 

@@ -285,8 +285,10 @@ the ones that matter for that job.
   and shown exactly once. Upstream credentials encrypted at rest, never
   returned by the API.
 - An `Authorization` header is authoritative — a rejected token never falls
-  back to a session cookie. Sessions carry a version that a password change
-  bumps, so changing it ejects every other session.
+  back to a session cookie. Signing out revokes that session's cookie on the
+  server, not just in the browser. Sessions carry a version that a password
+  change or reset bumps, so it ejects every other session; **Account → Sign
+  out everywhere** does the same on demand.
 - Failed login attempts limited per IP, per username from that IP, and per
   username overall (at a higher ceiling), over Basic auth as well as the
   login endpoint, and both outcomes audited. Those limits fall back to

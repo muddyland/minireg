@@ -143,6 +143,9 @@ def create_session_token(
         # or an explicit sign-out-everywhere invalidates existing cookies
         # instead of leaving them valid for the rest of their 12 hours.
         "sv": session_version,
+        # Names this one session, so signing out can revoke it alone (see
+        # models.RevokedSession) without signing out every other browser.
+        "jti": secrets.token_urlsafe(16),
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=ttl or settings.session_ttl_seconds)).timestamp()),
         "typ": "session",

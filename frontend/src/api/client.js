@@ -63,6 +63,7 @@ export const api = {
   login: (username, password) =>
     request('/api/auth/login', { method: 'POST', body: { username, password } }),
   logout: () => request('/api/auth/logout', { method: 'POST' }),
+  logoutEverywhere: () => request('/api/auth/logout-everywhere', { method: 'POST' }),
   me: () => request('/api/auth/me'),
   changePassword: (current_password, new_password) =>
     request('/api/auth/password', { method: 'POST', body: { current_password, new_password } }),

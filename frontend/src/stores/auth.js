@@ -54,6 +54,14 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  // Ends every browser session of this account, this one included. Unlike
+  // logout(), a failure is reported: the caller asked for the others to end.
+  async function logoutEverywhere() {
+    await api.logoutEverywhere()
+    user.value = null
+    scopes.value = []
+  }
+
   return {
     user,
     scopes,
@@ -67,5 +75,6 @@ export const useAuthStore = defineStore('auth', () => {
     loadOidcStatus,
     login,
     logout,
+    logoutEverywhere,
   }
 })

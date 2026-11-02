@@ -33,7 +33,7 @@ from ..core.security import (
     verify_token_secret,
 )
 from ..db import get_session
-from ..models import ApiToken, AuthProvider, User
+from ..models import ApiToken, AuthProvider, RevokedSession, User
 
 log = logging.getLogger(__name__)
 
@@ -405,6 +405,19 @@ async def _basic_password_identity(
     return Identity()
 
 
+async def session_revoked(session: AsyncSession, payload: dict) -> bool:
+    """Whether this session cookie was signed out (see RevokedSession).
+
+    Cookies issued before sessions carried a ``jti`` cannot be listed; they
+    run out within SESSION_TTL_SECONDS of the upgrade, and signing one out
+    falls back to ending all of the user's sessions.
+    """
+    jti = payload.get("jti")
+    if not jti:
+        return False
+    return await session.get(RevokedSession, str(jti)[:64]) is not None
+
+
 async def resolve_identity(
     request: Request, session: AsyncSession = Depends(get_session)
 ) -> Identity:
@@ -451,7 +464,12 @@ async def resolve_identity(
             # The version in the cookie must still match the user row: a
             # password change or a sign-out-everywhere bumps it, which is what
             # makes a stateless session revocable.
-            if user and user.is_active and payload.get("sv", 0) == user.session_version:
+            if (
+                user
+                and user.is_active
+                and payload.get("sv", 0) == user.session_version
+                and not await session_revoked(session, payload)
+            ):
                 # The cookie is the one credential a browser attaches on its
                 # own, so it is the only one a cross-site request can ride.
                 reject_cross_site(request)

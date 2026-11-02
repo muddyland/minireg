@@ -631,3 +631,89 @@ class TestAdminChangesEndSessions:
         )
         assert resp.status_code == 200
         assert (await app_client.get("/api/auth/me")).status_code == 200
+
+
+class TestSigningOutRevokesTheSession:
+    """Logout only deleted the cookie from the browser that asked; any copy
+    of it stayed valid for the rest of its 12 hours. And there was no way to
+    end one's other sessions short of changing the password."""
+
+    async def _works(self, client, cookie) -> bool:
+        client.cookies.clear()
+        client.cookies.set(settings.session_cookie, cookie)
+        ok = (await client.get("/api/auth/me")).status_code == 200
+        client.cookies.clear()
+        return ok
+
+    async def test_a_copied_cookie_dies_with_the_logout(self, app_client):
+        copied = await login(app_client)
+        other = await login(app_client)  # a second browser
+        app_client.cookies.clear()
+        app_client.cookies.set(settings.session_cookie, copied)
+        assert (await app_client.post("/api/auth/logout", headers=SAME_ORIGIN)).status_code == 200
+        assert not await self._works(app_client, copied)
+        # Only that session: the other browser stays signed in.
+        assert await self._works(app_client, other)
+        # Signing out twice is harmless.
+        app_client.cookies.set(settings.session_cookie, copied)
+        assert (await app_client.post("/api/auth/logout", headers=SAME_ORIGIN)).status_code == 200
+
+    async def test_expired_entries_are_pruned(self, app_client):
+        from datetime import UTC, datetime, timedelta
+
+        from app.models import RevokedSession
+
+        async with db_module.session_scope() as session:
+            session.add(
+                RevokedSession(jti="old", expires_at=datetime.now(UTC) - timedelta(hours=1))
+            )
+        await login(app_client)
+        await app_client.post("/api/auth/logout", headers=SAME_ORIGIN)
+        async with db_module.session_scope() as session:
+            jtis = (await session.execute(select(RevokedSession.jti))).scalars().all()
+        assert "old" not in jtis and len(jtis) == 1
+
+    async def test_a_cookie_from_before_the_upgrade_ends_all_sessions(self, app_client):
+        """No jti to list, so logout falls back to sign-out-everywhere."""
+        import jwt as pyjwt
+
+        row = await user_row("publisher")
+        payload = pyjwt.decode(await login(app_client), options={"verify_signature": False})
+        payload.pop("jti")
+        legacy = pyjwt.encode(payload, settings.secret_key, algorithm="HS256")
+        other = await login(app_client)
+        assert await self._works(app_client, legacy)
+        app_client.cookies.set(settings.session_cookie, legacy)
+        assert (await app_client.post("/api/auth/logout", headers=SAME_ORIGIN)).status_code == 200
+        assert not await self._works(app_client, legacy)
+        assert not await self._works(app_client, other)
+        assert (await user_row("publisher")).session_version == row.session_version + 1
+
+    async def test_sign_out_everywhere(self, app_client):
+        first = await login(app_client)
+        second = await login(app_client)
+        resp = await app_client.post("/api/auth/logout-everywhere", headers=SAME_ORIGIN)
+        assert resp.status_code == 200
+        assert not await self._works(app_client, first)
+        assert not await self._works(app_client, second)
+        # Tokens are separate credentials and keep working.
+        assert (await app_client.get("/api/auth/me", headers=auth(app_client))).status_code == 200
+        async with db_module.session_scope() as session:
+            actions = (await session.execute(select(AuditLog.action))).scalars().all()
+        assert "auth.logout.everywhere" in actions
+        await login(app_client)  # and signing in again works
+
+    async def test_sign_out_everywhere_needs_a_primary_credential(self, app_client):
+        cookie = await login(app_client)
+        app_client.cookies.clear()
+        # Not a read token, and not a password over Basic...
+        for headers in (auth(app_client, "reader"), password_basic()):
+            resp = await app_client.post("/api/auth/logout-everywhere", headers=headers)
+            assert resp.status_code == 403
+        # ...and not a cross-site form riding the cookie.
+        app_client.cookies.set(settings.session_cookie, cookie)
+        resp = await app_client.post(
+            "/api/auth/logout-everywhere", headers={"sec-fetch-site": "cross-site"}
+        )
+        assert resp.status_code == 403
+        assert await self._works(app_client, cookie)
