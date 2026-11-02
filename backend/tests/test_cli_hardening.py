@@ -324,3 +324,92 @@ class TestServerDropsMalformedFixVersions:
         assert lowest_clearing_version("npm", [{"fixed_version": INJECTED_NPM}], "4.17.0") is None
         assert lowest_clearing_version("cargo", [{"fixed_version": "1.0.0\n"}], "0.9.0") is None
         assert lowest_clearing_version("npm", [{"fixed_version": "4.17.21"}], "4.17.0") == "4.17.21"
+
+
+# --------------------------------------------------------------------------- #
+# --fix reports what it did not change honestly
+# --------------------------------------------------------------------------- #
+def run_fix(tmp_path, monkeypatch, source, ecosystem, findings, dry_run=False):
+    monkeypatch.setattr(cli, "verify_fixes", lambda *a: [])
+    args = argparse.Namespace(dry_run=dry_run, yes=True, insecure=False)
+    cli.apply_fixes(args, "https://reg.example", "t", tmp_path, [(source, ecosystem, findings)])
+
+
+def finding(name, version, fix):
+    return {"name": name, "version": version, "fix_version": fix, "cves": [{"cve_id": "CVE-X"}]}
+
+
+class TestFixReportsHonestly:
+    @pytest.mark.parametrize(
+        "lockfile, command",
+        [
+            ("poetry.lock", 'poetry add "requests>=2.31.0"'),
+            ("uv.lock", 'uv lock --upgrade-package "requests==2.31.0"'),
+            ("Pipfile.lock", 'pipenv upgrade "requests>=2.31.0"'),
+        ],
+    )
+    def test_tool_owned_lockfiles_get_the_tools_command(
+        self, tmp_path, monkeypatch, capsys, lockfile, command
+    ):
+        lock = tmp_path / lockfile
+        lock.write_text('[[package]]\nname = "requests"\nversion = "2.19.0"\n')
+        run_fix(tmp_path, monkeypatch, lock, "pypi", [finding("requests", "2.19.0", "2.31.0")])
+        out = capsys.readouterr()
+        assert command in out.out
+        assert "already at or above" not in out.out + out.err
+        assert "nothing to change" not in out.out
+        assert lock.read_text() == '[[package]]\nname = "requests"\nversion = "2.19.0"\n'
+
+    def test_a_higher_pin_is_not_downgraded(self, tmp_path, monkeypatch, capsys):
+        req = tmp_path / "requirements.txt"
+        req.write_text("requests==2.32.3\n")
+        run_fix(tmp_path, monkeypatch, req, "pypi", [finding("requests", "2.32.3", "2.31.0")])
+        assert req.read_text() == "requests==2.32.3\n"
+        assert "already at or above the fixed version: requests==2.32.3" in capsys.readouterr().out
+
+    def test_pep440_comparison(self):
+        assert cli.version_at_least("pypi", "2.31", "2.31.0") is True
+        assert cli.version_at_least("pypi", "2.31.0rc1", "2.31.0") is False
+        assert cli.version_at_least("pypi", "2.31.0.post1", "2.31.0") is True
+        assert cli.version_at_least("pypi", "2.31.0.dev1", "2.31.0a1") is False
+        assert cli.version_at_least("pypi", "10.0", "9.9") is True
+        assert cli.version_at_least("npm", "1.0.0-beta.2", "1.0.0") is False
+        assert cli.version_at_least("npm", "1.0.0-beta.11", "1.0.0-beta.2") is True
+        assert cli.version_at_least("pypi", "weird", "1.0") is None
+
+    def test_a_range_is_reported_not_called_fixed(self, tmp_path, monkeypatch, capsys):
+        req = tmp_path / "requirements.txt"
+        req.write_text("requests>=2.0\n")
+        run_fix(tmp_path, monkeypatch, req, "pypi", [finding("requests", "2.19.0", "2.31.0")])
+        out = capsys.readouterr()
+        assert "already at or above" not in out.out
+        assert "no exact pin" in out.err and "requests>=2.31.0" in out.err
+
+    def test_a_pin_in_an_included_file_is_rewritten_there(self, tmp_path, monkeypatch, capsys):
+        req = tmp_path / "requirements.txt"
+        req.write_text("-r common.txt\nflask==3.0.0\n")
+        common = tmp_path / "common.txt"
+        common.write_text("requests==2.19.0  # shared\n")
+        run_fix(tmp_path, monkeypatch, req, "pypi", [finding("requests", "2.19.0", "2.31.0")])
+        assert common.read_text() == "requests==2.31.0  # shared\n"
+        assert req.read_text() == "-r common.txt\nflask==3.0.0\n"
+        out = capsys.readouterr().out
+        assert str(common) in out and "already at or above" not in out
+
+    def test_npm_transitive_and_higher_declarations(self, tmp_path, monkeypatch, capsys):
+        lock = tmp_path / "package-lock.json"
+        lock.write_text("{}")
+        pj = tmp_path / "package.json"
+        original = '{"dependencies": {"vite": "^6.0.0"}}'
+        pj.write_text(original)
+        run_fix(
+            tmp_path,
+            monkeypatch,
+            lock,
+            "npm",
+            [finding("vite", "6.0.0", "5.4.6"), finding("minimist", "1.2.5", "1.2.6")],
+        )
+        assert pj.read_text() == original  # never lowered to ^5.4.6
+        out = capsys.readouterr()
+        assert "already at or above the fixed version: vite ^6.0.0" in out.out
+        assert "not declared" in out.err and "minimist>=1.2.6" in out.err

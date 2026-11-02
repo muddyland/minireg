@@ -1505,13 +1505,105 @@ def _print_cargo_fix_advice(path: Path, findings: list[dict]) -> int:
     return len(fixes)
 
 
+#: Lockfiles another tool owns, and the command that raises one package in
+#: each. Editing them by hand would leave the lock disagreeing with its
+#: hashes and with pyproject.toml / Pipfile, so --fix hands back the command.
+_PYPI_TOOL_ADVICE = {
+    "poetry.lock": ("poetry", 'poetry add "{name}>={version}"'),
+    "uv.lock": ("uv", 'uv lock --upgrade-package "{name}=={version}"'),
+    "Pipfile.lock": ("pipenv", 'pipenv upgrade "{name}>={version}"'),
+}
+
+
+def _print_tool_fix_advice(path: Path, findings: list[dict], tool: str, template: str) -> int:
+    """Like the cargo advice, for a PyPI lockfile owned by `tool`."""
+    fixes = sorted({(f["name"], f["fix_version"]) for f in usable_fixes("pypi", findings)})
+    if not fixes:
+        if findings:
+            print(f"    {dim(path.name)}: nothing with a published fix")
+        return 0
+    print(f"    {dim(path.name)}: run these — {tool} owns the lockfile")
+    for name, version in fixes:
+        print(f"      {template.format(name=name, version=version)}")
+    return len(fixes)
+
+
+_PEP440_PARTS_RE = re.compile(
+    r"v?(?:(?P<epoch>[0-9]+)!)?(?P<release>[0-9]+(?:\.[0-9]+)*)"
+    r"(?:[-_.]?(?P<pre_l>a|b|c|rc|alpha|beta|pre|preview)[-_.]?(?P<pre_n>[0-9]*))?"
+    r"(?P<post>-(?P<post_n1>[0-9]+)|[-_.]?(?:post|rev|r)[-_.]?(?P<post_n2>[0-9]*))?"
+    r"(?P<dev>[-_.]?dev[-_.]?(?P<dev_n>[0-9]*))?"
+    r"(?:\+[a-z0-9]+(?:[-_.][a-z0-9]+)*)?",
+    re.IGNORECASE,
+)
+_PRE_RANK = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2, "pre": 2, "preview": 2}
+
+
+def _version_key(ecosystem: str, version: str):
+    """A sort key for one version, or None when it cannot be read.
+
+    Enough of PEP 440 / semver precedence to tell whether a pin is already at
+    or above a fix; not a general implementation (local versions and build
+    metadata are ignored, as they are for precedence).
+    """
+    if ecosystem == "pypi":
+        m = _PEP440_PARTS_RE.fullmatch(version or "")
+        if m is None:
+            return None
+        release = [int(x) for x in m.group("release").split(".")]
+        while len(release) > 1 and release[-1] == 0:
+            release.pop()
+        post = m.group("post_n1") or m.group("post_n2")
+        has_post = m.group("post") is not None
+        if m.group("pre_l"):
+            pre = (0, _PRE_RANK[m.group("pre_l").lower()], int(m.group("pre_n") or 0))
+        elif m.group("dev") and not has_post:
+            pre = (-1,)
+        else:
+            pre = (1,)
+        post_key = (int(post or 0),) if has_post else (-1,)
+        dev_key = (0, int(m.group("dev_n") or 0)) if m.group("dev") else (1,)
+        return (int(m.group("epoch") or 0), tuple(release), pre, post_key, dev_key)
+    m = re.fullmatch(
+        r"(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", version or ""
+    )
+    if m is None:
+        return None
+    numbers = tuple(int(x or 0) for x in m.group(1, 2, 3))
+    if not m.group(4):
+        return (numbers, (1,))
+    idents = tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in m.group(4).split("."))
+    return (numbers, (0, idents))
+
+
+def version_at_least(ecosystem: str, current: str, target: str):
+    """True/False when ``current >= target``; None when either is unreadable."""
+    a, b = _version_key(ecosystem, current), _version_key(ecosystem, target)
+    if a is None or b is None:
+        return None
+    return a >= b
+
+
 def normalize_key(ecosystem: str, name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower() if ecosystem == "pypi" else name.lower()
 
 
-def plan_requirements_fix(path: Path, fixes: dict) -> tuple[str, list[str]]:
-    """Return the rewritten requirements.txt and a description of each change."""
-    original = path.read_text()
+def _new_fix_report() -> dict:
+    """What a planner found for each fix: pinned at all, already high enough,
+    or pinned to something it could not compare."""
+    return {"pinned": set(), "already": [], "uncompared": []}
+
+
+def plan_requirements_fix(
+    path: Path, fixes: dict, report: dict | None = None, text: str | None = None
+) -> tuple[str, list[str]]:
+    """Return the rewritten requirements.txt and a description of each change.
+
+    ``text`` plans on top of an earlier plan for the same file. ``report``,
+    if given, is filled in as by :func:`_new_fix_report`.
+    """
+    original = path.read_text() if text is None else text
+    report = _new_fix_report() if report is None else report
     changes = []
     out = []
 
@@ -1522,8 +1614,21 @@ def plan_requirements_fix(path: Path, fixes: dict) -> tuple[str, list[str]]:
             out.append(line)
             continue
 
-        target = fixes.get(normalize_key("pypi", match.group("name")))
-        if not valid_fix_version("pypi", target) or target == match.group("version"):
+        key = normalize_key("pypi", match.group("name"))
+        target = fixes.get(key)
+        if not valid_fix_version("pypi", target):
+            out.append(line)
+            continue
+        report["pinned"].add(key)
+        current = match.group("version")
+        at_least = version_at_least("pypi", current, target)
+        if at_least is None:
+            # Never guess: rewriting an unreadable pin could be a downgrade.
+            report["uncompared"].append(f"{match.group('name')}=={current} (fix: {target})")
+            out.append(line)
+            continue
+        if at_least:
+            report["already"].append(f"{match.group('name')}=={current}")
             out.append(line)
             continue
 
@@ -1537,8 +1642,11 @@ def plan_requirements_fix(path: Path, fixes: dict) -> tuple[str, list[str]]:
     return "".join(out), changes
 
 
-def plan_package_json_fix(path: Path, fixes: dict) -> tuple[str, list[str], list[str]]:
+def plan_package_json_fix(
+    path: Path, fixes: dict, report: dict | None = None
+) -> tuple[str, list[str], list[str]]:
     """Rewrite package.json dependency ranges. Returns (text, changes, skipped)."""
+    report = _new_fix_report() if report is None else report
     original = path.read_text()
     try:
         data = json.loads(original)
@@ -1559,13 +1667,16 @@ def plan_package_json_fix(path: Path, fixes: dict) -> tuple[str, list[str], list
             if not valid_fix_version("npm", target) or not isinstance(spec, str):
                 continue
 
+            report["pinned"].add(normalize_key("npm", name))
             match = _NPM_RANGE_RE.match(spec.strip())
             if match is None:
                 # A tag, git URL or file: path -- not something we can safely
                 # bump by rewriting a version number.
                 skipped.append(f"{name} ({spec})")
                 continue
-            if match.group("version") == target:
+            if version_at_least("npm", match.group("version"), target):
+                # Already at or above the fix: raising "to" it would lower it.
+                report["already"].append(f"{name} {spec}")
                 continue
 
             new_spec = f"{match.group('op') or ''}{target}"
@@ -1594,12 +1705,98 @@ def render_diff(path: Path, before: str, after: str) -> str:
         )
     )
 
+def _add_plan(plans, target: Path, before, after, changes, ecosystem, fixes) -> None:
+    entry = plans.get(target.resolve())
+    if entry is None:
+        plans[target.resolve()] = {
+            "target": target,
+            "before": before,
+            "after": after,
+            "changes": list(changes),
+            "ecosystem": ecosystem,
+            "fixes": dict(fixes),
+        }
+    else:
+        entry["after"] = after
+        entry["changes"].extend(changes)
+        entry["fixes"].update(fixes)
+
+
+def _plan_requirements_tree(plans: dict, target: Path, fixes: dict, report: dict) -> None:
+    """Plan ``target``, then the same-directory files it ``-r`` includes.
+
+    The audit merges a plain include (``-r common.txt``) into the file that
+    includes it, so a finding reported under requirements.txt can be pinned
+    in common.txt. That pin is rewritten where it lives -- the plan shows
+    that file's own name -- instead of the including file being reported as
+    already fixed.
+    """
+    queue = [target]
+    visited: set[Path] = set()
+    while queue:
+        current = queue.pop(0)
+        resolved = current.resolve()
+        if resolved in visited or not current.is_file():
+            continue
+        visited.add(resolved)
+        remaining = {k: v for k, v in fixes.items() if k not in report["pinned"]}
+        if not remaining:
+            return
+        earlier = plans.get(resolved)
+        before = earlier["after"] if earlier else current.read_text()
+        after, changes = plan_requirements_fix(current, remaining, report, text=before)
+        if changes and "--hash=" in before:
+            # Editing a version invalidates every recorded hash, and we
+            # cannot recompute them without downloading the artifacts.
+            info(
+                f"    {yellow('skip')} {current.name}: it pins hashes; "
+                "regenerate it with pip-compile instead"
+            )
+        elif changes:
+            original = earlier["before"] if earlier else before
+            _add_plan(plans, current, original, after, changes, "pypi", remaining)
+        for raw in before.splitlines():
+            include = _INCLUDE_RE.match(raw.split("#", 1)[0].strip())
+            if include:
+                child = (current.parent / include.group("file")).resolve()
+                if child.parent == target.parent.resolve():
+                    queue.append(child)
+
+
+def _report_unplanned(target: Path, ecosystem: str, fixes: dict, report: dict) -> None:
+    """Say plainly what --fix did not change, and why."""
+    if report["already"]:
+        print(
+            f"    {dim(target.name)}: already at or above the fixed version: "
+            + ", ".join(report["already"])
+        )
+    for entry in report["uncompared"]:
+        info(f"    {yellow('check')} {target.name}: could not compare {entry}; change it by hand")
+    missing = sorted(
+        f"{name}>={version}" for name, version in fixes.items() if name not in report["pinned"]
+    )
+    if not missing:
+        return
+    if ecosystem == "npm":
+        info(
+            f"    {yellow('not declared')} in {target.name}: {', '.join(missing)} -- "
+            "a transitive dependency; raise it through its parent or an `overrides` entry"
+        )
+    else:
+        info(
+            f"    {yellow('no exact pin')} in {target.name} or the files it includes: "
+            f"{', '.join(missing)} -- raise it by hand"
+        )
+
+
 def apply_fixes(args, registry, token, root: Path, per_source) -> None:
     """Propose (and optionally write) dependency bumps that clear the CVEs."""
     print()
     print(f"  {bold('Remediation')}")
 
-    planned = []
+    # Planned rewrites by file, so a file reached twice (an include shared by
+    # two requirements files) is planned once, on top of its earlier plan.
+    plans: dict[Path, dict] = {}
     # Sources we cannot rewrite but did give the user something actionable, so
     # the "nothing to change" line below does not contradict advice we just
     # printed.
@@ -1612,6 +1809,18 @@ def apply_fixes(args, registry, token, root: Path, per_source) -> None:
             # break, not a bump. cargo already owns this operation, so print the
             # exact invocations instead of guessing at the file.
             advised += _print_cargo_fix_advice(path, findings)
+            continue
+        if ecosystem == "pypi" and path.name in _PYPI_TOOL_ADVICE:
+            # Same reasoning: poetry, uv and pipenv own their lockfiles, and
+            # the requirement that has to rise lives in pyproject.toml or
+            # Pipfile. There used to be no branch here, so the lockfile itself
+            # was "planned", matched no requirements line, and was reported
+            # as already at or above the fixed versions.
+            tool, template = _PYPI_TOOL_ADVICE[path.name]
+            advised += _print_tool_fix_advice(path, findings, tool, template)
+            continue
+        if ecosystem == "pypi" and not _is_requirements_name(path.name):
+            info(f"    {yellow('skip')} {path.name}: --fix only rewrites requirements files")
             continue
 
         fixable = {
@@ -1631,30 +1840,25 @@ def apply_fixes(args, registry, token, root: Path, per_source) -> None:
             info(f"    {yellow('skip')} {path.name}: {target.name} not found next to it")
             continue
 
-        before = target.read_text()
+        report = _new_fix_report()
         if target.name == "package.json":
-            after, changes, skipped = plan_package_json_fix(target, fixable)
+            before = target.read_text()
+            after, changes, skipped = plan_package_json_fix(target, fixable, report)
+            for entry in skipped:
+                info(dim(f"    could not rewrite {entry}"))
+            if changes:
+                _add_plan(plans, target, before, after, changes, ecosystem, fixable)
         else:
-            if "--hash=" in before:
-                # Editing a version invalidates every recorded hash, and we
-                # cannot recompute them without downloading the artifacts.
-                info(
-                    f"    {yellow('skip')} {target.name}: it pins hashes; "
-                    "regenerate it with pip-compile instead"
-                )
-                continue
-            after, changes = plan_requirements_fix(target, fixable)
-            skipped = []
+            _plan_requirements_tree(plans, target, fixable, report)
 
-        for entry in skipped:
-            info(dim(f"    could not rewrite {entry}"))
-        if not changes:
-            print(f"    {dim(target.name)}: already at or above the fixed versions")
-            continue
-
-        planned.append((target, before, after, changes, ecosystem, fixable))
+        _report_unplanned(target, ecosystem, fixable, report)
         for entry in unfixable:
             print(f"    {red('no fix')} {entry['name']}@{entry['version']}")
+
+    planned = [
+        (p["target"], p["before"], p["after"], p["changes"], p["ecosystem"], p["fixes"])
+        for p in plans.values()
+    ]
 
     if not planned:
         if not advised:

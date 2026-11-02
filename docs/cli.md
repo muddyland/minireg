@@ -328,8 +328,15 @@ What it edits:
 | Audited | Edited | Why |
 |---|---|---|
 | `package-lock.json` | `package.json` | The lock is generated output; raising the declared floor is what stops the next `npm install` regenerating a vulnerable lock |
-| `requirements.txt` | `requirements.txt` | The pins are the declaration |
+| `requirements*.txt` | the same file, or the `-r` included file in the same directory that holds the pin | The pins are the declaration |
+| `poetry.lock`, `uv.lock`, `Pipfile.lock` | *nothing* | The tool owns the lock; the audit prints `poetry add "pkg>=X"`, `uv lock --upgrade-package "pkg==X"` or `pipenv upgrade "pkg>=X"` |
 | `Cargo.lock` | *nothing* | See below |
+
+A pin already at or above the fix is left alone and listed as such; one the
+CLI cannot compare is flagged for you to check. A dependency with no exact pin
+(a range, or an npm package that is only transitive) is named, with the
+version it needs, rather than counted as fixed. Fix versions that are not a
+well-formed version for the ecosystem are ignored, never written.
 
 Then regenerate the lockfile — `npm install`, or `pip install -r requirements.txt` — so the change takes effect.
 
