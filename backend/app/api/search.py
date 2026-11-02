@@ -176,6 +176,8 @@ async def package_detail(
             max_cvss=v.max_cvss,
             has_fix=v.has_fix,
             scanned=bool(v.scanned_at),
+            has_advisories=v.has_advisories,
+            malicious=v.is_malicious,
         )
 
     return {

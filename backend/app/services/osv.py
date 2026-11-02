@@ -18,6 +18,7 @@ capitalisation -- OSV rejects a query whose ecosystem name is not exact).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -31,7 +32,7 @@ from sqlalchemy.orm import defer
 
 from ..config import settings
 from ..models import Ecosystem, Package, PackageVersion, PackageVulnerability, Vulnerability
-from ..upstreams.base import get_http_client
+from ..upstreams.base import _retry_after_seconds, get_http_client
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,14 @@ MAL_RE = re.compile(r"^MAL-\d{4}-\d+$", re.IGNORECASE)
 # is the wrong reading of a confirmed backdoor. Score it at the top of the
 # scale so any sane block range catches it.
 MALICIOUS_SCORE = 10.0
+
+# Retries of one /v1/vulns fetch, in seconds before each. OSV answers a burst
+# with 429; giving up at once left versions it had just named as affected
+# looking clean.
+_FETCH_RETRY_DELAYS: tuple[float, ...] = (0.5, 2.0)
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+#: Longest Retry-After honoured between attempts.
+_MAX_FETCH_RETRY_WAIT = 5.0
 
 # CVSS v3/v4 qualitative rating scale (FIRST.org).
 SEVERITY_BANDS = (
@@ -312,6 +321,31 @@ def _parse_dt(value) -> datetime | None:
         return None
 
 
+def _aware(value: datetime | None) -> datetime | None:
+    """SQLite hands timestamps back naive; they were written as UTC."""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
+def _is_stale(row: Vulnerability, reported_modified: datetime | None) -> bool:
+    """Whether a stored OSV record must be fetched again.
+
+    querybatch reports each record's ``modified`` time, so a record is
+    refetched exactly when OSV has changed it since we stored it. When that
+    is unknown, the copy is trusted for one refresh interval.
+    """
+    reported_modified = _aware(reported_modified)
+    if reported_modified is not None:
+        stored = _aware(row.modified)
+        return stored is None or reported_modified > stored
+    fetched = _aware(row.fetched_at)
+    if fetched is None:
+        return True
+    age = (datetime.now(UTC) - fetched).total_seconds()
+    return age > settings.osv_refresh_interval_seconds
+
+
 # A GIT range's `fixed` event names a commit SHA. That is not installable from
 # a registry, and reporting it as the fixed version -- which happened whenever
 # OSV listed the git range first -- masked the real ECOSYSTEM fix and made the
@@ -344,10 +378,17 @@ class ScanResult:
     max_score: float | None = None
     has_fix: bool = False
     scanned: bool = True
+    #: One of the advisories is a malicious-package (MAL-*) record.
+    malicious: bool = False
 
     @property
     def severity(self) -> str | None:
         return severity_label(self.max_score)
+
+    @property
+    def has_advisories(self) -> bool:
+        """Whether the scan found anything; see ``CvePolicy.blocks``."""
+        return bool(self.cves)
 
 
 #: Up to this many packages are invalidated one prefix-SCAN each; above it, a
@@ -462,17 +503,38 @@ class OsvScanner:
         return (resp.json() or {}).get("results") or []
 
     async def _fetch_vuln(self, osv_id: str, timeout: float | None = None) -> dict | None:
+        """GET /v1/vulns/{id}. ``None`` means the record could not be fetched.
+
+        A rate limit, a 5xx or a timeout is retried a couple of times, since a
+        batch naming hundreds of advisories is exactly what earns a 429. The
+        caller must not read ``None`` as "nothing to report": querybatch has
+        already said this version is affected by ``osv_id``.
+        """
         client = get_http_client()
-        try:
-            resp = await client.get(
-                f"{settings.osv_api_url}/v1/vulns/{osv_id}",
-                timeout=timeout or settings.osv_timeout_seconds,
-            )
-        except (httpx.TimeoutException, httpx.TransportError):
-            return None
-        if resp.status_code != 200:
-            return None
-        return resp.json()
+        for attempt in range(len(_FETCH_RETRY_DELAYS) + 1):
+            resp = None
+            with contextlib.suppress(httpx.TimeoutException, httpx.TransportError):
+                resp = await client.get(
+                    f"{settings.osv_api_url}/v1/vulns/{osv_id}",
+                    timeout=timeout or settings.osv_timeout_seconds,
+                )
+            if resp is not None and resp.status_code == 200:
+                try:
+                    record = resp.json()
+                except ValueError:
+                    return None
+                return record if isinstance(record, dict) else None
+            if resp is not None and resp.status_code not in _RETRYABLE_STATUSES:
+                return None
+            if attempt == len(_FETCH_RETRY_DELAYS):
+                break
+            delay = _FETCH_RETRY_DELAYS[attempt]
+            if resp is not None and resp.status_code == 429:
+                asked = _retry_after_seconds(resp.headers.get("retry-after"))
+                if asked is not None:
+                    delay = min(asked, _MAX_FETCH_RETRY_WAIT)
+            await asyncio.sleep(delay)
+        return None
 
     # -- scanning ----------------------------------------------------------- #
     async def scan_versions(
@@ -524,23 +586,46 @@ class OsvScanner:
                 continue
 
             # Collect every distinct OSV id in this batch, then hydrate once.
-            needed: set[str] = set()
+            # querybatch also says when each record was last modified, which
+            # is how a stored copy is known to be out of date.
+            needed: dict[str, datetime | None] = {}
             per_item_ids: list[list[str]] = []
             for entry in raw_results:
-                ids = [v["id"] for v in (entry.get("vulns") or []) if v.get("id")]
+                vulns = [v for v in (entry.get("vulns") or []) if isinstance(v, dict)]
+                ids = [v["id"] for v in vulns if v.get("id")]
                 per_item_ids.append(ids)
-                needed.update(ids)
+                for v in vulns:
+                    if v.get("id"):
+                        needed[v["id"]] = _parse_dt(v.get("modified"))
 
-            hydrated = await self._hydrate(needed, ecosystem, timeout=timeout)
+            hydrated, failed = await self._hydrate(needed, ecosystem, timeout=timeout)
 
             for (name, version), ids in zip(batch, per_item_ids, strict=True):
+                if failed.intersection(ids):
+                    # OSV named an advisory for this version and we could not
+                    # read it. Recording what we did read as the whole answer
+                    # stored "scanned, clean" -- and deleted the links an
+                    # earlier scan had found -- for a version that may be
+                    # malware. Unscanned lets block_unscored decide and the
+                    # next pass try again.
+                    _bump("cve.hydrate.failed")
+                    log.warning(
+                        "OSV advisories %s for %s@%s could not be fetched; "
+                        "leaving the version unscanned",
+                        sorted(failed.intersection(ids)),
+                        name,
+                        version,
+                    )
+                    results[(name, version)] = ScanResult(None, name, version, scanned=False)
+                    continue
                 cves = []
                 max_score = None
                 has_fix = False
+                malicious = False
                 for osv_id in ids:
                     record = hydrated.get(osv_id)
                     if record is None:
-                        continue  # filtered out, or hydration failed
+                        continue  # filtered out on purpose (OSV_CVE_ONLY)
                     # The fix bound is package-specific, so it can only be
                     # resolved here where the package name is known -- not in
                     # _hydrate, which serves a whole batch of packages at once.
@@ -557,6 +642,8 @@ class OsvScanner:
                         max_score = score
                     if record.get("fixed_version"):
                         has_fix = True
+                    if record.get("malicious"):
+                        malicious = True
                 if not cves:
                     # Scanned, nothing found. Recorded as a real zero rather
                     # than None so the policy engine can tell "clean" from
@@ -570,20 +657,33 @@ class OsvScanner:
                     max_score=max_score,
                     has_fix=has_fix,
                     scanned=True,
+                    malicious=malicious,
                 )
         return results
 
     async def _hydrate(
-        self, osv_ids: set[str], ecosystem: Ecosystem, *, timeout: float | None = None
-    ) -> dict[str, dict]:
-        """Fetch full records, keeping only CVEs, and upsert them."""
-        if not osv_ids:
-            return {}
+        self,
+        osv_ids: dict[str, datetime | None] | set[str],
+        ecosystem: Ecosystem,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[dict[str, dict], set[str]]:
+        """Fetch full records, keeping only CVEs, and upsert them.
 
-        # Records we already have and that are fresh enough are not re-fetched.
+        ``osv_ids`` maps each id to the ``modified`` time querybatch reported
+        for it (a plain set means "unknown"). Returns ``(records, failed)``:
+        ``records`` holds every id that is usable, and an id missing from it
+        was filtered out on purpose (``OSV_CVE_ONLY``); ``failed`` holds the
+        ids that could not be fetched at all, which the caller must not
+        mistake for "no advisory".
+        """
+        if not osv_ids:
+            return {}, set()
+        reported = osv_ids if isinstance(osv_ids, dict) else dict.fromkeys(osv_ids)
+
         known = (
             await self.session.execute(
-                select(Vulnerability).where(Vulnerability.id.in_(list(osv_ids)))
+                select(Vulnerability).where(Vulnerability.id.in_(list(reported)))
             )
         ).scalars().all()
         cached = {
@@ -599,12 +699,18 @@ class OsvScanner:
                 # issue. Omitting it here meant every CVE we had already seen
                 # reported "no fix available", regardless of the truth.
                 "raw": v.raw,
+                "malicious": is_malicious({"id": v.id, "aliases": v.aliases or []})
+                or v.severity_type == "MALICIOUS",
             }
             for v in known
         }
-        missing = osv_ids - set(cached)
+        # A stored record is re-fetched once OSV says it changed. Rows were
+        # written once and never read back, so a CVSS score published (or
+        # raised) after we first saw an advisory never reached the policy.
+        stale = {v.id for v in known if _is_stale(v, reported.get(v.id))}
+        missing = (set(reported) - set(cached)) | stale
         if not missing:
-            return cached
+            return cached, set()
 
         # Bounded fan-out. A batch covering a heavily-advised package can name
         # hundreds of distinct ids, and firing them all at once is what earns
@@ -628,8 +734,16 @@ class OsvScanner:
         fetched = await asyncio.gather(
             *(_fetch(i) for i in ordered), return_exceptions=True
         )
-        for record in fetched:
-            if not isinstance(record, dict):
+        failed: set[str] = set()
+        refreshed: dict[str, dict] = {}
+        for requested, record in zip(ordered, fetched, strict=True):
+            if not isinstance(record, dict) or record.get("id") != requested:
+                if requested in stale:
+                    # The stored copy is older than OSV's, but it is still a
+                    # real answer; try again on the next scan.
+                    log.warning("OSV advisory %s could not be refreshed", requested)
+                else:
+                    failed.add(requested)
                 continue
             cve_id = extract_cve(record)
             malicious = is_malicious(record)
@@ -638,10 +752,9 @@ class OsvScanner:
             # almost never gets a CVE assigned, so honouring the flag here
             # meant the registry scanned malware and recorded it as clean.
             if settings.osv_cve_only and not cve_id and not malicious:
+                cached.pop(requested, None)
                 continue
-            osv_id = record.get("id")
-            if not osv_id:
-                continue
+            osv_id = requested
             score, stype, vector = best_severity(record)
             if malicious and score is None:
                 score, stype, vector = MALICIOUS_SCORE, "MALICIOUS", None
@@ -672,8 +785,95 @@ class OsvScanner:
                 "summary": record.get("summary"),
                 "fixed_version": None,
                 "raw": record,
+                "malicious": malicious,
             }
-        return cached
+            if requested in stale:
+                refreshed[osv_id] = record
+
+        if refreshed:
+            # Every stored version linked to a changed record carries the old
+            # score and fix in its denormalized columns; the policy reads
+            # those, not the record.
+            await self._reapply_records(refreshed)
+        return cached, failed
+
+    async def _reapply_records(self, records: dict[str, dict]) -> None:
+        """Re-derive the stored verdict of every version linked to ``records``.
+
+        The versions in the batch being scanned are rewritten by
+        :meth:`apply_to_version` anyway; this reaches the others, so an
+        advisory whose score was raised blocks every version it names now
+        rather than whenever each one's own rescan comes round.
+        """
+        await self.session.flush()
+        link_rows = (
+            await self.session.execute(
+                select(PackageVulnerability, Package.name, Package.ecosystem)
+                .join(PackageVersion, PackageVersion.id == PackageVulnerability.version_id)
+                .join(Package, Package.id == PackageVersion.package_id)
+                .where(PackageVulnerability.vulnerability_id.in_(list(records)))
+            )
+        ).all()
+        if not link_rows:
+            return
+        for link, package_name, package_ecosystem in link_rows:
+            link.fixed_version = fixed_version_for(
+                records[link.vulnerability_id],
+                package_name,
+                getattr(package_ecosystem, "value", package_ecosystem),
+            )
+        await self.session.flush()
+        await self._recompute_versions({link.version_id for link, _n, _e in link_rows})
+
+    async def _recompute_versions(self, version_ids: set[int]) -> None:
+        """Recompute the denormalized CVE columns of ``version_ids`` from
+        their links, the same way :meth:`rescore_stored` does."""
+        if not version_ids:
+            return
+        pairs = (
+            await self.session.execute(
+                select(
+                    PackageVulnerability.version_id,
+                    Vulnerability.cvss_score,
+                    PackageVulnerability.fixed_version,
+                    Vulnerability.id,
+                    Vulnerability.aliases,
+                    Vulnerability.severity_type,
+                )
+                .join(Vulnerability, Vulnerability.id == PackageVulnerability.vulnerability_id)
+                .where(PackageVulnerability.version_id.in_(list(version_ids)))
+            )
+        ).all()
+        worst: dict[int, float | None] = {}
+        fixable: dict[int, bool] = {}
+        malware: dict[int, bool] = {}
+        for version_id, score, fixed, osv_id, aliases, stype in pairs:
+            current = worst.get(version_id)
+            if score is not None and (current is None or score > current):
+                worst[version_id] = score
+            worst.setdefault(version_id, None)
+            fixable[version_id] = fixable.get(version_id, False) or bool(fixed)
+            malware[version_id] = malware.get(version_id, False) or (
+                stype == "MALICIOUS" or is_malicious({"id": osv_id, "aliases": aliases or []})
+            )
+        for version_id, score in worst.items():
+            version_row = await self.session.get(
+                PackageVersion, version_id, options=[defer(PackageVersion.metadata_json)]
+            )
+            if version_row is None or version_row.scanned_at is None:
+                continue
+            if (
+                version_row.max_cvss != score
+                or version_row.has_fix != fixable[version_id]
+                or not version_row.has_advisories
+                or version_row.is_malicious != malware[version_id]
+            ):
+                version_row.max_cvss = score
+                version_row.has_fix = fixable[version_id]
+                version_row.has_advisories = True
+                version_row.is_malicious = malware[version_id]
+                await self._note_changed(version_row)
+        await self.session.flush()
 
     async def _upsert_vulnerability(self, row: dict) -> None:
         from ..db import get_engine
@@ -830,9 +1030,13 @@ class OsvScanner:
             version_row.max_cvss != result.max_score
             or version_row.scanned_at is None
             or version_row.has_fix != result.has_fix
+            or version_row.has_advisories != result.has_advisories
+            or version_row.is_malicious != result.malicious
         )
         version_row.max_cvss = result.max_score
         version_row.has_fix = result.has_fix
+        version_row.has_advisories = result.has_advisories
+        version_row.is_malicious = result.malicious
         version_row.scanned_at = datetime.now(UTC)
 
         existing_links = {

@@ -16,7 +16,9 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-minireg}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-minireg}
+      # No default: a well-known password on a database every container on
+      # the network could reach was a default worth refusing to start with.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-minireg}
       # C collation makes the b-tree index scans on package names materially
       # faster than a locale-aware collation, and package names are ASCII.
@@ -60,7 +62,7 @@ services:
       options:
         max-size: "20m"
         max-file: "5"
-    networks: [minireg]
+    networks: [backend]
 
   # Valkey, the BSD-licensed Redis fork. Wire-compatible: the app still talks
   # to it through redis-py at REDIS_URL, and the service name, volume and
@@ -70,8 +72,16 @@ services:
     restart: unless-stopped
     # Headroom over maxmemory for fragmentation and client buffers.
     mem_limit: ${REDIS_MEM_LIMIT:-768m}
+    environment:
+      # Read by the healthcheck below.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
     command:
       - valkey-server
+      # The app trusts what it reads back -- rendered packuments are served
+      # verbatim, policy rules and settings are cached here -- so nothing
+      # but the app may talk to it.
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
       - --maxmemory
       - ${REDIS_MAXMEMORY:-512mb}
       # The cache is disposable: evict rather than error when it fills.
@@ -84,7 +94,7 @@ services:
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "valkey-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" valkey-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -98,7 +108,7 @@ services:
       options:
         max-size: "20m"
         max-file: "5"
-    networks: [minireg]
+    networks: [backend]
 
   minireg:
     build:
@@ -132,8 +142,10 @@ services:
       METRICS_TOKEN: ${METRICS_TOKEN:-}
 
       # -- backing services -------------------------------------------------
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-minireg}:${POSTGRES_PASSWORD:-minireg}@postgres:5432/${POSTGRES_DB:-minireg}
-      REDIS_URL: redis://redis:6379/0
+      # Both passwords go into URLs as they are: use URL-safe values (the
+      # generator in .env.example produces them).
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-minireg}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-minireg}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
       STORAGE_PATH: /data/packages
 
       # -- access ------------------------------------------------------------
@@ -259,13 +271,18 @@ services:
       timeout: 5s
       retries: 3
       start_period: 25s
-    networks: [minireg]
+    # `backend` reaches the database and Valkey; `minireg` is the published
+    # port, upstream traffic and the scanner.
+    networks: [backend, minireg]
 
   # Trivy worker for container images. Opt in with `--profile scanner` once
   # an admin has created a token (API tokens -> Scanner token) and put it in
   # .env as MINIREG_SCANNER_TOKEN. It unpacks untrusted image layers, so it
   # gets nothing worth stealing: no database, no upstream credentials, a
-  # scan-only token, a read-only root and hard limits.
+  # scan-only token, a read-only root and hard limits -- and it is not on the
+  # `backend` network, so it cannot even open a connection to Postgres or
+  # Valkey. It reaches minireg's API and, for a Trivy DB repository outside
+  # this registry, the internet.
   scanner:
     build:
       context: .
@@ -308,5 +325,11 @@ volumes:
   trivy-cache:
 
 networks:
+  # minireg, the scanner, egress and the published port.
   minireg:
     driver: bridge
+  # Postgres, Valkey and minireg only. Internal: no route out, and nothing
+  # else attached to it.
+  backend:
+    driver: bridge
+    internal: true

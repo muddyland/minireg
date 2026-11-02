@@ -7,7 +7,7 @@ Evaluation order (deliberate, and the block list is *always* enforced):
 2. Allowlist mode (optional). When enabled, a package must match an allow rule
    to pass. This is the "default deny" posture.
 3. CVE policy. A version whose highest CVSS score falls inside the configured
-   block range is denied.
+   block range is denied, and so is one a malicious-package advisory names.
 
 Rules are cached in Redis and in-process because they are consulted on every
 single request; the cache is invalidated whenever a rule is written.
@@ -69,7 +69,13 @@ class CvePolicy:
     # Deny only when the CVE has a fix available upstream, if set.
     require_fix_available: bool = False
 
-    def blocks(self, score: float | None, *, scanned: bool = True) -> bool:
+    def blocks(
+        self,
+        score: float | None,
+        *,
+        scanned: bool = True,
+        has_advisories: bool | None = None,
+    ) -> bool:
         """Whether this policy denies a version with ``score``.
 
         Three states, and conflating any two of them breaks the policy:
@@ -79,16 +85,24 @@ class CvePolicy:
         * ``score is None`` with ``scanned=True`` -- OSV answered and the
           version *has* advisories, but none carried a usable severity. Also
           unknown risk, so ``block_unscored`` decides here too.
-        * ``score == 0.0`` -- scanned, no advisories at all. Clean, and never
-          blocked. This is the case an earlier version got wrong: clean
-          versions were stored as ``None`` and so were indistinguishable from
-          unscanned, which made ``block_unscored`` deny every package in the
-          registry and left fail-closed mode unusable.
+        * no advisories at all (stored as ``score == 0.0``) -- clean, and
+          never blocked, whatever the range. An earlier version stored clean
+          versions as ``None``, which made ``block_unscored`` deny every
+          package in the registry; a later one stored them as 0.0 and so a
+          range starting at 0 ("anything with a CVE") denied every package
+          instead.
+
+        ``has_advisories`` tells a clean version from one whose advisories
+        all score 0.0, which a range starting at 0 does block. It is only
+        consulted for 0.0: any other score already means advisories exist.
+        Callers without it read 0.0 as clean.
         """
         if not self.enabled:
             return False
         if not scanned or score is None:
             return self.block_unscored
+        if score == 0.0 and not has_advisories:
+            return False
         return self.min_score <= score <= self.max_score
 
     def to_dict(self) -> dict:
@@ -278,6 +292,8 @@ class PolicyEngine:
         max_cvss: float | None = None,
         has_fix: bool = False,
         scanned: bool = True,
+        has_advisories: bool | None = None,
+        malicious: bool = False,
         _name_level: bool = False,
     ) -> Verdict:
         eco = ecosystem.value if isinstance(ecosystem, Ecosystem) else str(ecosystem)
@@ -325,7 +341,20 @@ class PolicyEngine:
 
         # 3. CVE score policy.
         policy = await self.get_cve_policy()
-        if version is not None and policy.blocks(max_cvss, scanned=scanned):
+        if version is not None and policy.enabled and malicious:
+            # A malicious-package advisory says the release *is* malware.
+            # There is no fixed version of a backdoor -- OSV records have no
+            # `fixed` event -- so require_fix_available let every one of them
+            # through, and a score range is the wrong question to ask.
+            return Verdict(
+                allowed=False,
+                reason="blocked by CVE policy: an OSV malicious-package advisory "
+                "names this version as malware",
+                source="cve",
+            )
+        if version is not None and policy.blocks(
+            max_cvss, scanned=scanned, has_advisories=has_advisories
+        ):
             if not scanned:
                 return Verdict(
                     allowed=False,

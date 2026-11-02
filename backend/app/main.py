@@ -192,6 +192,12 @@ async def _cve_refresh_task() -> None:
     deadline = time.monotonic() + settings.osv_housekeeping_budget_seconds
     cutoff = datetime.now(UTC) - timedelta(seconds=settings.osv_refresh_interval_seconds)
     total = 0
+    # Versions OSV could not fully answer for in this pass. They keep their
+    # old scanned_at (so they stay at the head of the queue for next time)
+    # and are skipped for the rest of this pass, or one advisory OSV keeps
+    # refusing would have the loop reselect the same rows until the budget
+    # ran out.
+    deferred: set[int] = set()
 
     while time.monotonic() < deadline:
         async with session_scope() as session:
@@ -201,15 +207,20 @@ async def _cve_refresh_task() -> None:
             # per *row*, so a 200-row batch pulled and JSON-parsed multiple GB
             # and got the container OOM-killed. metadata_json is deferred for
             # the same reason; apply_to_version never reads it.
+            stmt = (
+                select(Package.ecosystem, Package.name, PackageVersion)
+                .join(PackageVersion, PackageVersion.package_id == Package.id)
+                .options(defer(PackageVersion.metadata_json))
+                .where(
+                    (PackageVersion.scanned_at.is_(None))
+                    | (PackageVersion.scanned_at < cutoff)
+                )
+            )
+            if deferred:
+                stmt = stmt.where(PackageVersion.id.notin_(deferred))
             rows = (
                 await session.execute(
-                    select(Package.ecosystem, Package.name, PackageVersion)
-                    .join(PackageVersion, PackageVersion.package_id == Package.id)
-                    .options(defer(PackageVersion.metadata_json))
-                    .where(
-                        (PackageVersion.scanned_at.is_(None))
-                        | (PackageVersion.scanned_at < cutoff)
-                    )
+                    stmt
                     # Never-scanned first, then oldest. Within that, the
                     # versions people actually resolve to: a package's own
                     # `latest` and its most-downloaded releases earn their scan
@@ -228,8 +239,9 @@ async def _cve_refresh_task() -> None:
             grouped: dict = {}
             for eco, name, version in rows:
                 grouped.setdefault(eco, []).append((name, version))
+            unanswered: set[int] = set()
             for ecosystem, items in grouped.items():
-                await _scan_group(scanner, ecosystem, items)
+                unanswered |= await _scan_group(scanner, ecosystem, items)
             total += len(rows)
 
         # After the commit above: drop the rendered documents that still have
@@ -238,14 +250,23 @@ async def _cve_refresh_task() -> None:
 
         if len(rows) < settings.osv_batch_size:
             break
+        if len(unanswered) == len(rows):
+            # Nothing in the batch got an answer: OSV is down or refusing us.
+            # Walking the rest of the backlog would only repeat that.
+            log.warning("OSV answered for none of %d versions; ending this pass", len(rows))
+            break
+        deferred |= unanswered
 
     if total:
         log.info("background CVE refresh scanned %d versions", total)
 
 
-async def _scan_group(scanner, ecosystem, items: list) -> None:
+async def _scan_group(scanner, ecosystem, items: list) -> set[int]:
     """Scan one ecosystem's slice, splitting on failure so one bad row cannot
-    wedge the queue behind it."""
+    wedge the queue behind it.
+
+    Returns the ids of the versions OSV could not answer for; their stored
+    verdict is left as it was."""
     try:
         results = await scanner.scan_versions(
             ecosystem, [(n, v.version) for n, v in items]
@@ -259,17 +280,21 @@ async def _scan_group(scanner, ecosystem, items: list) -> None:
                 "CVE scan permanently failing for %s@%s; skipping", name, version.version
             )
             version.scanned_at = datetime.now(UTC)
-            return
+            return set()
         mid = len(items) // 2
         log.warning("CVE batch of %d failed; retrying in halves", len(items))
-        await _scan_group(scanner, ecosystem, items[:mid])
-        await _scan_group(scanner, ecosystem, items[mid:])
-        return
+        return await _scan_group(scanner, ecosystem, items[:mid]) | await _scan_group(
+            scanner, ecosystem, items[mid:]
+        )
 
+    unanswered: set[int] = set()
     for name, version in items:
         result = results.get((name, version.version))
-        if result is not None:
-            await scanner.apply_to_version(version, result, name)
+        if result is None or not result.scanned:
+            unanswered.add(version.id)
+            continue
+        await scanner.apply_to_version(version, result, name)
+    return unanswered
 
 
 async def housekeeping_loop() -> None:

@@ -68,6 +68,29 @@ def _tripped() -> bool:
     return _tripped_client is _redis and time.monotonic() < _down_until
 
 
+def redact_url(url: str) -> str:
+    """``url`` with any password replaced, for logging.
+
+    The compose file now puts Valkey's password in REDIS_URL, and the
+    connect line went to the container log verbatim.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+        if parts.password is None:
+            return url
+        userinfo = f"{parts.username or ''}:***"
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        if parts.port is not None:
+            host = f"{host}:{parts.port}"
+        return urlunsplit(parts._replace(netloc=f"{userinfo}@{host}"))
+    except ValueError:
+        return "<unparseable URL>"
+
+
 async def init_redis() -> aioredis.Redis | None:
     global _redis
     try:
@@ -81,7 +104,7 @@ async def init_redis() -> aioredis.Redis | None:
         )
         await _redis.ping()
         _healthy()
-        log.info("cache connected: %s", settings.redis_url)
+        log.info("cache connected: %s", redact_url(settings.redis_url))
     except Exception as exc:
         log.warning("cache unavailable, running degraded: %s", exc)
         _redis = None

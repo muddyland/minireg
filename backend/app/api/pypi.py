@@ -258,6 +258,8 @@ async def get_file(
         max_cvss=version_row.max_cvss,
         has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
+        has_advisories=version_row.has_advisories,
+        malicious=version_row.is_malicious,
     )
     if verdict.blocked:
         audit.record_download(
@@ -338,6 +340,8 @@ async def _get_core_metadata(session: AsyncSession, project: str, filename: str)
         max_cvss=version_row.max_cvss,
         has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
+        has_advisories=version_row.has_advisories,
+        malicious=version_row.is_malicious,
     )
     if verdict.blocked:
         return PlainTextResponse(
@@ -588,6 +592,8 @@ async def upload(
         max_cvss=scan.max_score,
         has_fix=scan.has_fix,
         scanned=scan.scanned,
+        has_advisories=scan.has_advisories,
+        malicious=scan.malicious,
     )
     if cve_verdict.blocked:
         # Capture the actor before the rollback expires the ORM objects the
@@ -620,6 +626,9 @@ async def upload(
             is_local=True,
             published_at=datetime.now(UTC),
             max_cvss=scan.max_score,
+            has_fix=scan.has_fix,
+            has_advisories=scan.has_advisories,
+            is_malicious=scan.malicious,
             scanned_at=datetime.now(UTC) if scan.scanned else None,
         )
         session.add(version_row)
@@ -809,6 +818,8 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
             max_cvss=version_row.max_cvss,
             has_fix=version_row.has_fix,
             scanned=bool(version_row.scanned_at),
+            has_advisories=version_row.has_advisories,
+            malicious=version_row.is_malicious,
         )
         if verdict.blocked:
             blocked.add(version_row.version)

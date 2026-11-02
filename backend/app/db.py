@@ -88,15 +88,12 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             raise
 
 
-# Columns added after the first release. There is no migration framework here,
-# so new *additive* columns are applied at startup; anything destructive (a drop,
-# a rename, a type change) would need a real migration and is deliberately not
-# handled by this mechanism.
 # Known limitation, stated plainly: this is not a migration framework. It
-# handles additive columns and nothing else -- a drop, a rename, a type change
-# or a backfill needs a real migration, applied by hand. If the schema starts
-# needing those regularly, adopt alembic and baseline it against the current
-# tables rather than extending this list.
+# handles additive columns and the idempotent backfills in DATA_FIXES, and
+# nothing else -- a drop, a rename or a type change needs a real migration,
+# applied by hand. If the schema starts needing those regularly, adopt
+# alembic and baseline it against the current tables rather than extending
+# this list.
 ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "web_url_template", "VARCHAR(512)"),
     ("device_authorizations", "requested_scopes", "JSONB"),
@@ -109,11 +106,13 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
     ("api_tokens", "docker_repo_prefixes", "JSONB"),
     ("users", "publish_via_oidc_admin", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("package_versions", "has_advisories", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("package_versions", "is_malicious", "BOOLEAN NOT NULL DEFAULT FALSE"),
 ]
 
-# One-off corrections to existing rows, applied at startup after the columns
-# above exist. Each must be idempotent (a no-op once applied) and portable
-# between SQLite and PostgreSQL.
+# Backfills for the columns above, run after them on every start. Each must be
+# idempotent (it runs again on every boot) and portable SQL (SQLite runs it
+# too). Keep the WHERE narrow so a re-run touches no rows.
 DATA_FIXES: list[str] = [
     # An OIDC login used to link a local account by email but leave its
     # password in place, so the password kept working beside SSO -- past an
@@ -122,6 +121,21 @@ DATA_FIXES: list[str] = [
     # may have come from it go.
     "UPDATE users SET password_hash = NULL, session_version = session_version + 1 "
     "WHERE provider = 'oidc' AND password_hash IS NOT NULL",
+    # has_advisories: a version scanned before the column existed has its
+    # advisories in package_vulnerabilities. Only a 0.0 maximum consults the
+    # flag, so this is what keeps "advisories that all score 0.0" from
+    # reading as clean after the upgrade.
+    "UPDATE package_versions SET has_advisories = TRUE "
+    "WHERE has_advisories = FALSE "
+    "AND id IN (SELECT version_id FROM package_vulnerabilities)",
+    # is_malicious: versions linked to a malicious-package record. A record
+    # filed under another id with only a MAL-* alias is caught by the
+    # version's next rescan instead.
+    "UPDATE package_versions SET is_malicious = TRUE "
+    "WHERE is_malicious = FALSE AND id IN ("
+    "SELECT pv.version_id FROM package_vulnerabilities pv "
+    "JOIN vulnerabilities v ON v.id = pv.vulnerability_id "
+    "WHERE v.id LIKE 'MAL-%' OR v.severity_type = 'MALICIOUS')",
 ]
 
 
@@ -150,9 +164,6 @@ async def create_schema() -> None:
                 await conn.execute(
                     text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {coltype}")
                 )
-
-        for stmt in DATA_FIXES:
-            await conn.execute(text(stmt))
 
         if engine.dialect.name == "postgresql":
             # Trigram index powers substring package search without a full scan.
@@ -184,6 +195,14 @@ async def create_schema() -> None:
                         stmt.split(" ON ")[0],
                         exc,
                     )
+
+        # Backfills run on every dialect: the SQL is portable, and a fresh
+        # database (where create_all already made the columns) has nothing
+        # for them to touch.
+        from sqlalchemy import text
+
+        for fix in DATA_FIXES:
+            await conn.execute(text(fix))
 
 
 async def dispose_engine() -> None:

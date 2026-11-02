@@ -116,6 +116,11 @@ Blocks versions whose highest CVSS base score falls inside a range.
 | 0.0 – 10.0 | Anything with a CVE |
 | 4.0 – 6.9 | Medium only (unusual, but supported) |
 
+A version with no advisories at all is never blocked by the range, even one
+starting at 0.0: a clean scan is recorded as a score of 0.0, but it is
+recorded as clean too. A version whose advisories all score 0.0 (a CVSS
+vector declaring no impact) is in a range that starts at 0.0.
+
 It is a *range*, not a threshold, so you can block medium severity while
 allowing critical. That sounds backwards but is occasionally what you want —
 for example when criticals are individually reviewed and accepted while the
@@ -138,6 +143,12 @@ medium tail is not worth anyone's time.
 - OSV answered, the version has advisories, but none of them published a
   severity anyone could score.
 
+That includes a version for which OSV named an advisory whose full record
+could not then be fetched (a rate limit, an error or a timeout on
+`/v1/vulns/{id}`, after two retries). It is left unscanned rather than
+recorded as clean, whatever an earlier scan found stays in force, and the
+next background pass tries again.
+
 A version that was scanned and had no advisories records a real zero and is
 never blocked by this switch. That distinction is what makes fail-closed
 usable at all: an earlier release stored both cases as "no score", so turning
@@ -152,6 +163,17 @@ That is the trade you are making: correctness over availability.
 
 Skips versions with no fixed release available upstream. Avoids blocking things
 nobody can currently remediate, at the cost of serving known-vulnerable code.
+
+It never applies to malware: see below.
+
+### Malicious packages
+
+A version named by a malicious-package advisory (`MAL-*`) is blocked whenever
+the CVE policy is enabled, whatever the range and whatever **Only block when a
+fix exists** says. Such an advisory says the release *is* malware; there is no
+fixed version of a backdoor, so the fix switch used to let every one of them
+through, and how it scores is not the question. Turn the CVE policy off and it
+is served like anything else.
 
 ### Where scores come from
 
@@ -174,6 +196,14 @@ Scores are computed from the CVSS vectors OSV publishes:
   any impact never scores below 2.0, so an approximation error cannot present a
   real vulnerability as harmless.
 - **v2** — computed exactly; last resort.
+
+OSV edits its records: a score is often added or raised weeks after an
+advisory is first published, and fixed releases are added as they ship. Each
+scan compares the `modified` time OSV reports against the stored copy and
+fetches the record again when it changed (or, when OSV reports no time, once
+the copy is older than `OSV_REFRESH_INTERVAL_SECONDS`). Every stored version
+linked to a refetched advisory has its highest score and fix status
+recomputed at once, not when its own rescan comes round.
 
 If you change scoring behaviour, **Vulnerabilities → Recompute scores** re-runs
 the calculation over stored OSV records without re-fetching anything, and

@@ -39,11 +39,13 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://…` | Must use the `asyncpg` driver. |
+| `DATABASE_URL` | `postgresql+asyncpg://…` | Must use the `asyncpg` driver. The compose file builds it from `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB`. |
+| `POSTGRES_PASSWORD` | none (compose) | **Required** by the compose file, which refuses to start without it. Goes into `DATABASE_URL` as is, so use a URL-safe value. |
+| `REDIS_PASSWORD` | none (compose) | **Required** by the compose file: Valkey is started with `--requirepass`, and `REDIS_URL` is built as `redis://:<password>@redis:6379/0`. URL-safe value. |
 | `DB_POOL_SIZE` | `20` | Per process. With N replicas, Postgres needs `N × (pool + overflow)` connections. |
 | `DB_MAX_OVERFLOW` | `20` | Burst above the pool. |
 | `DB_ECHO` | `false` | Logs every SQL statement. Debugging only. |
-| `REDIS_URL` | `redis://redis:6379/0` | Optional. Valkey or Redis, same protocol. Without it the registry still works, just slower. When it is unreachable the app stops asking it for 2 s at a time, doubling up to 30 s, instead of paying a timeout on every call, and reconnects by itself. |
+| `REDIS_URL` | `redis://redis:6379/0` | Optional. Valkey or Redis, same protocol. Put a password in it as `redis://:<password>@host:6379/0`; it is masked in the log. Without it the registry still works, just slower. When it is unreachable the app stops asking it for 2 s at a time, doubling up to 30 s, instead of paying a timeout on every call, and reconnects by itself. |
 | `META_CACHE_TTL` | `60` | Seconds a rendered packument / index page stays fresh. After that, the refresh is a conditional request (`If-None-Match` / `If-Modified-Since`) to the upstream that served the document; a `304` just extends freshness, and only versions that changed are rewritten. |
 | `META_NEGATIVE_CACHE_TTL` | `30` | How long a "not found" is remembered. |
 | `SEARCH_CACHE_TTL` | `120` | Search result caching. |
@@ -130,7 +132,11 @@ any upstream claims a pattern, matching names are only ever resolved from
 upstreams that claim it — a public registry can then never answer for an
 internal package, whatever the tier order and whatever the internal upstream
 is doing at the time. **Require digest** refuses to cache an artifact the
-upstream published no hash for.
+upstream published no hash for, or only a hash minireg cannot check. A hex
+digest (sha256, sha1, md5, blake2b) or an npm `integrity` string counts; for
+`integrity` the strongest algorithm listed is checked (sha512, sha384, sha256,
+or npm's legacy sha1), and a value that does not decode is a mismatch, not a
+pass.
 
 ### Container images
 
@@ -158,7 +164,7 @@ Full guide: [Container images](containers.md).
 | Variable | Default | Notes |
 |---|---|---|
 | `MAX_PUBLISH_BYTES` | `268435456` | Rejected on `Content-Length` before the body is read. |
-| `MAX_METADATA_BYTES` | `100663296` | Largest upstream packument or index document. |
+| `MAX_METADATA_BYTES` | `100663296` | Largest upstream packument, simple page, index file or other metadata response, counted after decompression and enforced while it downloads: a response that passes it is abandoned there and the upstream treated as failed. `0` = no limit. |
 | `MAX_ARTIFACT_BYTES` | `2147483648` | Largest artifact streamed from an upstream. |
 | `STORAGE_QUOTA_BYTES` | `0` | When a download would take the blob store over this, the least recently accessed cached upstream artifacts are evicted down to 90% of it. The same runs in the hourly housekeeping. Never evicted: files published here and anything read in the last 10 minutes. An evicted artifact is fetched again on its next request. A download fails only when nothing evictable is left. Publishes are exempt. `0` disables. |
 | `DB_POOL_TIMEOUT_SECONDS` | `10` | Wait for a pooled connection before failing. |

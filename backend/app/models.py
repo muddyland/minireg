@@ -436,6 +436,13 @@ class PackageVersion(Base):
     # Denormalized from package_vulnerabilities because the CVE policy consults
     # it on every download, where a second query per version is not affordable.
     has_fix: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Whether the last complete scan found any advisory at all. A clean
+    # version and one whose advisories all score 0.0 share max_cvss 0.0, and
+    # only the second may be caught by a CVE range starting at 0.
+    has_advisories: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Whether one of those advisories is an OpenSSF malicious-package (MAL-*)
+    # record. The CVE policy blocks these whatever its range or fix setting.
+    is_malicious: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     package: Mapped[Package] = relationship(back_populates="versions")
