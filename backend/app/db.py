@@ -108,6 +108,7 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("users", "publish_via_oidc_admin", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("package_versions", "has_advisories", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("package_versions", "is_malicious", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("docker_repo_manifests", "push_block_reason", "TEXT"),
 ]
 
 # Backfills for the columns above, run after them on every start. Each must be
@@ -136,6 +137,19 @@ DATA_FIXES: list[str] = [
     "SELECT pv.version_id FROM package_vulnerabilities pv "
     "JOIN vulnerabilities v ON v.id = pv.vulnerability_id "
     "WHERE v.id LIKE 'MAL-%' OR v.severity_type = 'MALICIOUS')",
+    # The push verdict moved from the shared manifest row to the link of a
+    # local repository (DockerRepoManifest.push_block_reason). Carry existing
+    # verdicts over to the local repositories holding the digest -- never to
+    # upstream ones, where the shared row's verdict refused pulls the push
+    # rules have no say over -- then clear the old column so it cannot be
+    # carried over again after a policy change cleared the new one.
+    "UPDATE docker_repo_manifests SET push_block_reason = ("
+    " SELECT m.policy_block_reason FROM docker_manifests m"
+    " WHERE m.id = docker_repo_manifests.manifest_id)"
+    " WHERE push_block_reason IS NULL"
+    " AND manifest_id IN (SELECT id FROM docker_manifests WHERE policy_block_reason IS NOT NULL)"
+    " AND repository_id IN (SELECT id FROM docker_repositories WHERE is_local = TRUE)",
+    "UPDATE docker_manifests SET policy_block_reason = NULL WHERE policy_block_reason IS NOT NULL",
 ]
 
 

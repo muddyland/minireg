@@ -28,7 +28,15 @@ from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.cache import cache_delete, cache_get_json, cache_set_json
-from ..models import DockerFinding, DockerManifest, DockerManifestRef, DockerRepository, Setting
+from ..models import (
+    DockerFinding,
+    DockerManifest,
+    DockerManifestRef,
+    DockerRepoManifest,
+    DockerRepository,
+    DockerScanJob,
+    Setting,
+)
 
 KEY_DOCKER_POLICY = "docker_policy"
 _CACHE_KEY = "docker:policy"
@@ -331,6 +339,25 @@ async def evaluate_rules(
     return ALLOW
 
 
+async def push_block_reasons(
+    session: AsyncSession, repo: DockerRepository, manifest_ids: list[int]
+) -> dict[int, str]:
+    """The push verdicts recorded in this repository: manifest id -> reason,
+    for the blocked ones. Only a local repository ever has any."""
+    if not manifest_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(DockerRepoManifest.manifest_id, DockerRepoManifest.push_block_reason).where(
+                DockerRepoManifest.repository_id == repo.id,
+                DockerRepoManifest.manifest_id.in_(manifest_ids),
+                DockerRepoManifest.push_block_reason.isnot(None),
+            )
+        )
+    ).all()
+    return dict(rows)
+
+
 async def _evaluate_index(
     session: AsyncSession,
     repo: DockerRepository,
@@ -365,9 +392,12 @@ async def _evaluate_index(
             )
         )
     ).scalars().all()
+    blocked = (
+        await push_block_reasons(session, repo, [c.id for c in children]) if repo.is_local else {}
+    )
     for child in children:
-        if child.policy_block_reason:
-            verdict = ImageVerdict(False, child.policy_block_reason, source="push_policy")
+        if blocked.get(child.id):
+            verdict = ImageVerdict(False, blocked[child.id], source="push_policy")
         elif child.scan_status == "scanned":
             verdict = await evaluate_rules(session, child, policy, policy.pull, label="pull")
         else:
@@ -384,7 +414,14 @@ async def evaluate_pull(
     manifest: DockerManifest,
     policy: ImagePolicy,
 ) -> ImageVerdict:
-    """May this manifest be served from this repository right now?"""
+    """May this manifest be served from this repository right now?
+
+    The push bar (and waiting for the scan of a pushed image) applies to
+    what a local repository serves, whatever the bytes' origin; what an
+    upstream repository serves is held to the pull rules only. It is the
+    repository being served that decides, never the manifest row: that row
+    is shared by every repository holding the digest.
+    """
     if repo.quarantined:
         return ImageVerdict(
             False,
@@ -392,8 +429,11 @@ async def evaluate_pull(
             + (f": {repo.quarantine_reason}" if repo.quarantine_reason else ""),
             source="quarantine",
         )
-    if manifest.policy_block_reason:
-        return ImageVerdict(False, manifest.policy_block_reason, source="push_policy")
+    local = repo.is_local
+    if local:
+        reason = (await push_block_reasons(session, repo, [manifest.id])).get(manifest.id)
+        if reason:
+            return ImageVerdict(False, reason, source="push_policy")
     if manifest.kind == "index":
         return await _evaluate_index(session, repo, manifest, policy)
     if manifest.kind != "image":
@@ -402,9 +442,12 @@ async def evaluate_pull(
         return await evaluate_rules(session, manifest, policy, policy.pull, label="pull")
     if not policy.scanning_enabled:
         return ALLOW
-    local = manifest.upstream_id is None
-    pending = manifest.scan_status in ("unscanned", "queued", "scanning")
-    if pending and (policy.strict_mode or (local and policy.push_require_scan)):
+    gated = policy.strict_mode or (local and policy.push_require_scan)
+    if not gated:
+        return ALLOW
+    # A failed scan counts as not scanned yet: the next manifest pull queues
+    # it again.
+    if manifest.scan_status in ("unscanned", "queued", "scanning", "failed"):
         return ImageVerdict(
             False,
             "image has not been scanned yet; a scan is queued, retry shortly",
@@ -412,4 +455,29 @@ async def evaluate_pull(
             retry_after=15,
             source="unscanned",
         )
+    if manifest.scan_status == "not_applicable":
+        # An image the scanner skipped (over the scan size limit) has not
+        # been scanned either. Allowing it let anything that could get an
+        # image marked unscannable past strict mode and the push gate. Not
+        # a retry: it stays this way until the policy or a rescan changes it.
+        why = await _skip_reason(session, manifest)
+        return ImageVerdict(
+            False,
+            "image could not be scanned"
+            + (f" ({why})" if why else "")
+            + ", and policy refuses images that have not been scanned",
+            source="unscanned",
+        )
     return ALLOW
+
+
+async def _skip_reason(session: AsyncSession, manifest: DockerManifest) -> str | None:
+    error = (
+        await session.execute(
+            select(DockerScanJob.error)
+            .where(DockerScanJob.manifest_id == manifest.id)
+            .order_by(DockerScanJob.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return error[:200] if error else None

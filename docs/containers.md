@@ -139,8 +139,13 @@ docker push minireg.example.com/local/team-a/myapp:1.0
 
 A push is always accepted. Scanning starts straight away, and until it
 finishes, pulls of the new digest wait for up to *hold seconds* and then get
-a 503. Once the scan finishes, the image is checked against the **push
-rules**. By default an image is blocked if it has:
+a 503. A failed scan is retried, and pulls keep getting a 503 meanwhile. An
+image over the scan size limit (*Largest image scanned*) is never scanned,
+so its pulls are refused until an admin raises the limit and rescans it, or
+turns off *Refuse pulls of a pushed image until its scan is in*.
+
+Once the scan finishes, the image is checked against the **push rules**. By
+default an image is blocked if it has:
 
 - a vulnerability on CISA's Known Exploited Vulnerabilities list, or
 - a CRITICAL finding that already has a fixed version.
@@ -149,6 +154,12 @@ The pull error names the reason, for example
 `denied: blocked by push policy: CVE-2024-9999 (CRITICAL, fixed in 2.0)`. To
 fix it, rebuild on a patched base image and push again. Changing the push
 rules re-judges every pushed image immediately.
+
+The push rules cover everything served from `local/`, whatever its origin:
+an upstream image re-tagged and pushed unchanged is held to them there,
+even when the pull rules let it through the upstream. The verdict
+belongs to the repository, not to the image: pushing an image here never
+changes how pulls of the same image through an upstream are judged.
 
 ## Scanning
 
@@ -242,7 +253,7 @@ around the registry. These are the tools that stay useful instead:
 | **Block at severity** | Off by default for pulls. Can be combined with *only fixable*. |
 | **Quarantine** | Refuse every pull of a repository, and show the reason you give. |
 | **Accepted risks** | CVEs that never count towards a block. |
-| **Strict mode** | Never serve an unscanned image. Clients get 503 with `Retry-After` until the scan finishes. |
+| **Strict mode** | Never serve an unscanned image. Clients get 503 with `Retry-After` until the scan finishes. An image the scanner skips because it is over the scan size limit is refused with `DENIED`. |
 | **Hold first pulls** | Wait up to *N* seconds for the scan of a small image before answering. Larger images are served straight away and scanned in the background. |
 
 A refused pull returns the standard `DENIED` error with the reason, which
@@ -256,18 +267,31 @@ repository that names it is refused. A layer shared with an allowed image is
 still served. So a blocked image cannot be reassembled by fetching its layers
 by digest, under its own name or any other.
 
+A manifest minireg already holds for one repository is linked into another
+only when that repository's upstream confirms it has the digest: it answers
+the request by digest with the same bytes. An upstream that is down, rate
+limiting or refusing access (Docker Hub answers 401 for a repository that
+doesn't exist) confirms nothing, so the pull fails rather than serving the
+copy held for someone else. Quarantine is per repository: an image that a
+quarantined repository shares with another repository stays available
+there, provided that repository's upstream confirms it. To refuse an image
+everywhere, deny one of its CVEs.
+
 ## Caching and upstream rate limits
 
 - **Tags are revalidated with HEAD.** A cached tag is served as-is for
   `DOCKER_TAG_TTL_SECONDS` (default 600). After that, the next pull checks
   the upstream with a HEAD request, which doesn't count against Docker Hub's
-  pull quota. The manifest is fetched again, by digest, only when the tag has
-  moved.
+  pull quota. The manifest is fetched again only when the tag has moved, by
+  the digest the HEAD reported, so the bytes stored are the ones it named.
+  (An upstream whose HEAD gives no digest is fetched by tag.) A tag that
+  moved to an image this upstream already served costs no fetch at all.
 - **Digests never expire.** A digest is immutable, so `image@sha256:…` is
   never revalidated.
 - **Serve-stale.** When the upstream is down, times out or returns 429, the
   cached copy of the tag is served. The response carries
-  `X-Minireg-Cache: stale` and `Warning: 110 - "Response is Stale"`.
+  `X-Minireg-Cache: stale` and `Warning: 110 - "Response is Stale"`. Only
+  what that repository already holds is served stale.
 - **Negative caching.** When the upstream says an image or tag doesn't exist,
   that answer is remembered for a short while (default 60 seconds). A typo
   in a CI matrix then doesn't turn into a stream of upstream requests.

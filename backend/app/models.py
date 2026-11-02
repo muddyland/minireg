@@ -789,7 +789,11 @@ class DockerManifest(Base):
     # Stored CycloneDX SBOM (a blob in the OCI store). Rescans run against it
     # instead of pulling the image again.
     sbom_digest: Mapped[str | None] = mapped_column(String(80))
-    # Set when a pushed image fails the push policy: pulls are refused.
+    # Legacy: the push verdict used to live here, on the row every repository
+    # holding the digest shares, so it leaked into upstream pulls of the same
+    # bytes and missed upstream bytes pushed here. It now lives on
+    # DockerRepoManifest.push_block_reason; startup moves old values there
+    # and clears this column. Nothing reads or writes it any more.
     policy_block_reason: Mapped[str | None] = mapped_column(Text)
 
     created_at: Mapped[datetime] = _now_col()
@@ -832,6 +836,12 @@ class DockerRepoManifest(Base):
     created_at: Mapped[datetime] = _now_col()
     last_pulled_at: Mapped[datetime] = _now_col(index=True)
     pull_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    # Set when the image fails the push rules, in a local repository only:
+    # pulls of it from this repository are refused with this reason. Per
+    # repository because the push bar applies to what is served from
+    # local/, whatever the bytes' origin; the same digest pulled through an
+    # upstream is judged by the pull rules alone.
+    push_block_reason: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         UniqueConstraint("repository_id", "manifest_id", name="uq_docker_repo_manifest"),
