@@ -209,7 +209,13 @@ async def me(identity: Identity = Depends(require_user)) -> dict:
     return {
         "user": _user_payload(identity.user),
         "auth_method": identity.method,
-        "scopes": (identity.token.scopes if identity.token else ["read", "publish", "admin"]),
+        "scopes": (
+            identity.token.scopes
+            if identity.token
+            else ["read"]
+            if identity.is_password_basic
+            else ["read", "publish", "admin"]
+        ),
     }
 
 

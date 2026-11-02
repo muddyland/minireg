@@ -187,7 +187,7 @@ win when a fleet asks for hundreds of packages at once.
 | Tokens stored as SHA-256 of the secret; public prefix indexed | O(1) lookup with one constant-time compare, no per-row hashing |
 | An `Authorization` header is authoritative | A revoked token must not appear to work because a browser session exists |
 | Upstream credentials encrypted at rest, never returned | The API can say *whether* one is set, never what it is |
-| Publishing always requires a token | Passwords are refused for publishing |
+| Publishing always requires a token | Passwords are refused for publishing; an account password over HTTP Basic is read-only |
 | Digests verified before serving | A compromised upstream cannot poison the cache |
 | Login limited per IP **and** per username | Neither a single source nor a single account can be brute-forced |
 | CLI login via device authorization | No password reaches the terminal; SSO works unchanged |

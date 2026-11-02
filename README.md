@@ -279,6 +279,8 @@ the ones that matter for that job.
   applies to approving a CLI login. Listing and revoking tokens needs a
   session or an admin-scoped token, so a leaked read-only token cannot
   enumerate or revoke the others.
+- An account password over HTTP Basic is read-only: it can fetch, but not
+  publish, administer or mint tokens.
 - Argon2id password hashing; API tokens stored as SHA-256 of the secret half
   and shown exactly once. Upstream credentials encrypted at rest, never
   returned by the API.

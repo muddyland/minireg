@@ -37,13 +37,22 @@ from ..models import ApiToken, User
 log = logging.getLogger(__name__)
 
 
+#: Identity.method for an account password sent over HTTP Basic.
+PASSWORD_BASIC = "basic_password"
+#: Why a password-over-Basic request was refused something beyond reading.
+PASSWORD_BASIC_READ_ONLY = (
+    "an account password over HTTP Basic is read-only; use an API token "
+    "(or sign in in the browser) for this"
+)
+
+
 @dataclass(slots=True)
 class Identity:
     """Who is making this request."""
 
     user: User | None = None
     token: ApiToken | None = None
-    method: str = "anonymous"  # session|token|basic|anonymous
+    method: str = "anonymous"  # session|token|basic|basic_password|anonymous
 
     @property
     def is_authenticated(self) -> bool:
@@ -65,10 +74,25 @@ class Identity:
     def token_id(self) -> int | None:
         return self.token.id if self.token else None
 
+    @property
+    def is_password_basic(self) -> bool:
+        """An account password sent over HTTP Basic, not a token."""
+        return self.method == PASSWORD_BASIC
+
     def has_scope(self, scope: str) -> bool:
-        """Session logins carry full user authority; tokens are scope-limited."""
+        """Session logins carry full user authority; tokens are scope-limited.
+
+        An account password over HTTP Basic is read-only. It exists for
+        clients that cannot send a bearer token and only need to fetch;
+        publishing, admin actions and minting tokens need a token or a
+        browser session, as the docs have always promised. Treating it as a
+        session meant a password in a pip.conf could publish and mint itself
+        an admin token.
+        """
         if self.user is None:
             return False
+        if self.is_password_basic:
+            return scope == "read"
         if self.token is None:
             return True
         return self.token_has_scope(scope)
@@ -284,10 +308,10 @@ async def _basic_password_identity(
     login endpoint's protections: without them it was an unthrottled,
     unlogged password oracle that also cost a full argon2 verify per guess.
 
-    The resulting identity is marked ``basic_password`` and carries no token,
-    which :meth:`Identity.has_scope` treats as full user authority. That is
-    correct for a password -- it is the user's primary credential -- but it is
-    also why the guessing has to be as expensive here as it is at /auth/login.
+    The resulting identity is marked ``basic_password`` and carries no token.
+    :meth:`Identity.has_scope` grants it ``read`` and nothing else, and
+    :func:`require_primary_credential` refuses it, so a password sent this
+    way can fetch packages but cannot publish, administer or mint tokens.
     """
     from ..core.cache import rate_limit
     from ..core.security import verify_password
@@ -310,7 +334,7 @@ async def _basic_password_identity(
         await session.execute(select(User).where(User.username == username))
     ).scalar_one_or_none()
     if user and user.is_active and verify_password(password, user.password_hash):
-        return Identity(user=user, method="basic_password")
+        return Identity(user=user, method=PASSWORD_BASIC)
 
     with contextlib.suppress(Exception):
         await record_audit(
@@ -486,6 +510,8 @@ async def require_admin(identity: Identity = Depends(resolve_identity)) -> Ident
         )
     if not identity.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin privileges required")
+    if identity.is_password_basic:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PASSWORD_BASIC_READ_ONLY)
     if not identity.has_scope("admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="token lacks the 'admin' scope"
@@ -504,6 +530,9 @@ async def require_primary_credential(
     asking for ``admin`` and be handed one, because the check only ever looked
     at whether the *owner* was an admin. Scoping a token is only meaningful if
     the token cannot widen itself.
+
+    An account password over HTTP Basic is refused too: it is read-only, and
+    a password lifted from a client config must not be able to mint tokens.
     """
     if identity.user is None:
         raise HTTPException(
@@ -511,6 +540,8 @@ async def require_primary_credential(
             detail="authentication required",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if identity.is_password_basic:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PASSWORD_BASIC_READ_ONLY)
     if identity.token is not None and not identity.token_has_scope("admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -529,6 +560,11 @@ async def require_publish(identity: Identity = Depends(resolve_identity)) -> Ide
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="an API token is required to publish",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+    if identity.is_password_basic:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="account passwords cannot publish; use an API token with the 'publish' scope",
         )
     if not identity.can_publish:
         raise HTTPException(
