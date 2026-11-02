@@ -49,7 +49,7 @@ An hourly loop inside the app handles:
 | Quota | With `STORAGE_QUOTA_BYTES` set, evicts cached upstream artifacts back down to 90% of it. See [Eviction](#eviction) |
 | Temp cleanup | Removes staging files orphaned by a crash |
 | Container images | Garbage collection, eviction, watched tags, and the `orphans` step, which reconciles image blob files that have had no database row for 6 hours (see [Container images](containers.md#storage)) |
-| CVE refresh | Re-scans versions older than `OSV_REFRESH_INTERVAL_SECONDS`, and drops the cached rendered documents of every package whose verdict changed |
+| CVE refresh | Re-scans versions older than `OSV_REFRESH_INTERVAL_SECONDS`, and drops the cached rendered documents of every package whose verdict changed. A version OSV could not fully answer for keeps its previous verdict and is retried on the next pass; a pass in which OSV answers for nothing ends early |
 
 The first run is delayed 60 seconds so a restart storm does not converge. Each
 pass takes a renewable lease in Valkey, so only one replica runs it at a time.

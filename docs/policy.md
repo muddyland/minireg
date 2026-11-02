@@ -138,6 +138,12 @@ medium tail is not worth anyone's time.
 - OSV answered, the version has advisories, but none of them published a
   severity anyone could score.
 
+That includes a version for which OSV named an advisory whose full record
+could not then be fetched (a rate limit, an error or a timeout on
+`/v1/vulns/{id}`, after two retries). It is left unscanned rather than
+recorded as clean, whatever an earlier scan found stays in force, and the
+next background pass tries again.
+
 A version that was scanned and had no advisories records a real zero and is
 never blocked by this switch. That distinction is what makes fail-closed
 usable at all: an earlier release stored both cases as "no score", so turning
@@ -174,6 +180,14 @@ Scores are computed from the CVSS vectors OSV publishes:
   any impact never scores below 2.0, so an approximation error cannot present a
   real vulnerability as harmless.
 - **v2** — computed exactly; last resort.
+
+OSV edits its records: a score is often added or raised weeks after an
+advisory is first published, and fixed releases are added as they ship. Each
+scan compares the `modified` time OSV reports against the stored copy and
+fetches the record again when it changed (or, when OSV reports no time, once
+the copy is older than `OSV_REFRESH_INTERVAL_SECONDS`). Every stored version
+linked to a refetched advisory has its highest score and fix status
+recomputed at once, not when its own rescan comes round.
 
 If you change scoring behaviour, **Vulnerabilities → Recompute scores** re-runs
 the calculation over stored OSV records without re-fetching anything, and
