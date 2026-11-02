@@ -276,6 +276,9 @@ async def _dispatch(
         if not is_digest(reference):
             raise RegistryError("DIGEST_INVALID", "referrers are looked up by digest")
         repo = await reg.get_repo(session, target, create=False)
+        # Referrers list a quarantined repository's signatures and SBOMs
+        # (digests, annotations): refused like its tags and manifests.
+        _check_quarantine(ident, repo)
         artifact_type = request.query_params.get("artifactType")
         body = await reg.referrers(session, target, repo, reference, artifact_type)
         headers = _headers({"Content-Type": "application/vnd.oci.image.index.v1+json"})

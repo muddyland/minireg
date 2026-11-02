@@ -183,6 +183,34 @@ class TestBlobsFollowImagePolicy:
         resp = await client.get(f"/v2/q/blobs/{sha(img.layers[0])}", headers=headers)
         assert resp.status_code == 403
 
+    async def test_quarantine_covers_referrers(self, docker_env, no_scan_gate):
+        """Referrers name a quarantined repository's signatures and SBOMs;
+        they are refused like its tags and manifests."""
+        client, _ = docker_env
+        token = await make_user()
+        headers = await bearer(client, "repository:local/team/signed:pull,push", token)
+        img = Image.build("signed")
+        assert (await push_image(client, "local/team/signed", "1", img, headers)).status_code == 201
+        sig = Image.build(
+            "sig",
+            extra={
+                "artifactType": "application/vnd.dev.cosign.artifact.sig.v1+json",
+                "subject": {"mediaType": OCI_MANIFEST, "digest": img.digest, "size": len(img.manifest)},
+            },
+        )
+        assert (await push_image(client, "local/team/signed", sig.digest, sig, headers)).status_code == 201
+        url = f"/v2/local/team/signed/referrers/{img.digest}"
+        listed = await client.get(url, headers=headers)
+        assert listed.status_code == 200
+        assert [m["digest"] for m in listed.json()["manifests"]] == [sig.digest]
+
+        async with db_module.session_scope() as session:
+            await session.execute(update(DockerRepository).values(quarantined=True, quarantine_reason="incident 7"))
+        resp = await client.get(url, headers=headers)
+        assert resp.status_code == 403
+        assert resp.json()["errors"][0]["code"] == "DENIED"
+        assert "incident 7" in resp.json()["errors"][0]["message"]
+
     async def test_the_scanner_still_reads_blocked_layers(self, docker_env):
         from tests.test_docker_scan import scanner_headers
 
