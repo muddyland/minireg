@@ -346,6 +346,22 @@ def check_fetchable(url: str, *, upstream_url: str | None = None) -> None:
         )
 
 
+async def check_fetchable_async(url: str, *, upstream_url: str | None = None) -> None:
+    """:func:`check_fetchable` without blocking the event loop.
+
+    The name is resolved on a worker thread: ``socket.getaddrinfo`` on the
+    loop stalls every other request in the process for as long as DNS takes,
+    and a cold artifact fetch did exactly that.
+    """
+    host = _check_url_shape(url, upstream_url=upstream_url)
+    if settings.upstream_allow_private_addresses:
+        return
+    if await asyncio.to_thread(_resolves_private, host):
+        raise BlockedUrl(
+            f"'{host}' resolves to a private or link-local address; refusing to fetch"
+        )
+
+
 async def guard_url(
     url: str,
     *,

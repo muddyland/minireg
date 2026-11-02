@@ -48,7 +48,7 @@ from ..core.cache import Lease, herd_guard, lease_is_free
 from ..db import session_scope
 from ..models import Blob, PackageFile, Upstream
 from ..upstreams.base import UpstreamError
-from ..upstreams.netguard import BlockedUrl, check_fetchable
+from ..upstreams.netguard import BlockedUrl, check_fetchable_async
 from .resolver import build_provider
 from .storage import Digests, StoredBlob, get_store
 
@@ -339,11 +339,17 @@ async def _open_upstream(
 
     The URL comes from upstream metadata, so it is checked against the
     allowlist before a socket is opened, and again on every redirect.
+
+    Through a provider, :meth:`~..upstreams.base.UpstreamProvider.stream`
+    does that for every hop, the first included, resolving asynchronously and
+    pinning the answer. A synchronous pre-check here repeated the same host
+    rules with a blocking ``getaddrinfo`` on the event loop, on every cold
+    fetch.
     """
-    check_fetchable(url, upstream_url=upstream.url if upstream else None)
     if upstream is not None:
         response, chunks = await build_provider(upstream).stream(url)
     else:
+        await check_fetchable_async(url)
         # No upstream row (e.g. an absolute URL from a merged document): fetch
         # anonymously with the shared client. Redirects are followed by hand:
         # httpx's own follow_redirects connects to every hop before anything
@@ -363,7 +369,7 @@ async def _open_upstream(
             if not location:
                 raise ArtifactError(f"{filename}: redirect with no Location header")
             current = str(httpx.URL(current).join(location))
-            check_fetchable(current)
+            await check_fetchable_async(current)
         else:
             raise ArtifactError(f"{filename}: too many redirects fetching {url}")
         chunks = response.aiter_bytes(settings.stream_chunk_size)
