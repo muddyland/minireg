@@ -110,6 +110,7 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
     ("api_tokens", "docker_repo_prefixes", "JSONB"),
     ("package_versions", "has_advisories", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("package_versions", "is_malicious", "BOOLEAN NOT NULL DEFAULT FALSE"),
 ]
 
 # Backfills for the columns above, run after them on every start. Each must be
@@ -123,6 +124,14 @@ DATA_FIXES: list[str] = [
     "UPDATE package_versions SET has_advisories = TRUE "
     "WHERE has_advisories = FALSE "
     "AND id IN (SELECT version_id FROM package_vulnerabilities)",
+    # is_malicious: versions linked to a malicious-package record. A record
+    # filed under another id with only a MAL-* alias is caught by the
+    # version's next rescan instead.
+    "UPDATE package_versions SET is_malicious = TRUE "
+    "WHERE is_malicious = FALSE AND id IN ("
+    "SELECT pv.version_id FROM package_vulnerabilities pv "
+    "JOIN vulnerabilities v ON v.id = pv.vulnerability_id "
+    "WHERE v.id LIKE 'MAL-%' OR v.severity_type = 'MALICIOUS')",
 ]
 
 

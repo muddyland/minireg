@@ -164,6 +164,17 @@ That is the trade you are making: correctness over availability.
 Skips versions with no fixed release available upstream. Avoids blocking things
 nobody can currently remediate, at the cost of serving known-vulnerable code.
 
+It never applies to malware: see below.
+
+### Malicious packages
+
+A version named by a malicious-package advisory (`MAL-*`) is blocked whenever
+the CVE policy is enabled, whatever the range and whatever **Only block when a
+fix exists** says. Such an advisory says the release *is* malware; there is no
+fixed version of a backdoor, so the fix switch used to let every one of them
+through, and how it scores is not the question. Turn the CVE policy off and it
+is served like anything else.
+
 ### Where scores come from
 
 OSV.dev. `OSV_CVE_ONLY` narrows this to records carrying a `CVE-*` alias, and

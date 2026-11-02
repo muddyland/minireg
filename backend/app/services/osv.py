@@ -378,6 +378,8 @@ class ScanResult:
     max_score: float | None = None
     has_fix: bool = False
     scanned: bool = True
+    #: One of the advisories is a malicious-package (MAL-*) record.
+    malicious: bool = False
 
     @property
     def severity(self) -> str | None:
@@ -619,6 +621,7 @@ class OsvScanner:
                 cves = []
                 max_score = None
                 has_fix = False
+                malicious = False
                 for osv_id in ids:
                     record = hydrated.get(osv_id)
                     if record is None:
@@ -639,6 +642,8 @@ class OsvScanner:
                         max_score = score
                     if record.get("fixed_version"):
                         has_fix = True
+                    if record.get("malicious"):
+                        malicious = True
                 if not cves:
                     # Scanned, nothing found. Recorded as a real zero rather
                     # than None so the policy engine can tell "clean" from
@@ -652,6 +657,7 @@ class OsvScanner:
                     max_score=max_score,
                     has_fix=has_fix,
                     scanned=True,
+                    malicious=malicious,
                 )
         return results
 
@@ -693,6 +699,8 @@ class OsvScanner:
                 # issue. Omitting it here meant every CVE we had already seen
                 # reported "no fix available", regardless of the truth.
                 "raw": v.raw,
+                "malicious": is_malicious({"id": v.id, "aliases": v.aliases or []})
+                or v.severity_type == "MALICIOUS",
             }
             for v in known
         }
@@ -777,6 +785,7 @@ class OsvScanner:
                 "summary": record.get("summary"),
                 "fixed_version": None,
                 "raw": record,
+                "malicious": malicious,
             }
             if requested in stale:
                 refreshed[osv_id] = record
@@ -827,6 +836,9 @@ class OsvScanner:
                     PackageVulnerability.version_id,
                     Vulnerability.cvss_score,
                     PackageVulnerability.fixed_version,
+                    Vulnerability.id,
+                    Vulnerability.aliases,
+                    Vulnerability.severity_type,
                 )
                 .join(Vulnerability, Vulnerability.id == PackageVulnerability.vulnerability_id)
                 .where(PackageVulnerability.version_id.in_(list(version_ids)))
@@ -834,12 +846,16 @@ class OsvScanner:
         ).all()
         worst: dict[int, float | None] = {}
         fixable: dict[int, bool] = {}
-        for version_id, score, fixed in pairs:
+        malware: dict[int, bool] = {}
+        for version_id, score, fixed, osv_id, aliases, stype in pairs:
             current = worst.get(version_id)
             if score is not None and (current is None or score > current):
                 worst[version_id] = score
             worst.setdefault(version_id, None)
             fixable[version_id] = fixable.get(version_id, False) or bool(fixed)
+            malware[version_id] = malware.get(version_id, False) or (
+                stype == "MALICIOUS" or is_malicious({"id": osv_id, "aliases": aliases or []})
+            )
         for version_id, score in worst.items():
             version_row = await self.session.get(
                 PackageVersion, version_id, options=[defer(PackageVersion.metadata_json)]
@@ -850,10 +866,12 @@ class OsvScanner:
                 version_row.max_cvss != score
                 or version_row.has_fix != fixable[version_id]
                 or not version_row.has_advisories
+                or version_row.is_malicious != malware[version_id]
             ):
                 version_row.max_cvss = score
                 version_row.has_fix = fixable[version_id]
                 version_row.has_advisories = True
+                version_row.is_malicious = malware[version_id]
                 await self._note_changed(version_row)
         await self.session.flush()
 
@@ -1013,10 +1031,12 @@ class OsvScanner:
             or version_row.scanned_at is None
             or version_row.has_fix != result.has_fix
             or version_row.has_advisories != result.has_advisories
+            or version_row.is_malicious != result.malicious
         )
         version_row.max_cvss = result.max_score
         version_row.has_fix = result.has_fix
         version_row.has_advisories = result.has_advisories
+        version_row.is_malicious = result.malicious
         version_row.scanned_at = datetime.now(UTC)
 
         existing_links = {

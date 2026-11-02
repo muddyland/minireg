@@ -597,6 +597,35 @@ class TestCvePolicy:
             await session.execute(update(PackageVersion).values(has_advisories=True))
         assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 403
 
+    async def test_require_fix_does_not_let_malware_through(self, app_client):
+        """A MAL-* advisory has no fixed release, so "only block when a fix
+        exists" used to serve every malicious package."""
+        from sqlalchemy import update
+
+        from app.models import PackageVersion
+
+        await app_client.put("/npm/test-pkg", json=npm_publish_body(), headers=auth(app_client))
+        await self._set_policy(min_score=7.0, max_score=10.0, require_fix_available=True)
+        await self._set_version_score(10.0)
+        async with db_module.session_scope() as session:
+            await session.execute(
+                update(PackageVersion).values(has_advisories=True, has_fix=False)
+            )
+        # An ordinary unfixable advisory is still let through, as configured.
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 200
+
+        async with db_module.session_scope() as session:
+            await session.execute(update(PackageVersion).values(is_malicious=True))
+        response = await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")
+        assert response.status_code == 403
+        assert "malicious" in response.text
+        # Outside the score range too: malware is not a severity question.
+        await self._set_policy(min_score=4.0, max_score=6.9)
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 403
+        # The policy switch still governs it.
+        await self._set_policy(enabled=False)
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 200
+
     async def _score_one_version(self, version, score):
         from datetime import UTC, datetime
 

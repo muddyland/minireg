@@ -467,3 +467,74 @@ class TestCvePolicyZeroRange:
         assert policy.blocks(5.0, scanned=True, has_advisories=False)
         assert policy.blocks(None, scanned=True)
         assert policy.blocks(None, scanned=False)
+
+
+# --------------------------------------------------------------------------- #
+# Malicious-package advisories
+# --------------------------------------------------------------------------- #
+class TestMaliciousFlag:
+    async def test_scan_flags_malware_and_the_policy_blocks_it_without_a_fix(self, db):
+        from app.models import Setting
+        from app.services.policy import KEY_CVE_POLICY, PolicyEngine
+
+        version_id = await seed_version("evil", "1.0.0")
+        with respx.mock(assert_all_called=False) as router:
+            querybatch(router, [("MAL-2026-7", "2026-01-01T00:00:00Z")])
+            router.get(f"{OSV}/v1/vulns/MAL-2026-7").mock(
+                return_value=httpx.Response(200, json=record("MAL-2026-7"))
+            )
+            result = await scan("evil", "1.0.0")
+        assert result.malicious is True
+        assert result.has_fix is False
+
+        async with db_module.session_scope() as session:
+            session.add(
+                Setting(
+                    key=KEY_CVE_POLICY,
+                    value={"enabled": True, "min_score": 7.0, "max_score": 10.0,
+                           "require_fix_available": True},
+                )
+            )
+        async with db_module.session_scope() as session:
+            row = await session.get(PackageVersion, version_id)
+            assert row.is_malicious is True
+            verdict = await PolicyEngine(session).evaluate(
+                "npm",
+                "evil",
+                row.version,
+                max_cvss=row.max_cvss,
+                has_fix=row.has_fix,
+                scanned=bool(row.scanned_at),
+                has_advisories=row.has_advisories,
+                malicious=row.is_malicious,
+            )
+        assert verdict.blocked
+
+    async def test_a_cached_malicious_record_still_flags_the_version(self, db):
+        await seed_version("evil", "2.0.0")
+        await seed_advisory(
+            "MAL-2026-7",
+            score=10.0,
+            modified=datetime(2026, 1, 1, tzinfo=UTC),
+            raw=record("MAL-2026-7"),
+        )
+        with respx.mock(assert_all_called=False) as router:
+            querybatch(router, [("MAL-2026-7", "2026-01-01T00:00:00Z")])
+            result = await scan("evil", "2.0.0")
+        assert result.malicious is True
+
+    async def test_upgrade_backfills_malicious_versions(self, db):
+        bad = await seed_version("evil", "1.0.0", max_cvss=10.0, scanned_at=datetime.now(UTC))
+        other = await seed_version("lib", "1.0.0", max_cvss=9.8, scanned_at=datetime.now(UTC))
+        await seed_advisory(
+            "MAL-2026-7", score=10.0, modified=datetime(2026, 1, 1, tzinfo=UTC),
+            raw=record("MAL-2026-7"), link_to=[bad],
+        )
+        await seed_advisory(
+            "GHSA-x", score=9.8, modified=datetime(2026, 1, 1, tzinfo=UTC),
+            raw=record("GHSA-x", package="lib", vector=CRITICAL), link_to=[other],
+        )
+        await db_module.create_schema()
+        async with db_module.session_scope() as session:
+            assert (await session.get(PackageVersion, bad)).is_malicious is True
+            assert (await session.get(PackageVersion, other)).is_malicious is False

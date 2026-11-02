@@ -7,7 +7,7 @@ Evaluation order (deliberate, and the block list is *always* enforced):
 2. Allowlist mode (optional). When enabled, a package must match an allow rule
    to pass. This is the "default deny" posture.
 3. CVE policy. A version whose highest CVSS score falls inside the configured
-   block range is denied.
+   block range is denied, and so is one a malicious-package advisory names.
 
 Rules are cached in Redis and in-process because they are consulted on every
 single request; the cache is invalidated whenever a rule is written.
@@ -293,6 +293,7 @@ class PolicyEngine:
         has_fix: bool = False,
         scanned: bool = True,
         has_advisories: bool | None = None,
+        malicious: bool = False,
         _name_level: bool = False,
     ) -> Verdict:
         eco = ecosystem.value if isinstance(ecosystem, Ecosystem) else str(ecosystem)
@@ -340,6 +341,17 @@ class PolicyEngine:
 
         # 3. CVE score policy.
         policy = await self.get_cve_policy()
+        if version is not None and policy.enabled and malicious:
+            # A malicious-package advisory says the release *is* malware.
+            # There is no fixed version of a backdoor -- OSV records have no
+            # `fixed` event -- so require_fix_available let every one of them
+            # through, and a score range is the wrong question to ask.
+            return Verdict(
+                allowed=False,
+                reason="blocked by CVE policy: an OSV malicious-package advisory "
+                "names this version as malware",
+                source="cve",
+            )
         if version is not None and policy.blocks(
             max_cvss, scanned=scanned, has_advisories=has_advisories
         ):
