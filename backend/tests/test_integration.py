@@ -836,6 +836,33 @@ class TestClientConfig:
         assert body["twine"]["repository_url"] == "http://registry.test/pypi/legacy/"
         assert "registry.test/npm/:_authToken" in body["npm"]["npmrc"]
 
+    async def test_pip_trusted_host_only_for_plain_http(self, app_client, monkeypatch):
+        """pip's `trusted-host` turns certificate verification off for an
+        https index (pip mounts its InsecureHTTPAdapter for the host), so a
+        copied pip.conf must only carry it when the registry is plain http,
+        where pip needs it to use the index at all."""
+        import configparser
+
+        from app.config import settings
+
+        def parsed(body):
+            conf = configparser.ConfigParser()
+            conf.read_string(body["pip"]["pip_conf"])
+            return conf
+
+        body = (await app_client.get("/api/client-config", headers=auth(app_client))).json()
+        assert parsed(body).get("global", "trusted-host") == "registry.test"
+        assert body["pip"]["authenticated_index_url"].startswith("http://__token__:")
+
+        monkeypatch.setattr(settings, "public_url", "https://registry.example.com:8443")
+        body = (await app_client.get("/api/client-config", headers=auth(app_client))).json()
+        conf = parsed(body)
+        assert conf.get("global", "index-url") == "https://registry.example.com:8443/pypi/simple/"
+        assert not conf.has_option("global", "trusted-host")
+        assert body["pip"]["authenticated_index_url"] == (
+            "https://__token__:<your-token>@registry.example.com:8443/pypi/simple/"
+        )
+
     async def test_cargo_stanza_is_client_ready(self, app_client):
         """The Client setup page renders these keys directly, so the contract
         matters as much as the values. Both the `sparse+` prefix and the

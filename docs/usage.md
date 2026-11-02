@@ -124,6 +124,8 @@ index-url = https://__token__:<token>@registry.example.com/pypi/simple/
 
 Over plain HTTP add `trusted-host = registry.example.com` to silence pip's
 warning. Do this only on a trusted network; the token is in cleartext.
+Never add it for an https registry: for https, `trusted-host` makes pip skip
+certificate verification.
 
 ### uv
 
