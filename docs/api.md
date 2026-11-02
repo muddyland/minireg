@@ -101,7 +101,7 @@ Mounted at `/pypi`.
 | `GET` | `/pypi/files/{project}/{filename}` | Artifact |
 | `GET` | `/pypi/files/{project}/{filename}.metadata` | PEP 658 metadata sidecar |
 | `GET` | `/pypi/{project}/json` | Warehouse-compatible JSON (subset) |
-| `POST` | `/pypi/legacy/` | twine upload |
+| `POST` | `/pypi/legacy/` | twine upload. Wheels and `.tar.gz` sdists only; see [usage](usage.md#publishing-with-twine) for the rules |
 
 Content negotiation per PEP 691:
 

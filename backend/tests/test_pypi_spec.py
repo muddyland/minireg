@@ -336,6 +336,43 @@ class TestUploadValidation:
                 make_form(filetype="bogus"), "my_package-1.0.0-py3-none-any.whl", b"d", "x"
             )
 
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "my_package-1.0.0.zip",
+            "my_package-1.0.0-py3.12.egg",
+            "my_package-1.0.0.win-amd64.exe",
+            "my_package-1.0.0.win-amd64.msi",
+            "my_package-1.0.0.tar.bz2",
+        ],
+    )
+    def test_rejects_anything_but_wheels_and_tar_gz_sdists(self, filename):
+        # PEP 715 (no eggs), PEP 625 (sdists are .tar.gz), as Warehouse does.
+        form = make_form()
+        del form["filetype"]
+        with pytest.raises(UploadError, match="only wheels"):
+            parse_upload(form, filename, b"d", "x")
+
+    @pytest.mark.parametrize(
+        ("filetype", "filename"),
+        [
+            ("bdist_wheel", "my_package-1.0.0.tar.gz"),
+            ("sdist", "my_package-1.0.0-py3-none-any.whl"),
+        ],
+    )
+    def test_rejects_a_filetype_the_extension_contradicts(self, filetype, filename):
+        with pytest.raises(UploadError, match="does not match"):
+            parse_upload(make_form(filetype=filetype), filename, b"d", "x")
+
+    @pytest.mark.parametrize("filetype", ["bdist_egg", "bdist_wininst", "bdist_dumb"])
+    def test_rejects_legacy_filetypes(self, filetype):
+        with pytest.raises(UploadError, match="invalid filetype"):
+            parse_upload(make_form(filetype=filetype), "my_package-1.0.0.tar.gz", b"d", "x")
+
+    def test_rejects_a_non_pep440_version(self):
+        with pytest.raises(UploadError, match="not a valid version"):
+            parse_upload(make_form(version="latest"), "my_package-latest.tar.gz", b"d", "x")
+
     def test_unknown_is_treated_as_absent(self):
         parsed = parse_upload(
             make_form(summary="UNKNOWN"), "my_package-1.0.0-py3-none-any.whl", b"d", "x"

@@ -397,7 +397,9 @@ class TestPypiPublishFlow:
         assert "already exists" in response.text
 
     async def test_only_one_sdist_per_release(self, app_client):
-        for filename in ("my_package-1.0.0.tar.gz", "my_package-1.0.0.zip"):
+        # Two spellings of the same sdist name; a .zip is no longer accepted
+        # as an sdist at all.
+        for filename in ("my_package-1.0.0.tar.gz", "my-package-1.0.0.tar.gz"):
             data, files = self._upload(filename=filename)
             data["filetype"] = "sdist"
             response = await app_client.post(

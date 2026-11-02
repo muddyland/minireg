@@ -138,6 +138,12 @@ def parse_dist_filename(filename: str) -> tuple[str, str, str] | None:
         stem = filename[: -len(".egg")]
         parts = stem.split("-")
         if len(parts) >= 2:
+            # Same rule as the sdist branch above: `foo-latest.egg` is not a
+            # release, and would otherwise sort ahead of every real one.
+            try:
+                Version(parts[1])
+            except InvalidVersion:
+                return None
             return parts[0], parts[1], "bdist_egg"
     return None
 

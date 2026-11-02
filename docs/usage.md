@@ -171,7 +171,12 @@ Then `twine upload -r minireg dist/*`.
 
 Rules that are enforced:
 
-- The filename must agree with the declared name and version.
+- The filename must agree with the declared name and version, and the version
+  must be valid PEP 440.
+- Only wheels (`.whl`) and sdists (`.tar.gz`) are accepted, as on PyPI today:
+  eggs (PEP 715), `.zip` sdists (PEP 625) and Windows installers are refused,
+  and a declared `filetype` must match the extension (`bdist_wheel` for a
+  wheel, `sdist` for a `.tar.gz`).
 - Every digest you supply must match the bytes received.
 - Only one sdist per release.
 - Versions are compared as PEP 440 does: `2.0.0` is the same release as an

@@ -9,6 +9,7 @@ Warehouse's own rules that we reproduce:
 * the filename must agree with the ``name`` and ``version`` fields
 * every digest the client supplies must match the bytes received
 * only one sdist per release
+* only wheels and ``.tar.gz`` sdists, with a ``filetype`` that agrees
 * re-uploading an existing filename is rejected (PyPI never overwrites)
 """
 
@@ -30,14 +31,19 @@ from ..core.naming import (
     normalize_pypi_name,
     normalize_pypi_version,
     parse_dist_filename,
+    parse_pypi_version,
 )
 
 log = logging.getLogger(__name__)
 
-VALID_FILETYPES = {"sdist", "bdist_wheel", "bdist_egg", "bdist_wininst", "bdist_dumb"}
-
-# Warehouse's allowed distribution extensions.
-ALLOWED_EXTENSIONS = (".tar.gz", ".zip", ".whl", ".egg")
+# What Warehouse accepts today, and the one filetype each extension may claim.
+# Eggs (and .exe/.msi installers) are refused since PEP 715, and sdists must be
+# .tar.gz since PEP 625; a legacy .zip sdist is refused rather than kept as an
+# escape hatch, because a file whose extension and filetype disagree is how a
+# second sdist got into a release disguised as a wheel.
+FILETYPE_FOR_EXTENSION = {".whl": "bdist_wheel", ".tar.gz": "sdist"}
+ALLOWED_EXTENSIONS = tuple(FILETYPE_FOR_EXTENSION)
+VALID_FILETYPES = frozenset(FILETYPE_FOR_EXTENSION.values())
 
 # Mirrors the transport-level cap in main.limit_body_size.
 MAX_FILE_BYTES = settings.max_publish_bytes
@@ -146,29 +152,39 @@ def parse_upload(
         raise UploadError("'version' is required")
     if not is_valid_pypi_name(name):
         raise UploadError(f"'{name}' is not a valid project name (PEP 508)")
+    if parse_pypi_version(version) is None:
+        raise UploadError(f"'{version}' is not a valid version (PEP 440)")
 
     if not filename:
         raise UploadError("no filename supplied for the uploaded content")
     if not _FILENAME_RE.match(filename):
         raise UploadError(f"invalid characters in filename '{filename}'")
-    if not filename.endswith(ALLOWED_EXTENSIONS):
+    extension = next((ext for ext in ALLOWED_EXTENSIONS if filename.endswith(ext)), None)
+    if extension is None:
         raise UploadError(
-            f"unsupported distribution type for '{filename}'; "
-            f"expected one of {', '.join(ALLOWED_EXTENSIONS)}"
+            f"unsupported distribution type for '{filename}'; only wheels (.whl) "
+            "and sdists (.tar.gz) can be uploaded"
         )
     if not content:
         raise UploadError("uploaded file is empty")
     if len(content) > MAX_FILE_BYTES:
         raise UploadError("uploaded file exceeds the size limit", status_code=413)
 
-    filetype = _single(form, "filetype")
+    # The extension decides the filetype; a declared one has to agree. It is
+    # stored and reported (packagetype in the JSON API) and the one-sdist rule
+    # keys on it, so a .tar.gz could otherwise claim to be a wheel.
+    filetype = FILETYPE_FOR_EXTENSION[extension]
+    declared_type = _single(form, "filetype")
+    if declared_type is not None and declared_type not in VALID_FILETYPES:
+        raise UploadError(f"invalid filetype '{declared_type}'")
+    if declared_type is not None and declared_type != filetype:
+        raise UploadError(
+            f"filetype '{declared_type}' does not match '{filename}', which is a {filetype}"
+        )
     parsed = parse_dist_filename(filename)
     if parsed is None:
         raise UploadError(f"could not parse project name and version from '{filename}'")
-    file_name_part, file_version_part, inferred_type = parsed
-    filetype = filetype or inferred_type
-    if filetype not in VALID_FILETYPES:
-        raise UploadError(f"invalid filetype '{filetype}'")
+    file_name_part, file_version_part, _inferred_type = parsed
 
     # The filename is the authority pip trusts, so it must agree with the form.
     if normalize_pypi_name(file_name_part) != normalize_pypi_name(name):

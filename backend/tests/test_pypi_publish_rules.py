@@ -141,3 +141,36 @@ class TestEqualVersionsAreOneRelease:
         assert "withdrawn" in response.text
         # An unrelated version is still fine.
         assert (await upload_wheel(app_client, "gone-pkg", "1.0.1")).status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Only wheels and .tar.gz sdists, with a filetype that agrees
+# --------------------------------------------------------------------------- #
+class TestDistributionTypes:
+    async def test_second_sdist_cannot_pose_as_a_wheel(self, app_client):  # noqa: F811
+        sdist = await upload(
+            app_client, "ftpkg", "1.0", "ftpkg-1.0.tar.gz", b"sdist-1", filetype="sdist"
+        )
+        assert sdist.status_code == 200, sdist.text
+        for filename, filetype, reason in (
+            ("ftpkg-1.0.zip", "bdist_wheel", "only wheels"),
+            ("ftpkg-1.0.zip", "sdist", "only wheels"),
+            ("FTPkg-1.0.tar.gz", "bdist_wheel", "does not match"),
+        ):
+            response = await upload(
+                app_client, "ftpkg", "1.0", filename, b"sdist-2", filetype=filetype
+            )
+            assert response.status_code == 400, (filename, filetype, response.text)
+            assert reason in response.text
+
+        api = (await app_client.get("/pypi/ftpkg/json")).json()
+        assert [(f["filename"], f["packagetype"]) for f in api["releases"]["1.0"]] == [
+            ("ftpkg-1.0.tar.gz", "sdist")
+        ]
+
+    async def test_eggs_and_non_pep440_versions_are_refused(self, app_client):  # noqa: F811
+        egg = await upload(app_client, "eggpkg", "latest", "eggpkg-latest.egg", b"egg")
+        assert egg.status_code == 400
+        egg = await upload(app_client, "eggpkg", "1.0", "eggpkg-1.0-py3.12.egg", b"egg")
+        assert egg.status_code == 400
+        assert (await app_client.get("/pypi/simple/eggpkg/", headers=JSON)).status_code == 404

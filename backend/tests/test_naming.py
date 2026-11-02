@@ -153,6 +153,12 @@ class TestDistFilenameParsing:
         assert parse_dist_filename("not-a-package") is None
         assert parse_dist_filename("noversion.whl") is None
 
+    def test_egg_needs_a_real_version(self):
+        # Upstream indexes still list eggs; one whose "version" is not PEP 440
+        # is not a release and must not become one.
+        assert parse_dist_filename("eggpkg-latest.egg") is None
+        assert parse_dist_filename("eggpkg-1.0-py2.7.egg") == ("eggpkg", "1.0", "bdist_egg")
+
 
 class TestNpmNames:
     @pytest.mark.parametrize(
