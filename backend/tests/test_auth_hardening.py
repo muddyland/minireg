@@ -467,3 +467,48 @@ class TestEmailVerifiedIsReadStrictly:
         assert admin.provider == AuthProvider.local
         # A separate account was made for the subject instead.
         assert (await user_row("evil")).oidc_subject == "evil"
+
+
+class TestDisabledAccountsCannotUseSso:
+    """The OIDC callback never looked at is_active: a disabled account got an
+    auth.login.oidc success in the audit log and a session cookie."""
+
+    async def _audit(self, action):
+        async with db_module.session_scope() as session:
+            return (
+                await session.execute(select(AuditLog).where(AuditLog.action == action))
+            ).scalars().all()
+
+    async def test_a_disabled_sso_account_is_refused(self, app_client, provider):
+        provider.update({"sub": "s5", "preferred_username": "sso-user"})
+        assert (await sso(app_client)).status_code == 302
+        async with db_module.session_scope() as session:
+            row = (
+                await session.execute(select(User).where(User.oidc_subject == "s5"))
+            ).scalar_one()
+            row.is_active = False
+        app_client.cookies.clear()
+
+        resp = await sso(app_client)
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "account is disabled"
+        assert settings.session_cookie not in resp.cookies
+        assert len(await self._audit("auth.login.oidc")) == 1  # the first login only
+        failed = await self._audit("auth.login.failed")
+        assert [r.detail["reason"] for r in failed] == ["account disabled"]
+
+    async def test_a_disabled_local_account_is_not_linked(self, app_client, provider):
+        async with db_module.session_scope() as session:
+            row = (
+                await session.execute(select(User).where(User.username == "publisher"))
+            ).scalar_one()
+            row.is_active = False
+        provider.update(
+            {"sub": "pub-sub", "preferred_username": "pub", "email": "pub@test", "email_verified": True}
+        )
+        resp = await sso(app_client)
+        assert resp.status_code == 403
+        row = await user_row("publisher")
+        assert row.oidc_subject is None
+        assert row.provider == AuthProvider.local
+        assert row.password_hash  # untouched

@@ -685,7 +685,7 @@ async def oidc_callback(
         ).scalars().all()
         # An ambiguous match is not a match. Email is not unique in this
         # schema, and picking one arbitrarily is how you link the wrong person.
-        if len(candidates) == 1:
+        if len(candidates) == 1 and candidates[0].is_active:
             user = candidates[0]
             user.oidc_issuer = profile.issuer
             user.oidc_subject = profile.subject
@@ -699,6 +699,26 @@ async def oidc_callback(
             user.password_hash = None
             user.session_version = (user.session_version or 0) + 1
             log.info("linked local account '%s' to OIDC subject", user.username)
+        elif len(candidates) == 1:
+            # A disabled account is not linked; it is refused below.
+            user = candidates[0]
+
+    # Disabled here means disabled, whatever the provider says. The callback
+    # used to audit a successful SSO login and hand out a cookie (one the
+    # session check then refused) for an account an admin had switched off.
+    if user is not None and not user.is_active:
+        await audit.record_audit(
+            session,
+            audit.LOGIN_FAILED,
+            actor_user_id=user.id,
+            actor_username=user.username,
+            success=False,
+            ip=ip,
+            user_agent=request.headers.get("user-agent"),
+            detail={"method": "oidc", "reason": "account disabled", "subject": profile.subject},
+        )
+        await session.commit()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account is disabled")
 
     created = False
     if user is None:
