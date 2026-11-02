@@ -12,6 +12,7 @@ consults an upstream.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -54,6 +55,12 @@ def cache_key(ecosystem: str, name: str, suffix: str = "") -> str:
 # first 255 characters of it.
 _TEXT_LIMITS = {"license": 255, "author": 512, "homepage": 1024, "latest_version": 128}
 
+#: C0 controls other than tab and newline, DEL, and the C1 range. Nothing in a
+#: description or licence needs them, and ESC is how a terminal escape sequence
+#: starts: a description carrying OSC 52 or "erase line" acts on the terminal
+#: of whoever runs `minireg search` or `curl`s the API.
+_CONTROL_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
 
 def coerce_text(value, limit: int | None = None) -> str | None:
     """Flatten an upstream field into something a text column will accept.
@@ -83,10 +90,22 @@ def coerce_text(value, limit: int | None = None) -> str | None:
     else:
         return None
 
-    text = text.strip()
+    text = _CONTROL_CHARS.sub("", text.replace("\r\n", "\n")).strip()
     if not text:
         return None
     return text[:limit] if limit else text
+
+
+def coerce_http_url(value, limit: int | None = None) -> str | None:
+    """A link from upstream metadata (a homepage), kept only if it is http(s).
+
+    The web UI renders it as a link, and anything else -- `javascript:`,
+    `data:` -- is either a script waiting for a click or useless to a reader.
+    """
+    text = coerce_text(value, limit)
+    if text and text.lower().startswith(("http://", "https://")):
+        return text
+    return None
 
 
 def coerce_keywords(value) -> list[str]:
@@ -382,7 +401,7 @@ async def persist_remote_package(
     _set(
         package,
         "homepage",
-        coerce_text(remote.homepage, _TEXT_LIMITS["homepage"]) or package.homepage,
+        coerce_http_url(remote.homepage, _TEXT_LIMITS["homepage"]) or package.homepage,
     )
     _set(package, "license", coerce_text(remote.license, _TEXT_LIMITS["license"]) or package.license)
     keywords = coerce_keywords(remote.keywords)
@@ -1085,7 +1104,8 @@ async def search_local(
 
     total = (await session.execute(count_stmt)).scalar_one()
     stmt = stmt.order_by(
-        (Package.normalized_name == query.lower()).desc(),
+        # Exact match first, ignoring case: npm keys keep it (JSONStream).
+        (func.lower(Package.normalized_name) == query.lower()).desc(),
         Package.download_count.desc(),
         Package.normalized_name.asc(),
     ).limit(limit).offset(offset)

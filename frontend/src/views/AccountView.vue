@@ -1,14 +1,28 @@
 <script setup>
 import { ref } from 'vue'
+import { useRouter } from 'vue-router'
 import api from '@/api/client'
 import { errorMessage } from '@/utils/errors'
 import { useAuthStore } from '@/stores/auth'
 import { formatDateTime } from '@/utils/format'
 
 const auth = useAuthStore()
+const router = useRouter()
 const form = ref({ current_password: '', new_password: '', confirm: '' })
 const message = ref(null)
 const error = ref(null)
+const sessionsError = ref(null)
+
+async function signOutEverywhere() {
+  sessionsError.value = null
+  if (!confirm('Sign out of every browser, including this one? API tokens keep working.')) return
+  try {
+    await auth.logoutEverywhere()
+    router.push({ name: 'login' })
+  } catch (err) {
+    sessionsError.value = errorMessage(err, 'Could not sign out the other sessions.')
+  }
+}
 
 async function changePassword() {
   message.value = null
@@ -64,6 +78,13 @@ async function changePassword() {
         <div class="row" style="justify-content: space-between">
           <span class="dim">Last sign-in</span>
           <span>{{ formatDateTime(auth.user?.last_login_at) }}</span>
+        </div>
+        <div v-if="sessionsError" class="alert alert-error" role="alert">{{ sessionsError }}</div>
+        <div class="row" style="justify-content: space-between">
+          <span class="dim">Browser sessions</span>
+          <button class="btn btn-sm btn-danger" type="button" @click="signOutEverywhere">
+            Sign out everywhere
+          </button>
         </div>
       </div>
     </div>

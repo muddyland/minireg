@@ -85,6 +85,24 @@ def cargo_error(message: str, status_code: int) -> Response:
     return json_response({"errors": [{"detail": message}]}, status_code)
 
 
+def cargo_http_error(exc) -> Response:
+    """An HTTPException raised under /cargo (auth, rate limit), cargo-shaped.
+
+    The guards are shared with npm and PyPI and raise FastAPI's
+    ``{"detail": ...}``, which cargo does not read. A 401 also carries the
+    RFC 3139 challenge, so cargo tells the user where to get a token instead
+    of only that it was refused.
+    """
+    detail = exc.detail if isinstance(exc.detail, str) else "request failed"
+    response = cargo_error(detail, exc.status_code)
+    for name, value in (exc.headers or {}).items():
+        if name.lower() not in ("www-authenticate", "content-length"):
+            response.headers[name] = value
+    if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+        response.headers["www-authenticate"] = f'Cargo login_url="{settings.public_url}/tokens"'
+    return response
+
+
 # --------------------------------------------------------------------------- #
 # Index
 # --------------------------------------------------------------------------- #
@@ -207,6 +225,8 @@ async def download(
         max_cvss=version_row.max_cvss,
         has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
+        has_advisories=version_row.has_advisories,
+        malicious=version_row.is_malicious,
     )
     if verdict.blocked:
         audit.record_download(
@@ -314,6 +334,8 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
             max_cvss=version_row.max_cvss,
             has_fix=version_row.has_fix,
             scanned=bool(version_row.scanned_at),
+            has_advisories=version_row.has_advisories,
+            malicious=version_row.is_malicious,
         )
         if verdict.blocked:
             blocked.add(version_row.version)

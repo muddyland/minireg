@@ -11,6 +11,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import api from '@/api/client'
 import CodeBlock from '@/components/CodeBlock.vue'
 import { errorMessage } from '@/utils/errors'
+import { safeHttpUrl } from '@/utils/url'
 import { useAuthStore } from '@/stores/auth'
 import {
   SEVERITIES,
@@ -45,6 +46,13 @@ function defaultDigest() {
   return pick?.digest || null
 }
 const digest = ref(defaultDigest())
+// The push verdict belongs to this repository, not to the digest (the same
+// bytes pulled through an upstream are judged by the pull rules), so it comes
+// from the repository listing rather than the digest's detail.
+const blockReason = computed(() => {
+  if (!props.tag.manifest.is_index) return props.tag.manifest.policy_block_reason
+  return platforms.value.find((p) => p.digest === digest.value)?.manifest?.policy_block_reason || null
+})
 
 // -- data, per digest ---------------------------------------------------------
 const cache = reactive({}) // digest -> { detail, config, packages, findings }
@@ -273,8 +281,8 @@ watch(filters, loadFindings)
 
     <template v-else-if="detail">
       <!-- summary strip -->
-      <div v-if="detail.policy_block_reason" class="alert alert-error small">
-        Pulls of this image are refused: {{ detail.policy_block_reason }}
+      <div v-if="blockReason" class="alert alert-error small">
+        Pulls of this image are refused: {{ blockReason }}
       </div>
       <div v-if="detail.last_job?.status === 'failed'" class="alert alert-error small">
         Last scan failed after {{ detail.last_job.attempts }} attempts: {{ detail.last_job.error }}
@@ -431,7 +439,7 @@ watch(filters, loadFindings)
                           <template v-else>—</template>
                         </span>
                         <span class="dim">Advisory</span>
-                        <span><a v-if="f.url" :href="f.url" target="_blank" rel="noopener noreferrer">{{ f.url }}</a><template v-else>—</template></span>
+                        <span><a v-if="safeHttpUrl(f.url)" :href="safeHttpUrl(f.url)" target="_blank" rel="noopener noreferrer">{{ f.url }}</a><template v-else>{{ f.url || '—' }}</template></span>
                       </div>
                     </td>
                   </tr>
@@ -600,7 +608,7 @@ watch(filters, loadFindings)
             <ul class="kv-list mono small">
               <li v-for="(v, k) in config.labels" :key="k">
                 <span class="kv-k">{{ k }}</span>=<span class="kv-v">
-                  <a v-if="/^https?:\/\//.test(v || '')" :href="v" target="_blank" rel="noopener noreferrer">{{ v }}</a>
+                  <a v-if="safeHttpUrl(v)" :href="safeHttpUrl(v)" target="_blank" rel="noopener noreferrer">{{ v }}</a>
                   <template v-else>{{ v }}</template>
                 </span>
               </li>

@@ -11,8 +11,12 @@ surface for anyone who asks.
 |---|---|---|
 | Bearer token | `Authorization: Bearer mrg_…` | npm, the CLI, scripts |
 | Basic (token) | `Authorization: Basic base64("__token__:mrg_…")` | pip, twine |
-| Basic (password) | `Authorization: Basic base64("user:pass")` | Clients that cannot send Bearer |
+| Basic (password) | `Authorization: Basic base64("user:pass")` | Clients that cannot send Bearer. **Read-only** |
 | Session cookie | `minireg_session` | The web UI |
+
+An account password over Basic is **read-only**: it can fetch packages
+(when `ALLOW_ANONYMOUS_READ=false`) but not publish, administer, mint tokens or
+approve a CLI login, which all answer `403`. Use an API token for those.
 
 An `Authorization` header is **authoritative**: if one is present but does not
 authenticate, the request is anonymous. It never falls back to a session
@@ -34,15 +38,15 @@ Mounted at `/npm`. Implements the npm registry API.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/npm/{package}` | Packument. `Accept: application/vnd.npm.install-v1+json` returns the abbreviated form |
+| `GET` | `/npm/{package}` | Packument. `Accept: application/vnd.npm.install-v1+json` returns the abbreviated form. Versions blocked by policy are left out; with `?write=true` (what `npm unpublish` and `npm deprecate` fetch) the package's owner or an admin gets every version, uncached |
 | `GET` | `/npm/{package}/{version}` | Version document; a dist-tag is accepted in place of a version |
 | `GET` | `/npm/{package}/-/{filename}` | Tarball. `immutable` cache headers |
 | `PUT` | `/npm/{package}` | Publish, deprecate, undeprecate |
-| `PUT` | `/npm/{package}/-rev/{rev}` | Version unpublish, as `npm unpublish pkg@x.y.z` sends it: the edited packument. Versions missing from the body are removed; `deprecated` edits are applied |
+| `PUT` | `/npm/{package}/-rev/{rev}` | Version unpublish, as `npm unpublish pkg@x.y.z` sends it: the edited packument. Versions missing from the body are removed, except ones policy currently blocks (unpublish those by their tarball `DELETE`); `deprecated` edits are applied |
 | `DELETE` | `/npm/{package}/-rev/{rev}` | Unpublish a package |
 | `DELETE` | `/npm/{package}/-/{filename}/-rev/{rev}` | Unpublish a version, releasing every file of that version |
 | `GET` | `/npm/-/package/{package}/dist-tags` | Read dist-tags |
-| `PUT` | `/npm/-/package/{package}/dist-tags/{tag}` | Set a dist-tag (body is a bare JSON string) |
+| `PUT` | `/npm/-/package/{package}/dist-tags/{tag}` | Set a dist-tag (body is a bare JSON string). As on npm, a tag must be URL-safe and must not be a valid semver range (`v1.0.0`, `1.x`, `^2` are refused with 400) |
 | `DELETE` | `/npm/-/package/{package}/dist-tags/{tag}` | Remove a dist-tag (`latest` cannot be removed) |
 | `GET` | `/npm/-/v1/search` | Search. `text`, `size`, `from` |
 | `GET` | `/npm/-/ping` | Service check |
@@ -97,11 +101,11 @@ Mounted at `/pypi`.
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/pypi/simple/` | Project index. HTML or JSON by content negotiation |
-| `GET` | `/pypi/simple/{project}/` | Project detail. Non-normalized names 301 to the PEP 503 form |
+| `GET` | `/pypi/simple/{project}/` | Project detail. Non-normalized names 301 to the PEP 503 form, keeping the query string |
 | `GET` | `/pypi/files/{project}/{filename}` | Artifact |
 | `GET` | `/pypi/files/{project}/{filename}.metadata` | PEP 658 metadata sidecar |
 | `GET` | `/pypi/{project}/json` | Warehouse-compatible JSON (subset) |
-| `POST` | `/pypi/legacy/` | twine upload |
+| `POST` | `/pypi/legacy/` | twine upload. Wheels and `.tar.gz` sdists only; see [usage](usage.md#publishing-with-twine) for the rules |
 
 Content negotiation per PEP 691:
 
@@ -122,7 +126,11 @@ by name: an `Accept` of `text/html` or `*/*`, or no `Accept` at all, gets
 the project page advertises each with the sha256 of exactly those bytes.
 
 Advertised API version is **1.1** (PEP 700). Implements PEP 503, 592, 629, 658,
-691, 700, and 714.
+691, 700, and 714. The one exception: a JSON project page listing a file whose
+size is not known yet (not yet cached, from an upstream that only serves
+PEP 503 HTML) leaves `size` out for that file and declares `1.0`, where `size`
+is not defined, rather than send a false `0`. The page returns to `1.1` once
+the file is cached and the rendered page's cache (`META_CACHE_TTL`) expires.
 
 ---
 
@@ -216,7 +224,8 @@ See [Container images](containers.md) for naming, the mirror, and policy.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/auth/login` | Password sign-in |
-| `POST` | `/api/auth/logout` | Sign out |
+| `POST` | `/api/auth/logout` | Sign out; the session cookie is revoked server-side, so a copy of it stops working too |
+| `POST` | `/api/auth/logout-everywhere` | End every browser session of this account, this one included (API tokens are unaffected) |
 | `GET` | `/api/auth/me` | Current identity and scopes |
 | `POST` | `/api/auth/password` | Change password |
 | `GET` | `/api/auth/tokens` | List your tokens |
@@ -226,9 +235,9 @@ See [Container images](containers.md) for naming, the mirror, and policy.
 | `GET` | `/api/auth/oidc/login` | Start the SSO flow |
 | `GET` | `/api/auth/oidc/callback` | SSO callback |
 
-Changing the password and listing, creating or revoking tokens need a
-primary credential: a session or account password, or a token with the
-`admin` scope. A leaked `read` or `publish` token gets `403` there, so it can
+Changing the password, signing out everywhere and listing, creating or
+revoking tokens need a primary credential: a browser session, or a token with the `admin` scope.
+An account password over HTTP Basic is not one (it is read-only). A leaked `read` or `publish` token gets `403` there, so it can
 neither mint a wider token nor enumerate or revoke its owner's others.
 
 ### Documentation

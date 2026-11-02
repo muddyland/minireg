@@ -9,8 +9,9 @@ and that it cannot be opened without limit.
 from __future__ import annotations
 
 import asyncio
-import inspect
+import contextlib
 import json
+import os
 
 import pytest
 import pytest_asyncio
@@ -27,7 +28,17 @@ from app.services.storage import BlobStore, set_store
 async def client(tmp_path):
     from app.main import app
 
-    db_module.init_engine(f"sqlite+aiosqlite:///{tmp_path / 'stream.db'}")
+    # SQLite by default; DOCKER_TEST_DATABASE_URL runs these against
+    # PostgreSQL too, which is where a held connection actually gets killed.
+    pg_url = os.environ.get("DOCKER_TEST_DATABASE_URL")
+    if pg_url:
+        from app.models import Base
+
+        db_module.init_engine(pg_url)
+        async with db_module.get_engine().begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+    else:
+        db_module.init_engine(f"sqlite+aiosqlite:///{tmp_path / 'stream.db'}")
     await db_module.create_schema()
     store = BlobStore(str(tmp_path / "storage"))
     store.ensure_dirs()
@@ -219,12 +230,46 @@ class TestLimits:
 
 
 class TestConnectionUse:
-    def test_the_tail_does_not_hold_the_request_session(self):
+    async def test_the_tail_does_not_hold_the_request_session(self, client, monkeypatch):
         """A response that lives as long as the operator leaves the page open
-        must not be holding one of the pool's connections while it does."""
-        source = inspect.getsource(insights.stream_downloads)
-        assert "session_scope()" in source, "the tail should open its own short sessions"
-        assert "Depends(get_session)" not in source
+        must not be holding one of the pool's connections while it does.
+
+        The request's own session matters as much as the polls': the router's
+        admin check looks the token up through it, which leaves a connection
+        idle in a transaction, and Postgres kills those after a minute. So
+        count connections checked out of the pool at the start of every poll;
+        anything above zero is being held across the stream."""
+        from sqlalchemy import event
+
+        pool = db_module.get_engine().sync_engine.pool
+        out = {"n": 0}
+
+        def checkout(*_):
+            out["n"] += 1
+
+        def checkin(*_):
+            out["n"] -= 1
+
+        event.listen(pool, "checkout", checkout)
+        event.listen(pool, "checkin", checkin)
+        held_at_poll: list[int] = []
+        real_scope = insights.session_scope
+
+        @contextlib.asynccontextmanager
+        async def spying_scope():
+            held_at_poll.append(out["n"])
+            async with real_scope() as session:
+                yield session
+
+        monkeypatch.setattr(insights, "session_scope", spying_scope)
+        try:
+            await read_stream(client, "/api/admin/downloads/stream")
+        finally:
+            event.remove(pool, "checkout", checkout)
+            event.remove(pool, "checkin", checkin)
+
+        assert len(held_at_poll) >= 3
+        assert held_at_poll == [0] * len(held_at_poll)
 
 
 async def seed_version(

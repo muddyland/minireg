@@ -5,6 +5,7 @@ import { useRoute } from 'vue-router'
 import api from '@/api/client'
 import { errorMessage } from '@/utils/errors'
 import { formatBytes, formatDate, severityClass } from '@/utils/format'
+import { safeHttpUrl } from '@/utils/url'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
 const route = useRoute()
@@ -96,8 +97,8 @@ watch(() => [route.params.ecosystem, route.params.name], load)
             <div style="min-width: 0">
               <div class="row-tight">
                 <a
-                  v-if="source.web_url"
-                  :href="source.web_url"
+                  v-if="safeHttpUrl(source.web_url)"
+                  :href="safeHttpUrl(source.web_url)"
                   target="_blank"
                   rel="noopener noreferrer"
                   style="font-weight: 600"
@@ -122,8 +123,8 @@ watch(() => [route.params.ecosystem, route.params.name], load)
               <!-- The address we actually fetch from. Shown when it differs
                    from the human page, so the link is never a guess. -->
               <a
-                v-if="source.index_url"
-                :href="source.index_url"
+                v-if="safeHttpUrl(source.index_url)"
+                :href="safeHttpUrl(source.index_url)"
                 target="_blank"
                 rel="noopener noreferrer"
                 class="mono faint"
@@ -150,9 +151,17 @@ watch(() => [route.params.ecosystem, route.params.name], load)
           </div>
           <div v-if="pkg.homepage" class="row" style="justify-content: space-between">
             <span class="dim">Homepage</span>
-            <a :href="pkg.homepage" target="_blank" rel="noopener noreferrer" class="truncate">
+            <!-- Upstream-supplied: linked only when it is http(s). -->
+            <a
+              v-if="safeHttpUrl(pkg.homepage)"
+              :href="safeHttpUrl(pkg.homepage)"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="truncate"
+            >
               {{ pkg.homepage }}
             </a>
+            <span v-else class="truncate">{{ pkg.homepage }}</span>
           </div>
           <div v-if="Object.keys(pkg.dist_tags || {}).length" style="margin-top: 0.5rem">
             <span class="dim">Tags</span>

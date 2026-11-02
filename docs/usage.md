@@ -70,6 +70,12 @@ Rules that are enforced:
 
 - A version that already exists is rejected with `409 Conflict`. Registries
   never overwrite a published version.
+- A version carrying build metadata (`1.0.0+build.5`) is rejected with `400`:
+  semver ignores everything after `+`, so it would be the same version as
+  `1.0.0`. `npm publish` strips it itself; other clients must too.
+- `npm publish --provenance` works, but the sigstore bundle it attaches is not
+  stored or served: the tarball publishes, and `npm audit signatures` has no
+  attestation from this registry to check.
 - Blocked packages are refused, so a blocked name cannot be squatted locally.
 - If CVE policy is enforcing, a version whose score falls in the blocked range
   is refused at publish time.
@@ -124,6 +130,8 @@ index-url = https://__token__:<token>@registry.example.com/pypi/simple/
 
 Over plain HTTP add `trusted-host = registry.example.com` to silence pip's
 warning. Do this only on a trusted network; the token is in cleartext.
+Never add it for an https registry: for https, `trusted-host` makes pip skip
+certificate verification.
 
 ### uv
 
@@ -171,9 +179,22 @@ Then `twine upload -r minireg dist/*`.
 
 Rules that are enforced:
 
-- The filename must agree with the declared name and version.
+- The filename must agree with the declared name and version, and the version
+  must be valid PEP 440.
+- Only wheels (`.whl`) and sdists (`.tar.gz`) are accepted, as on PyPI today:
+  eggs (PEP 715), `.zip` sdists (PEP 625) and Windows installers are refused,
+  and a declared `filetype` must match the extension (`bdist_wheel` for a
+  wheel, `sdist` for a `.tar.gz`).
+- A wheel must contain exactly one `.dist-info` directory with a `METADATA`
+  whose `Name` and `Version` match the upload. That file is served as the
+  PEP 658 sidecar, and its `Requires-Python` (not the form's) becomes the
+  file's `data-requires-python`. An sdist is checked by its filename only.
 - Every digest you supply must match the bytes received.
 - Only one sdist per release.
+- Versions are compared as PEP 440 does: `2.0.0` is the same release as an
+  existing `2.0`, so its files join that release (and the one-sdist rule
+  spans both spellings). Files cannot be added to a release mirrored from an
+  upstream, under any spelling of its version.
 - Re-uploading an existing filename is rejected. PyPI never overwrites, and
   neither does this.
 
@@ -200,7 +221,10 @@ replace-with = "minireg"
 registry = "sparse+https://registry.example.com/cargo/index/"
 ```
 
-Then `cargo build` as usual. `minireg configure` writes exactly this block.
+Then `cargo build` as usual. `minireg configure` writes the equivalent with
+`[registries.minireg]` in place of `[source.minireg]`, plus your token in
+`~/.cargo/credentials.toml`, because cargo only attaches a credential to a
+registry entry (see [the CLI](cli.md#configuring-package-managers)).
 
 Two details are load-bearing:
 
@@ -209,6 +233,42 @@ Two details are load-bearing:
   like a network problem.
 - **The trailing slash** on the index URL. Without it cargo joins the shard
   paths against the parent segment and every crate 404s.
+
+### When reads need a token
+
+With `ALLOW_ANONYMOUS_READ=false`, the index's `config.json` declares
+`"auth-required": true` and answers an anonymous request with `401` and a
+`WWW-Authenticate: Cargo login_url="…/tokens"` challenge, the protocol cargo
+uses for private registries (stable since cargo 1.74). Cargo then sends its
+token on every index and download request, as the bare `Authorization` value.
+
+Cargo sends a token only to a registry defined under `[registries]` with a
+credential provider, so define the registry there and point source
+replacement at it:
+
+```toml
+# ~/.cargo/config.toml
+[registries.minireg]
+index = "sparse+https://registry.example.com/cargo/index/"
+credential-provider = "cargo:token"
+
+[source.crates-io]
+replace-with = "minireg"
+```
+
+Then store a `read` token once, pasted on stdin:
+
+```bash
+cargo login --registry minireg
+```
+
+That writes it to `~/.cargo/credentials.toml` as
+`[registries.minireg] token = "mrg_…"`. In CI, set
+`CARGO_REGISTRIES_MINIREG_TOKEN` instead. Without the `credential-provider`
+line cargo stops with "authenticated registries require a
+credential-provider to be configured"; without a token it says "no token found
+for `minireg`". The same block also works while anonymous reads are allowed:
+cargo then sends no token at all.
 
 ### Commit it to the project
 
@@ -254,9 +314,10 @@ Hosting genuinely private crates needs a *separate* registry entry
 different feature from mirroring rather than an extension of it.
 
 For the same reason, `config.json` omits the `api` key. That key is what tells
-cargo that `publish`, `yank`, `search` and `login` work against a registry;
-leaving it out gets a clear "registry does not support API commands" instead of
-a failure from somewhere deeper in the command.
+cargo that `publish`, `yank` and `search` work against a registry; leaving it
+out gets a clear "registry does not support API commands" instead of a failure
+from somewhere deeper in the command. (`cargo login` only stores a token
+locally, and works without it.)
 
 ---
 
@@ -277,15 +338,18 @@ in the audit log and can be revoked without disrupting anyone.
     pip config set global.index-url \
       "https://__token__:$MINIREG_TOKEN@registry.example.com/pypi/simple/"
     mkdir -p ~/.cargo && cat >> ~/.cargo/config.toml <<'EOF'
+    [registries.minireg]
+    index = "sparse+https://registry.example.com/cargo/index/"
+    credential-provider = "cargo:token"
     [source.crates-io]
     replace-with = "minireg"
-    [source.minireg]
-    registry = "sparse+https://registry.example.com/cargo/index/"
     EOF
 ```
 
-Cargo needs no token here: reads are anonymous, and cargo only sends
-credentials to an index that declares `auth-required`.
+Cargo sends no token while reads are anonymous: it only sends credentials to
+an index that declares `auth-required`. With `ALLOW_ANONYMOUS_READ=false`, also
+set `CARGO_REGISTRIES_MINIREG_TOKEN: ${{ secrets.MINIREG_TOKEN }}` in the
+step's `env` (see [When reads need a token](#when-reads-need-a-token)).
 
 ### GitLab CI
 

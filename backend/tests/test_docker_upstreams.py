@@ -83,6 +83,11 @@ class TestLifecycle:
         resp = await client.patch(f"/api/admin/upstreams/{uid}", json={"name": "hub"}, headers=ah)
         assert resp.status_code == 400
         assert "cannot be renamed" in resp.json()["detail"]
+        # An empty name is a change too: it used to pass the rename guard
+        # (falsy) and leave an upstream whose image path prefix was ''.
+        resp = await client.patch(f"/api/admin/upstreams/{uid}", json={"name": ""}, headers=ah)
+        assert resp.status_code in (400, 422)
+        assert await upstream_id(client, ah, "dockerhub") == uid
 
     async def test_disabled_prefix_is_refused_not_sent_to_hub(self, docker_env):
         """With `quay` switched off, `quay/x/y` must not quietly become the

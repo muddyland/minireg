@@ -75,10 +75,17 @@ const endpoints = computed(() => {
 const TOKEN_NOTES = {
   npm: 'Installing needs no token while anonymous reads are on. Publishing needs one with the publish scope.',
   pip: 'Installing needs no token while anonymous reads are on. Publishing needs one with the publish scope.',
-  cargo: 'Never needed. The mirror is read-only and cargo sends no credentials to it.',
   docker: 'Pulls need none while anonymous reads are on. Pushes need a token with the docker:push scope as the password.',
   publish: 'Every publish or push needs an API token. Account passwords are refused.',
 }
+
+/** cargo sends a token only when config.json declares auth-required, which
+ * the server does exactly when anonymous reads are off. */
+const cargoTokenNote = computed(() =>
+  config.value?.cargo?.auth_required
+    ? 'Needed: this registry requires sign-in for reads. Run cargo login --registry minireg once and paste a read token; in CI set CARGO_REGISTRIES_MINIREG_TOKEN.'
+    : 'Not needed while anonymous reads are on: cargo sends no credentials to this read-only mirror.',
+)
 
 watch(tab, (value) => router.replace({ query: { ...route.query, tab: value } }))
 
@@ -238,6 +245,13 @@ onMounted(async () => {
                 Commit it at the repository root so it applies to everyone who builds the project, or put it
                 in <code>~/.cargo/config.toml</code> for your machine. Keep these tables at the end of the file.
               </p>
+              <template v-if="config.cargo.auth_required">
+                <CodeBlock caption="shell" code="cargo login --registry minireg" />
+                <p class="field-hint">
+                  Reads need a token here. Paste a <code>read</code> token when asked; cargo keeps it in
+                  <code>~/.cargo/credentials.toml</code>. In CI set <code>CARGO_REGISTRIES_MINIREG_TOKEN</code> instead.
+                </p>
+              </template>
             </div>
           </section>
 
@@ -403,7 +417,7 @@ onMounted(async () => {
         <div class="card">
           <div class="card-head"><h3>Tokens</h3></div>
           <div class="card-body rail-body">
-            <p class="small dim" style="margin: 0 0 0.7rem">{{ TOKEN_NOTES[tab] }}</p>
+            <p class="small dim" style="margin: 0 0 0.7rem">{{ tab === 'cargo' ? cargoTokenNote : TOKEN_NOTES[tab] }}</p>
             <router-link class="btn btn-sm" :to="{ name: 'tokens' }">
               <NavIcon name="key" :size="14" /> Manage tokens
             </router-link>

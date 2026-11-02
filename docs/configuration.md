@@ -39,11 +39,13 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://…` | Must use the `asyncpg` driver. |
+| `DATABASE_URL` | `postgresql+asyncpg://…` | Must use the `asyncpg` driver. The compose file builds it from `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB`. |
+| `POSTGRES_PASSWORD` | none (compose) | **Required** by the compose file, which refuses to start without it. Goes into `DATABASE_URL` as is, so use a URL-safe value. |
+| `REDIS_PASSWORD` | none (compose) | **Required** by the compose file: Valkey is started with `--requirepass`, and `REDIS_URL` is built as `redis://:<password>@redis:6379/0`. URL-safe value. |
 | `DB_POOL_SIZE` | `20` | Per process. With N replicas, Postgres needs `N × (pool + overflow)` connections. |
 | `DB_MAX_OVERFLOW` | `20` | Burst above the pool. |
 | `DB_ECHO` | `false` | Logs every SQL statement. Debugging only. |
-| `REDIS_URL` | `redis://redis:6379/0` | Optional. Valkey or Redis, same protocol. Without it the registry still works, just slower. When it is unreachable the app stops asking it for 2 s at a time, doubling up to 30 s, instead of paying a timeout on every call, and reconnects by itself. |
+| `REDIS_URL` | `redis://redis:6379/0` | Optional. Valkey or Redis, same protocol. Put a password in it as `redis://:<password>@host:6379/0`; it is masked in the log. Without it the registry still works, just slower. When it is unreachable the app stops asking it for 2 s at a time, doubling up to 30 s, instead of paying a timeout on every call, and reconnects by itself. |
 | `META_CACHE_TTL` | `60` | Seconds a rendered packument / index page stays fresh. After that, the refresh is a conditional request (`If-None-Match` / `If-Modified-Since`) to the upstream that served the document; a `304` just extends freshness, and only versions that changed are rewritten. |
 | `META_NEGATIVE_CACHE_TTL` | `30` | How long a "not found" is remembered. |
 | `SEARCH_CACHE_TTL` | `120` | Search result caching. |
@@ -130,7 +132,11 @@ any upstream claims a pattern, matching names are only ever resolved from
 upstreams that claim it — a public registry can then never answer for an
 internal package, whatever the tier order and whatever the internal upstream
 is doing at the time. **Require digest** refuses to cache an artifact the
-upstream published no hash for.
+upstream published no hash for, or only a hash minireg cannot check. A hex
+digest (sha256, sha1, md5, blake2b) or an npm `integrity` string counts; for
+`integrity` the strongest algorithm listed is checked (sha512, sha384, sha256,
+or npm's legacy sha1), and a value that does not decode is a mismatch, not a
+pass.
 
 ### Container images
 
@@ -158,7 +164,7 @@ Full guide: [Container images](containers.md).
 | Variable | Default | Notes |
 |---|---|---|
 | `MAX_PUBLISH_BYTES` | `268435456` | Rejected on `Content-Length` before the body is read. |
-| `MAX_METADATA_BYTES` | `100663296` | Largest upstream packument or index document. |
+| `MAX_METADATA_BYTES` | `100663296` | Largest upstream packument, simple page, index file or other metadata response, counted after decompression and enforced while it downloads: a response that passes it is abandoned there and the upstream treated as failed. `0` = no limit. |
 | `MAX_ARTIFACT_BYTES` | `2147483648` | Largest artifact streamed from an upstream. |
 | `STORAGE_QUOTA_BYTES` | `0` | When a download would take the blob store over this, the least recently accessed cached upstream artifacts are evicted down to 90% of it. The same runs in the hourly housekeeping. Never evicted: files published here and anything read in the last 10 minutes. An evicted artifact is fetched again on its next request. A download fails only when nothing evictable is left. Publishes are exempt. `0` disables. |
 | `DB_POOL_TIMEOUT_SECONDS` | `10` | Wait for a pooled connection before failing. |
@@ -190,6 +196,19 @@ back `TRUSTED_PROXY_HOPS` (default 1). Anything further left was written by
 the caller. Your reverse proxy must append rather than overwrite for this to
 be correct, which is what the nginx snippet in
 [installation](installation.md) does.
+
+`RATE_LIMIT_LOGIN_PER_MINUTE` counts **failed** password attempts (the login
+form, HTTP Basic with a password, and the current-password check when
+changing it); a correct password is not counted, so a client that sends its
+password on every request never throttles itself. Failures are capped per
+client address, per account from one address, and per account from all
+addresses together at ten times the limit. Someone guessing at your username
+therefore throttles only their own address until the guessing is spread over
+many addresses, at which point the account itself is throttled for the rest
+of the minute. Failed container-registry logins (`docker login`, `/v2`) are
+counted per address against the same limit and answered `429` beyond it;
+they are audited once per address and token per minute, so a loop of bad
+logins cannot grow the audit log without bound.
 
 Login and CLI device-flow limits fall back to an in-process counter when the
 cache is unreachable, rather than failing open — a cache outage should not
@@ -337,6 +356,11 @@ manually if you want the link.
 
 An account with no password is SSO-only.
 
+Resetting someone's password here, or taking away their admin or publish
+permission or disabling them, signs that account out of every browser
+session. API tokens are separate: they keep working until revoked, except
+that a disabled account's tokens are refused for as long as it is disabled.
+
 ### OIDC
 
 Any compliant provider — tested with [Kanidm](https://kanidm.com/) and
@@ -421,10 +445,20 @@ Issuer* field.
 
 Group membership is re-applied on **every** sign-in, so removing someone from
 the admin group demotes them the next time they log in — you do not have to
-touch the local account.
+touch the local account. Admins may publish, so promotion switches publishing
+on for an account that did not have it; demotion switches it off again,
+unless an admin has since set **Can publish** on the account by hand.
+Accounts promoted by a release before this rule existed cannot be told
+apart and keep publishing after demotion; untick it under **Users** if that
+is not wanted.
 
 An OIDC login whose email matches an existing local account links to it rather
-than creating a duplicate.
+than creating a duplicate — only when the provider says the email is
+verified. From then on the account signs in through the provider only: its
+local password is removed and the sessions it had are ended, so the
+provider's group checks and disabling cannot be sidestepped with the old
+password. Its API tokens keep working. Accounts linked by an earlier release
+lose their password the same way on the first start after upgrading.
 
 When a new SSO account's `preferred_username` is already taken, it gets a
 numeric suffix (`alice-2`) rather than failing, and the existing account is

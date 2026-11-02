@@ -53,11 +53,19 @@ def render_config_json() -> dict[str, Any]:
     which keeps our download route identical to the one clients already expect.
 
     ``api`` is omitted on purpose. It is what enables ``cargo publish``,
-    ``cargo yank``, ``cargo search`` and ``cargo login`` against a registry, and
-    this mirror implements none of them. Advertising it would turn a clear
+    ``cargo yank`` and ``cargo search`` against a registry, and this mirror
+    implements none of them (``cargo login`` only stores a token locally). Advertising it would turn a clear
     "registry does not support API commands" into a 404 from somewhere deeper.
+
+    ``auth-required`` is set when anonymous reads are off. Cargo sends its
+    token on index and download requests only to a registry that declares
+    it (RFC 3139); without it every fetch after config.json went out
+    anonymous and got a 401, so such a registry could not be used at all.
     """
-    return {"dl": f"{settings.cargo_base}/api/v1/crates"}
+    config: dict[str, Any] = {"dl": f"{settings.cargo_base}/api/v1/crates"}
+    if not settings.allow_anonymous_read:
+        config["auth-required"] = True
+    return config
 
 
 # --------------------------------------------------------------------------- #

@@ -263,13 +263,18 @@ def work_one() -> bool:
         log.info("job %s: done in %.1fs", job["job_id"], duration / 1000)
     except Exception as exc:
         message = str(exc) or type(exc).__name__
-        permanent = "unsupported" in message.lower() and "os" in message.lower()
+        # Every failure is reported as retryable. Trivy has no "cannot scan
+        # this image" error to single out: an unsupported or undetected OS
+        # is not an error at all (it logs a warning and scans the language
+        # packages). The old guess -- "unsupported" and "os" anywhere in the
+        # text -- matched words like "repository" and "host" and
+        # attacker-chosen names, and marked images unscannable for good.
         log.warning("job %s failed: %s", job["job_id"], message[-400:])
         try:
             api_json(
                 "POST",
                 f"/api/docker/scanner/jobs/{job['job_id']}/fail",
-                {"worker": NAME, "error": message[-3900:], "permanent": permanent},
+                {"worker": NAME, "error": message[-3900:]},
             )
         except (ApiError, OSError) as report_exc:
             log.error("could not report failure for job %s: %s", job["job_id"], report_exc)

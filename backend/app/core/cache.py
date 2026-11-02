@@ -68,6 +68,29 @@ def _tripped() -> bool:
     return _tripped_client is _redis and time.monotonic() < _down_until
 
 
+def redact_url(url: str) -> str:
+    """``url`` with any password replaced, for logging.
+
+    The compose file now puts Valkey's password in REDIS_URL, and the
+    connect line went to the container log verbatim.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+        if parts.password is None:
+            return url
+        userinfo = f"{parts.username or ''}:***"
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        if parts.port is not None:
+            host = f"{host}:{parts.port}"
+        return urlunsplit(parts._replace(netloc=f"{userinfo}@{host}"))
+    except ValueError:
+        return "<unparseable URL>"
+
+
 async def init_redis() -> aioredis.Redis | None:
     global _redis
     try:
@@ -81,7 +104,7 @@ async def init_redis() -> aioredis.Redis | None:
         )
         await _redis.ping()
         _healthy()
-        log.info("cache connected: %s", settings.redis_url)
+        log.info("cache connected: %s", redact_url(settings.redis_url))
     except Exception as exc:
         log.warning("cache unavailable, running degraded: %s", exc)
         _redis = None
@@ -387,9 +410,11 @@ _local_counters: dict[tuple[str, int], int] = {}
 _local_counter_window: int = 0
 
 
-def _local_rate_limit(key: str, limit: int, window: int) -> tuple[bool, int]:
+def _local_rate_limit(
+    key: str, limit: int, window: int, now: float | None = None
+) -> tuple[bool, int]:
     global _local_counter_window
-    bucket = int(time.time()) // window
+    bucket = int(time.time() if now is None else now) // window
     if bucket != _local_counter_window:
         _local_counters.clear()
         _local_counter_window = bucket
@@ -401,7 +426,12 @@ def _local_rate_limit(key: str, limit: int, window: int) -> tuple[bool, int]:
 
 
 async def rate_limit(
-    key: str, limit: int, window: int = 60, *, fail_closed: bool = False
+    key: str,
+    limit: int,
+    window: int = 60,
+    *,
+    fail_closed: bool = False,
+    now: float | None = None,
 ) -> tuple[bool, int]:
     """Fixed-window counter. Returns (allowed, remaining).
 
@@ -413,14 +443,17 @@ async def rate_limit(
     refreshed the TTL per request, which made the "window" end only after 60 s
     of *silence*: a busy CI runner that tripped the limit once stayed locked
     out for as long as it kept retrying.)
+
+    ``now`` pins the window, so a later :func:`rate_limit_refund` can give
+    the hit back to the same window it was taken from.
     """
     if not settings.rate_limit_enabled or limit <= 0:
         return True, limit
     client = await ensure_redis()
     if client is None:
-        return _local_rate_limit(key, limit, window) if fail_closed else (True, limit)
+        return _local_rate_limit(key, limit, window, now) if fail_closed else (True, limit)
     try:
-        bucket = int(time.time()) // window
+        bucket = int(time.time() if now is None else now) // window
         rkey = f"rl:{key}:{window}:{bucket}"
         pipe = client.pipeline()
         pipe.incr(rkey)
@@ -428,7 +461,33 @@ async def rate_limit(
         count, _ = await pipe.execute()
         return int(count) <= limit, max(0, limit - int(count))
     except Exception:
-        return _local_rate_limit(key, limit, window) if fail_closed else (True, limit)
+        return _local_rate_limit(key, limit, window, now) if fail_closed else (True, limit)
+
+
+async def rate_limit_refund(
+    key: str, limit: int, window: int = 60, *, fail_closed: bool = False, now: float | None = None
+) -> None:
+    """Give back one hit taken by :func:`rate_limit` in the window of ``now``.
+
+    For buckets that should count only some outcomes (failed logins): take
+    the hit first, so concurrent attempts cannot all slip under the limit
+    before any of them is counted, and refund it once the attempt turns out
+    not to count.
+    """
+    if not settings.rate_limit_enabled or limit <= 0:
+        return
+    bucket = int(time.time() if now is None else now) // window
+    client = await ensure_redis()
+    if client is not None:
+        try:
+            await client.decr(f"rl:{key}:{window}:{bucket}")
+            return
+        except Exception:
+            pass
+    if fail_closed:
+        count = _local_counters.get((key, bucket))
+        if count and bucket == _local_counter_window:
+            _local_counters[(key, bucket)] = count - 1
 
 
 async def cache_get_bytes(key: str) -> bytes | None:

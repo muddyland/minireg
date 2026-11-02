@@ -13,13 +13,14 @@ spec, so `docker pull`, `docker push`, Podman and containerd work too — see
 [Container images](docs/containers.md).
 
 ```bash
-cp .env.example .env     # set SECRET_KEY and PUBLIC_URL, then chmod 600 .env
+cp .env.example .env     # set SECRET_KEY, POSTGRES_PASSWORD, REDIS_PASSWORD and PUBLIC_URL; chmod 600 .env
 docker compose up -d --build
 docker compose exec minireg python -c "print(open('/data/initial-admin-password').read())"
 ```
 
-The app will not start in production with a placeholder `SECRET_KEY`. Generate
-one with `python3 -c "import secrets; print(secrets.token_urlsafe(48))"`.
+The app will not start in production with a placeholder `SECRET_KEY`, and
+compose will not start without the two passwords. Generate each with
+`python3 -c "import secrets; print(secrets.token_urlsafe(48))"`.
 
 Then [read the setup guide](docs/installation.md).
 
@@ -124,11 +125,12 @@ pip config set global.index-url https://registry.example.com/pypi/simple/
 
 ```toml
 # cargo, by hand — ~/.cargo/config.toml
+[registries.minireg]
+index = "sparse+https://registry.example.com/cargo/index/"
+credential-provider = "cargo:token"   # used only when reads need a token
+
 [source.crates-io]
 replace-with = "minireg"
-
-[source.minireg]
-registry = "sparse+https://registry.example.com/cargo/index/"
 ```
 
 > **`PUBLIC_URL` must match the address clients actually use.** Every tarball
@@ -279,14 +281,19 @@ the ones that matter for that job.
   applies to approving a CLI login. Listing and revoking tokens needs a
   session or an admin-scoped token, so a leaked read-only token cannot
   enumerate or revoke the others.
+- An account password over HTTP Basic is read-only: it can fetch, but not
+  publish, administer or mint tokens.
 - Argon2id password hashing; API tokens stored as SHA-256 of the secret half
   and shown exactly once. Upstream credentials encrypted at rest, never
   returned by the API.
 - An `Authorization` header is authoritative — a rejected token never falls
-  back to a session cookie. Sessions carry a version that a password change
-  bumps, so changing it ejects every other session.
-- Login attempts limited per IP **and** per username, over Basic auth as well
-  as the login endpoint, and both outcomes audited. Those limits fall back to
+  back to a session cookie. Signing out revokes that session's cookie on the
+  server, not just in the browser. Sessions carry a version that a password
+  change or reset bumps, so it ejects every other session; **Account → Sign
+  out everywhere** does the same on demand.
+- Failed login attempts limited per IP, per username from that IP, and per
+  username overall (at a higher ceiling), over Basic auth as well as the
+  login endpoint, and both outcomes audited. Those limits fall back to
   an in-process counter rather than failing open if the cache is unreachable.
 - OIDC links to an existing local account only on a provider-verified email,
   and the login flow is bound to the browser that started it.

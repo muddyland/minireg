@@ -114,6 +114,24 @@ class TestJsonProjectPage:
     def test_name_is_normalized(self, doc):
         assert doc["name"] == "my-package"
 
+    def test_unknown_size_is_left_out_not_zeroed(self):
+        # An uncached file from an HTML-only upstream: nobody knows its size.
+        # PEP 700 makes size mandatory at 1.1, so 0 would be a lie and a
+        # missing key a violation; the page declares 1.0 instead.
+        package = make_pypi_package()
+        unknown = package.versions[0].files[0]
+        unknown.size = None
+        unknown.blob_sha256 = None
+        doc = render_project_json(package)
+        assert doc["meta"]["api-version"] == "1.0"
+        by_name = {entry["filename"]: entry for entry in doc["files"]}
+        assert "size" not in by_name[unknown.filename]
+        assert all(
+            entry["size"] == 1024 for name, entry in by_name.items() if name != unknown.filename
+        )
+        # HTML has no size field; PEP 700 leaves it unchanged at 1.1.
+        assert f'content="{API_VERSION}"' in render_project_html(package)
+
     def test_required_file_keys(self, doc):
         for entry in doc["files"]:
             # PEP 691: filename, url, hashes are required.
@@ -335,6 +353,43 @@ class TestUploadValidation:
             parse_upload(
                 make_form(filetype="bogus"), "my_package-1.0.0-py3-none-any.whl", b"d", "x"
             )
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "my_package-1.0.0.zip",
+            "my_package-1.0.0-py3.12.egg",
+            "my_package-1.0.0.win-amd64.exe",
+            "my_package-1.0.0.win-amd64.msi",
+            "my_package-1.0.0.tar.bz2",
+        ],
+    )
+    def test_rejects_anything_but_wheels_and_tar_gz_sdists(self, filename):
+        # PEP 715 (no eggs), PEP 625 (sdists are .tar.gz), as Warehouse does.
+        form = make_form()
+        del form["filetype"]
+        with pytest.raises(UploadError, match="only wheels"):
+            parse_upload(form, filename, b"d", "x")
+
+    @pytest.mark.parametrize(
+        ("filetype", "filename"),
+        [
+            ("bdist_wheel", "my_package-1.0.0.tar.gz"),
+            ("sdist", "my_package-1.0.0-py3-none-any.whl"),
+        ],
+    )
+    def test_rejects_a_filetype_the_extension_contradicts(self, filetype, filename):
+        with pytest.raises(UploadError, match="does not match"):
+            parse_upload(make_form(filetype=filetype), filename, b"d", "x")
+
+    @pytest.mark.parametrize("filetype", ["bdist_egg", "bdist_wininst", "bdist_dumb"])
+    def test_rejects_legacy_filetypes(self, filetype):
+        with pytest.raises(UploadError, match="invalid filetype"):
+            parse_upload(make_form(filetype=filetype), "my_package-1.0.0.tar.gz", b"d", "x")
+
+    def test_rejects_a_non_pep440_version(self):
+        with pytest.raises(UploadError, match="not a valid version"):
+            parse_upload(make_form(version="latest"), "my_package-latest.tar.gz", b"d", "x")
 
     def test_unknown_is_treated_as_absent(self):
         parsed = parse_upload(

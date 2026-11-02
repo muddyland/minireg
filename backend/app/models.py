@@ -124,12 +124,18 @@ class User(Base):
     password_hash: Mapped[str | None] = mapped_column(String(255))
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # Bumped whenever every existing session for this user must stop working:
-    # a password change, or an explicit "sign out everywhere". Sessions are
-    # stateless JWTs, so without a version to compare against, logging out or
-    # changing a password left a stolen cookie valid for its full 12 hours.
+    # a password change or reset, a withdrawn right, linking to an SSO
+    # subject, or an explicit "sign out everywhere". Sessions are stateless
+    # JWTs, so without a version to compare against, a password change left a
+    # stolen cookie valid for its full 12 hours. Signing out of one browser
+    # revokes just that session instead, through RevokedSession.
     session_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     can_publish: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # can_publish was switched on only because the identity provider put this
+    # account in the admin group. Demotion takes it away again; an explicit
+    # grant by an admin clears the flag, so that one survives.
+    publish_via_oidc_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     provider: Mapped[AuthProvider] = mapped_column(
         Enum(AuthProvider, native_enum=False, length=16), default=AuthProvider.local, nullable=False
@@ -173,6 +179,24 @@ class ApiToken(Base):
     docker_repo_prefixes: Mapped[list] = mapped_column(JSONType, default=list)
 
     user: Mapped[User] = relationship(back_populates="tokens")
+
+
+class RevokedSession(Base):
+    """A session cookie signed out before it expired.
+
+    Session cookies are stateless JWTs, so deleting one from the browser that
+    signs out does nothing to a copy of it -- that copy stayed valid for the
+    rest of its 12 hours. Each cookie carries a random ``jti``; signing out
+    records it here until the cookie would have expired anyway, and the
+    session check refuses any cookie listed. Kept in the database rather
+    than the cache so that a cache outage cannot bring a signed-out session
+    back. Expired rows are pruned on the next sign-out.
+    """
+
+    __tablename__ = "revoked_sessions"
+
+    jti: Mapped[str] = mapped_column(String(64), primary_key=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class DeviceAuthorization(Base):
@@ -412,6 +436,13 @@ class PackageVersion(Base):
     # Denormalized from package_vulnerabilities because the CVE policy consults
     # it on every download, where a second query per version is not affordable.
     has_fix: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Whether the last complete scan found any advisory at all. A clean
+    # version and one whose advisories all score 0.0 share max_cvss 0.0, and
+    # only the second may be caught by a CVE range starting at 0.
+    has_advisories: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Whether one of those advisories is an OpenSSF malicious-package (MAL-*)
+    # record. The CVE policy blocks these whatever its range or fix setting.
+    is_malicious: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     package: Mapped[Package] = relationship(back_populates="versions")
@@ -758,7 +789,11 @@ class DockerManifest(Base):
     # Stored CycloneDX SBOM (a blob in the OCI store). Rescans run against it
     # instead of pulling the image again.
     sbom_digest: Mapped[str | None] = mapped_column(String(80))
-    # Set when a pushed image fails the push policy: pulls are refused.
+    # Legacy: the push verdict used to live here, on the row every repository
+    # holding the digest shares, so it leaked into upstream pulls of the same
+    # bytes and missed upstream bytes pushed here. It now lives on
+    # DockerRepoManifest.push_block_reason; startup moves old values there
+    # and clears this column. Nothing reads or writes it any more.
     policy_block_reason: Mapped[str | None] = mapped_column(Text)
 
     created_at: Mapped[datetime] = _now_col()
@@ -801,6 +836,12 @@ class DockerRepoManifest(Base):
     created_at: Mapped[datetime] = _now_col()
     last_pulled_at: Mapped[datetime] = _now_col(index=True)
     pull_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    # Set when the image fails the push rules, in a local repository only:
+    # pulls of it from this repository are refused with this reason. Per
+    # repository because the push bar applies to what is served from
+    # local/, whatever the bytes' origin; the same digest pulled through an
+    # upstream is judged by the pull rules alone.
+    push_block_reason: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         UniqueConstraint("repository_id", "manifest_id", name="uq_docker_repo_manifest"),

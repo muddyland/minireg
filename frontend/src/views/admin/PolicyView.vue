@@ -242,7 +242,8 @@ onMounted(load)
             </div>
           </div>
           <p class="field-hint" style="margin-top: -0.5rem">
-            e.g. 7.0–10.0 blocks high and critical. 0–10 blocks anything with a CVE.
+            e.g. 7.0–10.0 blocks high and critical. 0–10 blocks anything with an advisory;
+            a version with none is never blocked.
           </p>
 
           <label class="check mt">

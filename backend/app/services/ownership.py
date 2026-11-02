@@ -30,7 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..core.naming import normalize_name_for
+from ..core.naming import normalize_name_for, pypi_versions_equal
 from ..models import Ecosystem, Package, RetiredVersion, User
 from .policy import PolicyEngine
 
@@ -80,7 +80,9 @@ async def _namespace_patterns(session: AsyncSession, ecosystem: Ecosystem) -> li
 
 
 def _matches_namespace(name: str, patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatchcase(name, p.strip().lower()) for p in patterns)
+    # Case-insensitive on both sides, like the upstream name_patterns: npm
+    # keys keep their case, a reservation is about the namespace.
+    return any(fnmatch.fnmatchcase(name.lower(), p.strip().lower()) for p in patterns)
 
 
 async def _resolves_upstream(session: AsyncSession, ecosystem: Ecosystem, name: str) -> bool:
@@ -158,8 +160,20 @@ async def authorize_publish(
             )
         return PublishGrant(package=package, owner_user_id=owner, is_new_name=False)
 
-    # Brand new name here. Make sure it is not a public package we simply have
-    # not been asked for yet.
+    # Brand new name here. npm names are case-sensitive, so `cssselect` is a
+    # different package from the public `CSSselect` -- but a name that
+    # differs from one we already hold only in case is how a lookalike gets
+    # installed by mistake, and npm itself refuses new names like that.
+    if ecosystem == Ecosystem.npm:
+        variant = await _case_variant(session, ecosystem, normalized)
+        if variant is not None:
+            raise PublishDenied(
+                f"'{display_name}' differs only in case from '{variant}', which this "
+                "registry already serves. Choose a distinct name."
+            )
+
+    # Make sure it is not a public package we simply have not been asked for
+    # yet.
     if not reserved and check_upstream:
         try:
             exists_upstream = await _resolves_upstream(session, ecosystem, display_name)
@@ -181,6 +195,29 @@ async def authorize_publish(
                 "here would shadow the upstream package for everyone using this mirror."
             )
     return PublishGrant(package=None, owner_user_id=user_id, is_new_name=True)
+
+
+async def _case_variant(
+    session: AsyncSession, ecosystem: Ecosystem, normalized: str
+) -> str | None:
+    """Another spelling of ``normalized``, differing only in case, if held.
+
+    Unindexed (``lower()`` of the key), which is acceptable on the publish
+    path: publishes are rare and rate limited.
+    """
+    from sqlalchemy import func
+
+    return (
+        await session.execute(
+            select(Package.name)
+            .where(
+                Package.ecosystem == ecosystem,
+                func.lower(Package.normalized_name) == normalized.lower(),
+                Package.normalized_name != normalized,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
 
 
 async def authorize_mutation(
@@ -214,15 +251,28 @@ async def assert_not_retired(
     normalized_name: str,
     normalized_version: str,
 ) -> None:
-    row = (
-        await session.execute(
-            select(RetiredVersion).where(
-                RetiredVersion.ecosystem == ecosystem,
-                RetiredVersion.normalized_name == normalized_name,
-                RetiredVersion.normalized_version == normalized_version,
-            )
+    stmt = select(RetiredVersion).where(
+        RetiredVersion.ecosystem == ecosystem,
+        RetiredVersion.normalized_name == normalized_name,
+    )
+    if ecosystem == Ecosystem.pypi:
+        # PEP 440 keys keep trailing zeros, so `2.0` and `2.0.0` are stored
+        # apart but pip resolves them as one version: withdrawing one has to
+        # retire both. A name's tombstones are few; compare them here.
+        row = next(
+            (
+                retired
+                for retired in (await session.execute(stmt)).scalars()
+                if pypi_versions_equal(retired.normalized_version, normalized_version)
+            ),
+            None,
         )
-    ).scalar_one_or_none()
+    else:
+        row = (
+            await session.execute(
+                stmt.where(RetiredVersion.normalized_version == normalized_version)
+            )
+        ).scalar_one_or_none()
     if row is not None:
         raise PublishDenied(
             f"version {row.version} was published here and withdrawn; that version "

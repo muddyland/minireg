@@ -24,6 +24,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import NoReturn
 
 import jwt
 from fastapi import Request
@@ -173,26 +174,7 @@ async def authenticate_basic(
         raise unauthorized(request, "unsupported authorization scheme")
     identity = await _token_identity(session, presented)
     if identity is None:
-        from ..core.deps import client_ip
-        from ..services.audit import TOKEN_AUTH_FAILED, record_audit
-
-        try:
-            await record_audit(
-                session,
-                TOKEN_AUTH_FAILED,
-                actor_type="anonymous",
-                success=False,
-                ip=client_ip(request),
-                detail={"path": "/v2", "hint": "registry login"},
-            )
-            await session.commit()
-        except Exception:  # an audit write must not turn a 401 into a 500
-            await session.rollback()
-        raise unauthorized(
-            request,
-            "invalid credentials. Log in with an API token as the password; "
-            "account passwords are not accepted by the container registry",
-        )
+        await _refuse_bad_credentials(session, request, presented)
     scopes = set(identity.token.scopes or []) if identity.token else set()
     return RegistryIdentity(
         user=identity.user,
@@ -200,6 +182,62 @@ async def authenticate_basic(
         anonymous=False,
         scanner=SCANNER_SCOPE in scopes,
         method="token",
+    )
+
+
+async def _refuse_bad_credentials(
+    session: AsyncSession, request: Request, presented: str
+) -> NoReturn:
+    """401 for a credential that did not authenticate -- throttled and logged once.
+
+    Every failure used to write and commit an audit row before any rate limit
+    applied, so an anonymous loop of bad logins grew the audit table (and
+    cost a commit) per request. Failures are now counted per address, with a
+    429 past RATE_LIMIT_LOGIN_PER_MINUTE, and audited once per address and
+    token id per minute. A good token from the same address is unaffected:
+    only failures are counted.
+    """
+    from ..core.cache import rate_limit, rate_limit_retry_after
+    from ..core.deps import client_ip
+    from ..core.security import split_token
+    from ..services.audit import TOKEN_AUTH_FAILED, record_audit
+
+    ip = client_ip(request) or "unknown"
+    allowed, _ = await rate_limit(
+        f"registry-auth-fail:{ip}", settings.rate_limit_login_per_minute, fail_closed=True
+    )
+    if not allowed:
+        raise RegistryError(
+            "TOOMANYREQUESTS",
+            "too many failed logins from this address; try again shortly",
+            headers={"Retry-After": str(rate_limit_retry_after())},
+        )
+    parts = split_token(presented)
+    # The public half of a token is not secret, and says which one is failing.
+    prefix = parts[0][:32] if parts else None
+    first, _ = await rate_limit(f"registry-auth-audit:{ip}:{prefix or '-'}", 1, fail_closed=True)
+    if first:
+        try:
+            await record_audit(
+                session,
+                TOKEN_AUTH_FAILED,
+                actor_type="anonymous",
+                success=False,
+                ip=ip,
+                detail={
+                    "path": "/v2",
+                    "hint": "registry login",
+                    "token_prefix": prefix,
+                    "note": "repeats from this address are not logged again this minute",
+                },
+            )
+            await session.commit()
+        except Exception:  # an audit write must not turn a 401 into a 500
+            await session.rollback()
+    raise unauthorized(
+        request,
+        "invalid credentials. Log in with an API token as the password; "
+        "account passwords are not accepted by the container registry",
     )
 
 

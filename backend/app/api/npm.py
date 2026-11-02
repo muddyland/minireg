@@ -188,6 +188,8 @@ async def _version_columns(session: AsyncSession, package_id: int) -> list:
                     PackageVersion.version,
                     PackageVersion.max_cvss,
                     PackageVersion.has_fix,
+                    PackageVersion.has_advisories,
+                    PackageVersion.is_malicious,
                     PackageVersion.scanned_at,
                 ).where(PackageVersion.package_id == package_id)
             )
@@ -251,18 +253,39 @@ async def npm_web_login() -> Response:
 # --------------------------------------------------------------------------- #
 # Search
 # --------------------------------------------------------------------------- #
+#: registry.npmjs.org's bounds for ``size``; it clamps rather than refusing.
+SEARCH_MAX_SIZE = 250
+SEARCH_DEFAULT_SIZE = 20
+#: Past any real result set, and inside a 32-bit OFFSET on every backend;
+#: `from=1e30` must not reach the driver as an out-of-range integer.
+SEARCH_MAX_OFFSET = 2**31 - 1
+
+
+def _query_int(raw: str | None, default: int) -> int:
+    """A query-string integer the way npmjs reads one: junk is the default.
+
+    Parsed by hand rather than declared ``int`` on the route: FastAPI would
+    answer ``from=abc`` with a 422 the npm CLI does not understand, and the
+    old ``int()`` call answered it with a 500.
+    """
+    try:
+        return int((raw or "").strip())
+    except ValueError:
+        return default
+
+
 @router.get("/-/v1/search")
 async def search(
     request: Request,
     text: str = "",
-    size: int = 20,
-    from_: int = 0,
     session: AsyncSession = Depends(get_session),
     identity: Identity = Depends(rate_limited_read),
 ) -> Response:
-    # npm sends the offset as `from`, which is a Python keyword.
-    offset = int(request.query_params.get("from", from_) or 0)
-    size = max(1, min(int(size), 250))
+    # npm sends the offset as `from`, which is a Python keyword. A negative
+    # one reached the query as a negative OFFSET, which PostgreSQL rejects.
+    offset = min(max(0, _query_int(request.query_params.get("from"), 0)), SEARCH_MAX_OFFSET)
+    size = _query_int(request.query_params.get("size"), SEARCH_DEFAULT_SIZE)
+    size = max(1, min(size, SEARCH_MAX_SIZE))
     query = (text or "").strip()
 
     cache_id = f"search:npm:{query}:{size}:{offset}"
@@ -286,7 +309,7 @@ async def search(
                 keywords=row.keywords or [],
                 author=row.author,
                 date=row.updated_at,
-                score=1.0 if row.normalized_name == query.lower() else 0.5,
+                score=1.0 if row.normalized_name.lower() == query.lower() else 0.5,
             )
         )
 
@@ -316,10 +339,21 @@ async def get_dist_tags(
     if verdict.blocked:
         return npm_error(verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
 
-    # A tag pointing at a blocked version is a download the client is about to
-    # be refused, so filter the same set the packument filters. `latest` is
-    # re-pointed at the newest version that survives rather than dropped, which
-    # is what lets `npm install pkg` degrade to an installable release.
+    return json_response(await _visible_dist_tags(session, policy, package))
+
+
+async def _visible_dist_tags(
+    session: AsyncSession, policy: PolicyEngine, package: Package
+) -> dict[str, str]:
+    """The dist-tags as the packument serves them.
+
+    A tag pointing at a blocked version is a download the client is about to
+    be refused, so filter the same set the packument filters. `latest` is
+    re-pointed at the newest version that survives rather than dropped, which
+    is what lets `npm install pkg` degrade to an installable release. The
+    dist-tags endpoint and `GET /{pkg}/{tag}` both answer from this map, so
+    neither can disagree with the packument about where a tag points.
+    """
     version_rows = await _version_columns(session, package.id)
     blocked = await _blocked_from_rows(policy, package.normalized_name, version_rows)
     tags = {t.tag: t.version for t in package.dist_tags if t.version not in blocked}
@@ -328,7 +362,7 @@ async def get_dist_tags(
         fallback = max_semver(survivors) if survivors else None
         if fallback:
             tags["latest"] = fallback
-    return json_response(tags)
+    return tags
 
 
 @router.put("/-/package/{package_name:path}/dist-tags/{tag}")
@@ -346,14 +380,13 @@ async def set_dist_tag(
     if not version:
         return npm_error("a version is required", status.HTTP_400_BAD_REQUEST)
 
-    from ..core.naming import is_valid_semver
+    from ..core.naming import npm_dist_tag_error
 
-    if is_valid_semver(tag):
-        return npm_error(
-            "dist-tag must not be a valid semver version", status.HTTP_400_BAD_REQUEST
-        )
+    tag_error = npm_dist_tag_error(tag)
+    if tag_error:
+        return npm_error(tag_error, status.HTTP_400_BAD_REQUEST)
 
-    package = await _lean_package(session, name.lower())
+    package = await _lean_package(session, packages.normalized_for(ECOSYSTEM, name))
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -413,7 +446,7 @@ async def delete_dist_tag(
         return npm_error("the 'latest' tag cannot be removed", status.HTTP_400_BAD_REQUEST)
 
     name = npm_path_to_name(package_name)
-    package = await _lean_package(session, name.lower())
+    package = await _lean_package(session, packages.normalized_for(ECOSYSTEM, name))
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -654,7 +687,7 @@ async def get_tarball(
 ) -> Response:
     started = time.perf_counter()
     name = npm_path_to_name(package_name)
-    normalized = name.lower()
+    normalized = packages.normalized_for(ECOSYSTEM, name)
 
     # A narrow join, not the whole package graph: fetch_package eager-loads
     # every version and the Package entity, which carries the entire upstream
@@ -674,6 +707,8 @@ async def get_tarball(
         max_cvss=version_row.max_cvss if version_row else None,
         has_fix=bool(version_row and version_row.has_fix),
         scanned=bool(version_row and version_row.scanned_at),
+        has_advisories=bool(version_row and version_row.has_advisories),
+        malicious=bool(version_row and version_row.is_malicious),
     )
     if verdict.blocked:
         audit.record_download(
@@ -845,13 +880,26 @@ async def update_packument(
             status.HTTP_400_BAD_REQUEST,
         )
 
-    package = await _lean_package(session, name.lower(), with_versions=True, with_files=True)
+    package = await _lean_package(
+        session, packages.normalized_for(ECOSYSTEM, name), with_versions=True, with_files=True
+    )
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
     by_version = {v.version: v for v in package.versions}
-    removed = [by_version[v] for v in sorted(by_version, key=semver_key) if v not in submitted]
-    survivors = [v for v in by_version if v in submitted]
+    # Only versions the caller could have seen are removable. The packument
+    # without ?write=true hides policy-blocked versions, so a client that
+    # edited that view would otherwise retire every hidden version along with
+    # the one it meant to. A hidden version is left alone here; unpublishing
+    # it explicitly still works, through the tarball DELETE npm sends next.
+    hidden = await _blocked_versions(PolicyEngine(session), package)
+    removed = [
+        by_version[v]
+        for v in sorted(by_version, key=semver_key)
+        if v not in submitted and v not in hidden
+    ]
+    survivors = [v for v in by_version if v in submitted or v in hidden]
+    visible_survivors = [v for v in survivors if v not in hidden]
     if removed and not survivors:
         return npm_error(
             "this update would remove every version; unpublish the package instead",
@@ -887,7 +935,7 @@ async def update_packument(
         submitted_tags = body.get("dist-tags") if isinstance(body.get("dist-tags"), dict) else {}
         wanted = submitted_tags.get("latest")
         if not (isinstance(wanted, str) and wanted in survivors):
-            wanted = max_semver(survivors) or survivors[-1]
+            wanted = max_semver(visible_survivors or survivors) or survivors[-1]
         for tag_row in list(package.dist_tags):
             if tag_row.version not in removed_versions:
                 continue
@@ -952,7 +1000,7 @@ async def publish(
     except npm_publish.PublishError as exc:
         return npm_error(exc.message, exc.status_code)
 
-    normalized = parsed.name.lower()
+    normalized = packages.normalized_for(ECOSYSTEM, parsed.name)
 
     # The block list is enforced on publish too, so a blocked name cannot be
     # squatted locally to bypass the policy.
@@ -963,6 +1011,17 @@ async def publish(
 
     if parsed.intent == "deprecate":
         return await _handle_deprecate(session, request, identity, parsed)
+    if not parsed.versions:
+        # No versions (with or without attachments) is nothing to publish.
+        # This used to reach _handle_publish, which created an empty local
+        # package owned by the caller: a name squat that answered 404 for
+        # everyone, and for a cached upstream package in a reserved namespace
+        # a flip to `is_local` that froze it. npm's own unpublish never PUTs
+        # an empty document; it DELETEs /{pkg}/-rev/{rev}.
+        return npm_error(
+            "publish document carries no versions; nothing to publish",
+            status.HTTP_400_BAD_REQUEST,
+        )
     return await _handle_publish(session, request, identity, parsed)
 
 
@@ -1004,7 +1063,7 @@ async def _record_publish_denied(
 async def _handle_publish(
     session: AsyncSession, request: Request, identity: Identity, parsed: npm_publish.PublishRequest
 ) -> Response:
-    normalized = parsed.name.lower()
+    normalized = packages.normalized_for(ECOSYSTEM, parsed.name)
 
     # Ownership first, before a single row is touched. Everything below flips
     # `is_local`, and a package with any local version is never refreshed from
@@ -1025,28 +1084,7 @@ async def _handle_publish(
         return npm_error(denied.reason, denied.status_code)
 
     package = grant.package
-    if package is None:
-        package = Package(
-            ecosystem=ECOSYSTEM,
-            name=parsed.name,
-            normalized_name=normalized,
-            is_local=True,
-            owner_user_id=grant.owner_user_id,
-        )
-        # Initialise the collections so SQLAlchemy treats them as loaded.
-        # Touching an unloaded relationship on a brand-new instance would
-        # trigger a lazy load, which is illegal on an async session.
-        package.versions = []
-        package.dist_tags = []
-        session.add(package)
-        await session.flush()
-    package.is_local = True
-    if package.owner_user_id is None:
-        package.owner_user_id = grant.owner_user_id
-    if parsed.description:
-        package.description = parsed.description
-
-    existing = {v.version for v in package.versions}
+    existing = {v.version for v in package.versions} if package is not None else set()
     store = get_store()
     published: list[str] = []
 
@@ -1086,6 +1124,8 @@ async def _handle_publish(
             max_cvss=scan.max_score,
             has_fix=scan.has_fix,
             scanned=scan.scanned,
+            has_advisories=scan.has_advisories,
+            malicious=scan.malicious,
         )
         if cve_verdict.blocked:
             # Capture the actor before the rollback expires the ORM objects
@@ -1110,6 +1150,31 @@ async def _handle_publish(
             return npm_error(cve_verdict.reason or "blocked by CVE policy", status.HTTP_403_FORBIDDEN)
         staged.append((version, meta, attachment, scan))
 
+    # Only now, with every version staged and every check passed, does the
+    # name become a local package. Creating the row (or flipping a cached
+    # upstream row to `is_local`) before this point let a document with no
+    # publishable version claim the name.
+    if package is None:
+        package = Package(
+            ecosystem=ECOSYSTEM,
+            name=parsed.name,
+            normalized_name=normalized,
+            is_local=True,
+            owner_user_id=grant.owner_user_id,
+        )
+        # Initialise the collections so SQLAlchemy treats them as loaded.
+        # Touching an unloaded relationship on a brand-new instance would
+        # trigger a lazy load, which is illegal on an async session.
+        package.versions = []
+        package.dist_tags = []
+        session.add(package)
+        await session.flush()
+    package.is_local = True
+    if package.owner_user_id is None:
+        package.owner_user_id = grant.owner_user_id
+    if parsed.description:
+        package.description = parsed.description
+
     for version, meta, attachment, scan in staged:
         stored = await store.put_bytes(attachment.data)
 
@@ -1121,6 +1186,9 @@ async def _handle_publish(
             is_local=True,
             published_at=datetime.now(UTC),
             max_cvss=scan.max_score,
+            has_fix=scan.has_fix,
+            has_advisories=scan.has_advisories,
+            is_malicious=scan.malicious,
             scanned_at=datetime.now(UTC) if scan.scanned else None,
         )
         session.add(version_row)
@@ -1137,7 +1205,11 @@ async def _handle_publish(
         session.add(
             PackageFile(
                 version_id=version_row.id,
-                filename=attachment.filename,
+                # The canonical name, never the attachment key: libnpmpublish
+                # keys a scoped tarball `@scope/pkg-1.0.0.tgz`, and storing
+                # that rendered a dist.tarball (`.../-/%40scope%2Fpkg-...`)
+                # the tarball route could never match.
+                filename=npm_tarball_filename(parsed.name, version),
                 blob_sha256=stored.sha256,
                 size=stored.size,
                 content_type=attachment.content_type,
@@ -1210,7 +1282,9 @@ async def _handle_publish(
 async def _handle_deprecate(
     session: AsyncSession, request: Request, identity: Identity, parsed: npm_publish.PublishRequest
 ) -> Response:
-    package = await _lean_package(session, parsed.name.lower(), with_versions=True)
+    package = await _lean_package(
+        session, packages.normalized_for(ECOSYSTEM, parsed.name), with_versions=True
+    )
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -1287,7 +1361,9 @@ async def unpublish_version(
     identity: Identity = Depends(rate_limited_publish),
 ) -> Response:
     name = npm_path_to_name(package_name)
-    package = await _lean_package(session, name.lower(), with_versions=True, with_files=True)
+    package = await _lean_package(
+        session, packages.normalized_for(ECOSYSTEM, name), with_versions=True, with_files=True
+    )
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -1381,7 +1457,9 @@ async def unpublish_package(
     identity: Identity = Depends(rate_limited_publish),
 ) -> Response:
     name = npm_path_to_name(package_name)
-    package = await _lean_package(session, name.lower(), with_versions=True, with_files=True)
+    package = await _lean_package(
+        session, packages.normalized_for(ECOSYSTEM, name), with_versions=True, with_files=True
+    )
     if package is None:
         return npm_error("package not found", status.HTTP_404_NOT_FOUND)
 
@@ -1427,7 +1505,7 @@ async def unpublish_package(
         detail={"scope": "package"},
     )
     await session.commit()
-    await packages.invalidate_package_cache("npm", name.lower())
+    await packages.invalidate_package_cache("npm", packages.normalized_for(ECOSYSTEM, name))
     return json_response({"ok": True})
 
 
@@ -1508,25 +1586,35 @@ async def _version_response(
             )
         ).scalar_one_or_none()
 
+    policy = PolicyEngine(session)
     resolved = version
     version_row = await load_version(version)
     if version_row is None:
-        # A dist-tag is also accepted here, e.g. GET /lodash/latest.
-        tag = next((t for t in package.dist_tags if t.tag == version), None)
-        resolved = tag.version if tag else (package.latest_version if version == "latest" else None)
+        # A dist-tag is also accepted here, e.g. GET /lodash/latest. It
+        # resolves through the same policy-filtered map the packument and
+        # the dist-tags endpoint serve: resolving the raw tag answered 403
+        # for `latest` while both of those pointed it at a surviving release.
+        tags = await _visible_dist_tags(session, policy, package)
+        resolved = tags.get(version)
+        if resolved is None:
+            # A tag whose target is blocked is gone from that map; resolve it
+            # raw so the policy check below explains the refusal.
+            resolved = next((t.version for t in package.dist_tags if t.tag == version), None)
         if resolved is None:
             return npm_error("version not found", status.HTTP_404_NOT_FOUND)
         version_row = await load_version(resolved)
     if version_row is None:
         return npm_error("version not found", status.HTTP_404_NOT_FOUND)
 
-    verdict = await PolicyEngine(session).evaluate(
+    verdict = await policy.evaluate(
         ECOSYSTEM,
         package.normalized_name,
         resolved,
         max_cvss=version_row.max_cvss,
         has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
+        has_advisories=version_row.has_advisories,
+        malicious=version_row.is_malicious,
     )
     if verdict.blocked:
         return npm_error(verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
@@ -1560,7 +1648,7 @@ async def _packument_response(
     accept: str | None,
 ) -> Response:
     abbreviated = npm_render.wants_abbreviated(accept)
-    normalized = name.lower()
+    normalized = packages.normalized_for(ECOSYSTEM, name)
 
     # Cheap check before touching upstreams: never fetch a blocked package.
     policy = PolicyEngine(session)
@@ -1572,9 +1660,17 @@ async def _packument_response(
         npm_render.ABBREVIATED_CONTENT_TYPE if abbreviated else npm_render.FULL_CONTENT_TYPE
     )
     cache_id = packages.cache_key("npm", normalized, "abbrev" if abbreviated else "full")
+    # `?write=true` is what libnpmpublish sends before it edits the document
+    # (`npm unpublish pkg@x`, `npm deprecate`). Whether it gets the editable
+    # view depends on who is asking, so it never reads or fills the cache.
+    write_view = (
+        request.query_params.get("write") == "true"
+        and identity.is_authenticated
+        and identity.has_scope("publish")
+    )
     # Stored serialised and served as stored: a hit costs a hash for the ETag,
     # not a parse and a re-encode of the whole document.
-    cached = await cache_get_bytes(cache_id)
+    cached = None if write_view else await cache_get_bytes(cache_id)
     if cached is not None:
         audit.record_download(
             audit.DownloadEvent(
@@ -1594,6 +1690,8 @@ async def _packument_response(
     if lookup.package is None or not lookup.package.versions:
         return npm_error("Not found", status.HTTP_404_NOT_FOUND)
     package = lookup.package
+    if write_view:
+        write_view = await _may_unpublish(package, identity)
 
     # Inline CVE scan for versions we have never scanned.
     await _scan_new_versions(session, package)
@@ -1601,7 +1699,12 @@ async def _packument_response(
     document = npm_render.render_packument(package, abbreviated=abbreviated)
 
     # Drop versions blocked by CVE policy so a client cannot resolve to them.
-    blocked = await _blocked_versions(policy, package)
+    # Not from the editable view a package's owner (or an admin) asks for
+    # with ?write=true: libnpmpublish PUTs that document back, and every
+    # version missing from it is unpublished. Filtered, it made `npm
+    # unpublish pkg@x` retire every policy-hidden version too -- and with a
+    # single visible version, DELETE the whole package.
+    blocked = set() if write_view else await _blocked_versions(policy, package)
     if blocked:
         document["versions"] = {
             v: meta for v, meta in document["versions"].items() if v not in blocked
@@ -1625,7 +1728,7 @@ async def _packument_response(
     # Size-capped: the cache shares a fixed memory budget (allkeys-lru) with
     # herd-guard locks and rate-limit counters, which a few large documents
     # would evict. Large packuments are rendered per request instead.
-    if len(body) <= PACKUMENT_CACHE_MAX_BYTES:
+    if not write_view and len(body) <= PACKUMENT_CACHE_MAX_BYTES:
         await cache_set_bytes(cache_id, body, settings.meta_cache_ttl)
 
     audit.record_download(
@@ -1642,7 +1745,24 @@ async def _packument_response(
             upstream_id=lookup.upstream.id if lookup.upstream else None,
         )
     )
-    return document_response(request, body, content_type=content_type, vary_accept=True)
+    response = document_response(request, body, content_type=content_type, vary_accept=True)
+    if write_view:
+        response.headers["cache-control"] = "private, no-store"
+    return response
+
+
+async def _may_unpublish(package: Package, identity: Identity) -> bool:
+    """Whether ``identity`` may edit this package's version list."""
+    try:
+        await ownership.authorize_mutation(
+            package,
+            user_id=identity.user_id,
+            is_admin=identity.is_admin and identity.has_scope("admin"),
+            action="unpublish",
+        )
+    except ownership.PublishDenied:
+        return False
+    return True
 
 
 async def _scan_new_versions(session: AsyncSession, package: Package) -> None:
@@ -1700,7 +1820,8 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
 
 async def _blocked_from_rows(policy: PolicyEngine, normalized: str, rows) -> set[str]:
     """``rows`` are PackageVersion entities or column rows with ``version``,
-    ``max_cvss``, ``has_fix`` and ``scanned_at``."""
+    ``max_cvss``, ``has_fix``, ``has_advisories``, ``is_malicious`` and
+    ``scanned_at``."""
     blocked: set[str] = set()
     for version_row in rows:
         verdict = await policy.evaluate(
@@ -1710,6 +1831,8 @@ async def _blocked_from_rows(policy: PolicyEngine, normalized: str, rows) -> set
             max_cvss=version_row.max_cvss,
             has_fix=version_row.has_fix,
             scanned=bool(version_row.scanned_at),
+            has_advisories=version_row.has_advisories,
+            malicious=version_row.is_malicious,
         )
         if verdict.blocked:
             blocked.add(version_row.version)

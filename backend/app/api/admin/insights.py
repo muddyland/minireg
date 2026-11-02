@@ -636,6 +636,7 @@ async def stream_downloads(
             "id it saw, or it loses everything recorded during the gap."
         ),
     ),
+    session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
     """Server-sent events: package requests as they are recorded.
 
@@ -648,7 +649,16 @@ async def stream_downloads(
     life of the response, and this response lives for as long as the operator
     leaves the page open -- one pooled connection each would be a slow way to
     exhaust the pool. Each poll opens and closes its own instead.
+
+    Not using it is not enough, though: the router's ``require_admin`` has
+    already looked the caller up through it, so it holds a connection in an
+    open transaction. FastAPI only closes it after the response finishes, and
+    Postgres kills a connection idle in a transaction after
+    ``db_idle_transaction_timeout_seconds``. ``session`` here is that same
+    (cached) dependency; it is closed before streaming starts, which hands
+    the connection back. Authorisation has already happened by then.
     """
+    await session.close()
     global _active_streams
     if _active_streams >= MAX_DOWNLOAD_STREAMS:
         raise HTTPException(
@@ -947,7 +957,9 @@ async def trigger_scan(
     if ecosystem is not None:
         conditions.append(Package.ecosystem == ecosystem)
     if package_name:
-        conditions.append(Package.normalized_name == package_name.lower())
+        # Case-insensitive: npm keys keep their case (JSONStream), and
+        # scanning both spellings of a name is harmless.
+        conditions.append(func.lower(Package.normalized_name) == package_name.lower())
     if not rescan_all:
         conditions.append(PackageVersion.scanned_at.is_(None))
 

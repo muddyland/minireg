@@ -72,6 +72,21 @@ def parse_pypi_version(version: str) -> Version | None:
         return None
 
 
+def pypi_versions_equal(a: str, b: str) -> bool:
+    """PEP 440 equality: ``2.0``, ``2.0.0`` and ``v2.0`` are one version.
+
+    :func:`normalize_pypi_version` keeps trailing zeros, so its output is a
+    storage key, not an identity. pip treats ``2.0`` and ``2.0.0`` as the same
+    release, so anything deciding whether a release already exists has to
+    compare with this. Non-conforming versions fall back to their normalized
+    spelling.
+    """
+    parsed_a, parsed_b = parse_pypi_version(a), parse_pypi_version(b)
+    if parsed_a is not None and parsed_b is not None:
+        return parsed_a == parsed_b
+    return normalize_pypi_version(a) == normalize_pypi_version(b)
+
+
 def sort_pypi_versions(versions: list[str]) -> list[str]:
     """Ascending PEP 440 order; unparseable versions sort first, lexically."""
 
@@ -123,6 +138,12 @@ def parse_dist_filename(filename: str) -> tuple[str, str, str] | None:
         stem = filename[: -len(".egg")]
         parts = stem.split("-")
         if len(parts) >= 2:
+            # Same rule as the sdist branch above: `foo-latest.egg` is not a
+            # release, and would otherwise sort ahead of every real one.
+            try:
+                Version(parts[1])
+            except InvalidVersion:
+                return None
             return parts[0], parts[1], "bdist_egg"
     return None
 
@@ -142,12 +163,24 @@ _NPM_BLACKLIST = {"node_modules", "favicon.ico"}
 
 
 def normalize_npm_name(name: str) -> str:
-    """npm names are case-insensitive for lookup but preserved for display.
+    """npm names are case-*sensitive*: the key is the name as spelled.
 
-    New names may not contain uppercase at all; legacy ones may, so lookup is
-    lowercased while the published spelling is kept on the package row.
+    registry.npmjs.org treats ``JSONStream`` and ``jsonstream``, ``Q`` and
+    ``q``, ``CSSselect`` and ``cssselect`` as different packages, and so
+    must a mirror of it. Folding case here made the pairs share one row:
+    whichever was fetched first answered for both, a refresh of one merged
+    its versions into the other, and a *local* publish of the lowercase
+    spelling of an uppercase-only public name passed the shadow check (the
+    lowercase name does not exist upstream) and then answered every request
+    for the public one, tarballs included.
+
+    New names may not contain capitals at all (:func:`is_valid_npm_name`),
+    and the publish path separately refuses a new name that differs only in
+    case from one this registry already holds. Policy rules and namespace
+    patterns still match case-insensitively; that only ever blocks or
+    reserves more.
     """
-    return name.strip().lower()
+    return name.strip()
 
 
 def is_valid_npm_name(name: str) -> tuple[bool, str | None]:
@@ -207,6 +240,30 @@ def npm_tarball_filename(name: str, version: str) -> str:
     """npm's own convention: the scope is stripped from the tarball name."""
     base = name.split("/")[-1] if name.startswith("@") else name
     return f"{base}-{version}.tgz"
+
+
+def npm_dist_tag_error(tag: object) -> str | None:
+    """Why ``tag`` cannot be a dist-tag, or None when it can.
+
+    The rules ``npm dist-tag add`` and the public registry enforce:
+
+    * not empty or blank;
+    * not a valid semver *range* (``v1.0.0``, ``1``, ``1.x``, ``^2``): ``npm
+      install pkg@<spec>`` reads the spec as a range before it tries a tag,
+      so such a tag can never be installed by name, and a tag that looks like
+      a version invites confusing one for the other;
+    * URL-safe as one path segment, because the tag travels in
+      ``/-/package/{pkg}/dist-tags/{tag}``.
+    """
+    from .semver import is_valid_range
+
+    if not isinstance(tag, str) or not tag.strip():
+        return "dist-tag name must not be empty"
+    if is_valid_range(tag):
+        return f"dist-tag '{tag}' must not be a valid semver range"
+    if quote(tag, safe="") != tag:
+        return f"dist-tag '{tag}' can only contain URL-safe characters"
+    return None
 
 
 # Strict semver 2.0.0, anchored and with no tolerance for a leading `v` or `=`.

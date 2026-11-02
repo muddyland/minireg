@@ -26,8 +26,10 @@ have already explained themselves in one of those two places.
    unhealthy; it is retried every 2 minutes. The **Health** column shows the
    last error. Hit *Test*.
 3. **Is the name right?** PyPI normalizes names (PEP 503): `Foo.Bar`,
-   `foo-bar`, and `foo_bar` are one project. npm is case-sensitive for display
-   but lowercase for lookup.
+   `foo-bar`, and `foo_bar` are one project. npm names are case-sensitive, as
+   on registry.npmjs.org: `JSONStream` and `jsonstream` are two different
+   packages, and asking for the wrong spelling is a `404` (or the other
+   package).
 
 ### `403` with a message
 
@@ -160,9 +162,18 @@ be resolved through a replaced source at all — see
 
 ### `registry does not support API commands`
 
-Expected. This is a read-only mirror: `cargo publish`, `cargo yank`,
-`cargo search` and `cargo login` are not implemented, and `config.json` omits
-the `api` key so cargo says so up front rather than failing deeper in.
+Expected. This is a read-only mirror: `cargo publish`, `cargo yank` and
+`cargo search` are not implemented, and `config.json` omits the `api` key so
+cargo says so up front rather than failing deeper in. (`cargo login --registry
+minireg` does work: it only stores the token for a registry that needs one.)
+
+### cargo: `no token found` or `require a credential-provider`
+
+The registry has `ALLOW_ANONYMOUS_READ=false`. Define it under
+`[registries.minireg]` with `credential-provider = "cargo:token"` and store a
+token with `cargo login --registry minireg` (or set
+`CARGO_REGISTRIES_MINIREG_TOKEN`); see
+[When reads need a token](usage.md#when-reads-need-a-token).
 
 ### `ECONNREFUSED` / `ETIMEDOUT` behind a proxy
 

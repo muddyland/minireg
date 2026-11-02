@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from ..core.cache import cache_get_json, cache_set_json
 from ..core.deps import Identity, client_ip, rate_limited_publish, rate_limited_read
-from ..core.naming import normalize_pypi_name
+from ..core.naming import normalize_pypi_name, pypi_versions_equal
 from ..db import get_session
 from ..models import Blob, Ecosystem, Package, PackageFile, PackageVersion
 from ..services import artifacts, audit, ownership, packages, pypi_publish, pypi_render
@@ -148,10 +148,15 @@ async def simple_project(
     normalized = normalize_pypi_name(project)
 
     # PEP 503 requires the normalized URL; redirect so caches stay coherent.
+    # The query string goes along: `?format=` is PEP 691 negotiation, and
+    # dropping it turned a JSON request into an HTML answer.
     if project != normalized:
+        location = pypi_render.project_url(normalized)
+        if request.url.query:
+            location += f"?{request.url.query}"
         return Response(
             status_code=status.HTTP_301_MOVED_PERMANENTLY,
-            headers={"location": f"{settings.pypi_base}/simple/{normalized}/"},
+            headers={"location": location},
         )
 
     policy = PolicyEngine(session)
@@ -258,6 +263,8 @@ async def get_file(
         max_cvss=version_row.max_cvss,
         has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
+        has_advisories=version_row.has_advisories,
+        malicious=version_row.is_malicious,
     )
     if verdict.blocked:
         audit.record_download(
@@ -338,6 +345,8 @@ async def _get_core_metadata(session: AsyncSession, project: str, filename: str)
         max_cvss=version_row.max_cvss,
         has_fix=version_row.has_fix,
         scanned=bool(version_row.scanned_at),
+        has_advisories=version_row.has_advisories,
+        malicious=version_row.is_malicious,
     )
     if verdict.blocked:
         return PlainTextResponse(
@@ -494,6 +503,16 @@ async def upload(
     except pypi_publish.UploadError as exc:
         return upload_error(exc.message, exc.status_code)
 
+    wheel_metadata = None
+    if parsed.filetype == "bdist_wheel":
+        try:
+            wheel_metadata = await asyncio.to_thread(pypi_publish.check_wheel_metadata, parsed)
+        except pypi_publish.UploadError as exc:
+            return upload_error(exc.message, exc.status_code)
+        # pip filters on data-requires-python before it ever opens the wheel,
+        # so it has to say what the wheel says, not what the form claimed.
+        parsed.requires_python = wheel_metadata.requires_python
+
     normalized = parsed.normalized_name
 
     verdict = await PolicyEngine(session).is_name_blocked(ECOSYSTEM, normalized)
@@ -539,25 +558,41 @@ async def upload(
         package.owner_user_id = grant.owner_user_id
 
     normalized_version = parsed.normalized_version
+    # The release is found by PEP 440 equality, not by the stored key: that
+    # key keeps trailing zeros, so `2.0.0` missed a mirrored `2.0` and became
+    # a second release that pip treats as the same one. Warehouse matches the
+    # same way and files the upload under the existing release, keeping its
+    # spelling; an exact match wins where legacy data holds several.
+    equal_rows = [
+        v for v in package.versions if pypi_versions_equal(v.normalized_version, parsed.version)
+    ]
+    mirrored = next((v for v in equal_rows if not v.is_local), None)
     version_row = next(
-        (v for v in package.versions if v.normalized_version == normalized_version), None
+        (v for v in equal_rows if v.normalized_version == normalized_version),
+        equal_rows[0] if equal_rows else None,
     )
+
+    # An existing release that came from upstream is not somewhere to add
+    # files. Only the filename was checked before, so a wheel with a
+    # different platform tag attached itself to the genuine release -- and
+    # pip prefers the more specific tag, so an exact pin installed it.
+    if mirrored is not None:
+        spelled = (
+            parsed.version
+            if mirrored.version == parsed.version
+            else f"{parsed.version} (the same version as {mirrored.version})"
+        )
+        reason = (
+            f"{parsed.name} {spelled} is mirrored from an upstream "
+            "registry; files cannot be added to it here."
+        )
+        await _record_publish_denied(
+            session, request, identity, f"{parsed.name}=={parsed.version}", reason
+        )
+        return upload_error(reason, status.HTTP_403_FORBIDDEN)
 
     # PyPI never overwrites: a duplicate filename is an error.
     if version_row is not None:
-        # An existing release that came from upstream is not somewhere to add
-        # files. Only the filename was checked before, so a wheel with a
-        # different platform tag attached itself to the genuine release -- and
-        # pip prefers the more specific tag, so an exact pin installed it.
-        if not version_row.is_local:
-            reason = (
-                f"{parsed.name} {parsed.version} is mirrored from an upstream "
-                "registry; files cannot be added to it here."
-            )
-            await _record_publish_denied(
-                session, request, identity, f"{parsed.name}=={parsed.version}", reason
-            )
-            return upload_error(reason, status.HTTP_403_FORBIDDEN)
         for existing in version_row.files:
             if existing.filename == parsed.filename:
                 return upload_error(
@@ -588,6 +623,8 @@ async def upload(
         max_cvss=scan.max_score,
         has_fix=scan.has_fix,
         scanned=scan.scanned,
+        has_advisories=scan.has_advisories,
+        malicious=scan.malicious,
     )
     if cve_verdict.blocked:
         # Capture the actor before the rollback expires the ORM objects the
@@ -620,6 +657,9 @@ async def upload(
             is_local=True,
             published_at=datetime.now(UTC),
             max_cvss=scan.max_score,
+            has_fix=scan.has_fix,
+            has_advisories=scan.has_advisories,
+            is_malicious=scan.malicious,
             scanned_at=datetime.now(UTC) if scan.scanned else None,
         )
         session.add(version_row)
@@ -639,8 +679,6 @@ async def upload(
     else:
         blob.refcount += 1
 
-    core_metadata = pypi_publish.extract_wheel_metadata(parsed.content, parsed.filename)
-
     session.add(
         PackageFile(
             version_id=version_row.id,
@@ -656,8 +694,8 @@ async def upload(
             python_version=parsed.pyversion,
             requires_python=parsed.requires_python,
             core_metadata=(
-                pypi_publish.core_metadata_record(core_metadata["_raw_bytes"])
-                if core_metadata
+                pypi_publish.core_metadata_record(wheel_metadata.raw)
+                if wheel_metadata
                 else None
             ),
             upload_time=datetime.now(UTC),
@@ -809,6 +847,8 @@ async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
             max_cvss=version_row.max_cvss,
             has_fix=version_row.has_fix,
             scanned=bool(version_row.scanned_at),
+            has_advisories=version_row.has_advisories,
+            malicious=version_row.is_malicious,
         )
         if verdict.blocked:
             blocked.add(version_row.version)
