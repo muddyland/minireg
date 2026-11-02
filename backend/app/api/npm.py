@@ -367,12 +367,11 @@ async def set_dist_tag(
     if not version:
         return npm_error("a version is required", status.HTTP_400_BAD_REQUEST)
 
-    from ..core.naming import is_valid_semver
+    from ..core.naming import npm_dist_tag_error
 
-    if is_valid_semver(tag):
-        return npm_error(
-            "dist-tag must not be a valid semver version", status.HTTP_400_BAD_REQUEST
-        )
+    tag_error = npm_dist_tag_error(tag)
+    if tag_error:
+        return npm_error(tag_error, status.HTTP_400_BAD_REQUEST)
 
     package = await _lean_package(session, name.lower())
     if package is None:

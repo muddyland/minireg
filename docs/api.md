@@ -42,7 +42,7 @@ Mounted at `/npm`. Implements the npm registry API.
 | `DELETE` | `/npm/{package}/-rev/{rev}` | Unpublish a package |
 | `DELETE` | `/npm/{package}/-/{filename}/-rev/{rev}` | Unpublish a version, releasing every file of that version |
 | `GET` | `/npm/-/package/{package}/dist-tags` | Read dist-tags |
-| `PUT` | `/npm/-/package/{package}/dist-tags/{tag}` | Set a dist-tag (body is a bare JSON string) |
+| `PUT` | `/npm/-/package/{package}/dist-tags/{tag}` | Set a dist-tag (body is a bare JSON string). As on npm, a tag must be URL-safe and must not be a valid semver range (`v1.0.0`, `1.x`, `^2` are refused with 400) |
 | `DELETE` | `/npm/-/package/{package}/dist-tags/{tag}` | Remove a dist-tag (`latest` cannot be removed) |
 | `GET` | `/npm/-/v1/search` | Search. `text`, `size`, `from` |
 | `GET` | `/npm/-/ping` | Service check |

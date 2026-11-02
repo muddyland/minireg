@@ -209,6 +209,30 @@ def npm_tarball_filename(name: str, version: str) -> str:
     return f"{base}-{version}.tgz"
 
 
+def npm_dist_tag_error(tag: object) -> str | None:
+    """Why ``tag`` cannot be a dist-tag, or None when it can.
+
+    The rules ``npm dist-tag add`` and the public registry enforce:
+
+    * not empty or blank;
+    * not a valid semver *range* (``v1.0.0``, ``1``, ``1.x``, ``^2``): ``npm
+      install pkg@<spec>`` reads the spec as a range before it tries a tag,
+      so such a tag can never be installed by name, and a tag that looks like
+      a version invites confusing one for the other;
+    * URL-safe as one path segment, because the tag travels in
+      ``/-/package/{pkg}/dist-tags/{tag}``.
+    """
+    from .semver import is_valid_range
+
+    if not isinstance(tag, str) or not tag.strip():
+        return "dist-tag name must not be empty"
+    if is_valid_range(tag):
+        return f"dist-tag '{tag}' must not be a valid semver range"
+    if quote(tag, safe="") != tag:
+        return f"dist-tag '{tag}' can only contain URL-safe characters"
+    return None
+
+
 # Strict semver 2.0.0, anchored and with no tolerance for a leading `v` or `=`.
 _STRICT_SEMVER_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"

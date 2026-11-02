@@ -72,3 +72,39 @@ async def test_search_tolerates_junk_and_negative_paging(env):
     first = (await client.get("/npm/-/v1/search?text=findme&from=-5")).json()
     assert [o["package"]["name"] for o in first["objects"]] == ["findme"]
     assert (await client.get("/npm/-/v1/search?text=findme&from=1")).json()["objects"] == []
+
+
+# --------------------------------------------------------------------------- #
+# dist-tag names
+# --------------------------------------------------------------------------- #
+BAD_TAGS = ("v1.0.0", "1", "1.x", "^2", "x", "%20", "a%20b", "a%2Bb", "caf%C3%A9")
+
+
+async def test_dist_tag_names_npm_cannot_install_are_refused(env):
+    """``v1.0.0`` was accepted (only strict semver was refused), as were
+    ``' '`` and ``'a b'``; npm reads a range before a tag, so none of these
+    could ever be installed by name, and the blank ones break the URL."""
+    client, tokens = env
+    as_user(client, tokens["alice"])
+    assert (await client.put("/npm/tagpkg", json=publish_body("tagpkg", "1.0.0"))).status_code == 201
+
+    for tag in BAD_TAGS:
+        response = await client.put(f"/npm/-/package/tagpkg/dist-tags/{tag}", content='"1.0.0"')
+        assert response.status_code == 400, (tag, response.text)
+    good = await client.put("/npm/-/package/tagpkg/dist-tags/next-1_rc.2", content='"1.0.0"')
+    assert good.status_code == 200, good.text
+
+    tags = (await client.get("/npm/-/package/tagpkg/dist-tags")).json()
+    assert tags == {"latest": "1.0.0", "next-1_rc.2": "1.0.0"}
+
+
+async def test_publish_document_dist_tags_follow_the_same_rules(env):
+    client, tokens = env
+    as_user(client, tokens["alice"])
+    for tag in ("v1.0.0", " ", "", "a b", "~1"):
+        body = publish_body("doctags", "1.0.0")
+        body["dist-tags"] = {tag: "1.0.0"}
+        response = await client.put("/npm/doctags", json=body)
+        assert response.status_code == 400, (tag, response.text)
+    # Nothing was created by the refused publishes.
+    assert (await client.get("/npm/doctags")).status_code == 404

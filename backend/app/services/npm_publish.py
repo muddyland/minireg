@@ -20,7 +20,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..config import settings
-from ..core.naming import is_valid_npm_name, is_valid_semver, npm_tarball_filename
+from ..core.naming import (
+    is_valid_npm_name,
+    is_valid_semver,
+    npm_dist_tag_error,
+    npm_tarball_filename,
+)
 from .storage import Digests
 
 log = logging.getLogger(__name__)
@@ -135,10 +140,11 @@ def parse_publish_document(doc: Any, path_name: str) -> PublishRequest:
     for tag, version in dist_tags.items():
         if not isinstance(version, str):
             raise PublishError(f"dist-tag '{tag}' must map to a version string")
-        if is_valid_semver(tag):
-            # npm forbids this: a tag that parses as a version makes
-            # `npm install pkg@1.0.0` ambiguous.
-            raise PublishError(f"dist-tag '{tag}' must not be a valid semver version")
+        # npm forbids a tag that parses as a version or range: it makes
+        # `npm install pkg@1.0.0` ambiguous and can never be installed by name.
+        tag_error = npm_dist_tag_error(tag)
+        if tag_error:
+            raise PublishError(tag_error)
 
     raw_attachments = doc.get("_attachments") or {}
     if not isinstance(raw_attachments, dict):
