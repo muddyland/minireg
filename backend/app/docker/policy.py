@@ -34,6 +34,7 @@ from ..models import (
     DockerManifestRef,
     DockerRepoManifest,
     DockerRepository,
+    DockerScanJob,
     Setting,
 )
 
@@ -441,8 +442,12 @@ async def evaluate_pull(
         return await evaluate_rules(session, manifest, policy, policy.pull, label="pull")
     if not policy.scanning_enabled:
         return ALLOW
-    pending = manifest.scan_status in ("unscanned", "queued", "scanning")
-    if pending and (policy.strict_mode or (local and policy.push_require_scan)):
+    gated = policy.strict_mode or (local and policy.push_require_scan)
+    if not gated:
+        return ALLOW
+    # A failed scan counts as not scanned yet: the next manifest pull queues
+    # it again.
+    if manifest.scan_status in ("unscanned", "queued", "scanning", "failed"):
         return ImageVerdict(
             False,
             "image has not been scanned yet; a scan is queued, retry shortly",
@@ -450,4 +455,29 @@ async def evaluate_pull(
             retry_after=15,
             source="unscanned",
         )
+    if manifest.scan_status == "not_applicable":
+        # An image the scanner skipped (over the scan size limit) has not
+        # been scanned either. Allowing it let anything that could get an
+        # image marked unscannable past strict mode and the push gate. Not
+        # a retry: it stays this way until the policy or a rescan changes it.
+        why = await _skip_reason(session, manifest)
+        return ImageVerdict(
+            False,
+            "image could not be scanned"
+            + (f" ({why})" if why else "")
+            + ", and policy refuses images that have not been scanned",
+            source="unscanned",
+        )
     return ALLOW
+
+
+async def _skip_reason(session: AsyncSession, manifest: DockerManifest) -> str | None:
+    error = (
+        await session.execute(
+            select(DockerScanJob.error)
+            .where(DockerScanJob.manifest_id == manifest.id)
+            .order_by(DockerScanJob.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return error[:200] if error else None

@@ -139,8 +139,13 @@ docker push minireg.example.com/local/team-a/myapp:1.0
 
 A push is always accepted. Scanning starts straight away, and until it
 finishes, pulls of the new digest wait for up to *hold seconds* and then get
-a 503. Once the scan finishes, the image is checked against the **push
-rules**. By default an image is blocked if it has:
+a 503. A failed scan is retried, and pulls keep getting a 503 meanwhile. An
+image over the scan size limit (*Largest image scanned*) is never scanned,
+so its pulls are refused until an admin raises the limit and rescans it, or
+turns off *Refuse pulls of a pushed image until its scan is in*.
+
+Once the scan finishes, the image is checked against the **push rules**. By
+default an image is blocked if it has:
 
 - a vulnerability on CISA's Known Exploited Vulnerabilities list, or
 - a CRITICAL finding that already has a fixed version.
@@ -247,7 +252,7 @@ around the registry. These are the tools that stay useful instead:
 | **Block at severity** | Off by default for pulls. Can be combined with *only fixable*. |
 | **Quarantine** | Refuse every pull of a repository, and show the reason you give. |
 | **Accepted risks** | CVEs that never count towards a block. |
-| **Strict mode** | Never serve an unscanned image. Clients get 503 with `Retry-After` until the scan finishes. |
+| **Strict mode** | Never serve an unscanned image. Clients get 503 with `Retry-After` until the scan finishes. An image the scanner skips because it is over the scan size limit is refused with `DENIED`. |
 | **Hold first pulls** | Wait up to *N* seconds for the scan of a small image before answering. Larger images are served straight away and scanned in the background. |
 
 A refused pull returns the standard `DENIED` error with the reason, which

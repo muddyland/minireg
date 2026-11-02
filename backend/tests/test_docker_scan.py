@@ -403,6 +403,126 @@ class TestPolicy:
 CRITICAL_FIXABLE = [vuln("CVE-2024-9999", "CRITICAL", fixed="2.0")]
 
 
+class TestUnscannableIsNotAFreePass:
+    """An image the scanner could not scan has not been scanned: strict
+    mode and the push gate refuse it like any other unscanned image."""
+
+    async def _fail(self, client, sh, *, permanent: bool, error: str):
+        claim = await client.post("/api/docker/scanner/claim", json={"worker": "w1"}, headers=sh)
+        assert claim.status_code == 200, claim.text
+        job = claim.json()
+        r = await client.post(
+            f"/api/docker/scanner/jobs/{job['job_id']}/fail",
+            json={"worker": "w1", "error": error, "permanent": permanent},
+            headers=sh,
+        )
+        assert r.status_code == 200, r.text
+        return job
+
+    async def test_a_permanent_worker_failure_does_not_unlock_a_pushed_image(self, docker_env):
+        from sqlalchemy import select
+
+        from app import db
+        from app.models import DockerManifest
+
+        client, _ = docker_env
+        ah = await admin(client)
+        await set_policy(client, ah, hold_seconds=0.5)
+        token = await make_user()
+        ph = await bearer(client, "repository:local/hostile/app:pull,push", token)
+        img = Image.build("pushcrash")
+        assert (await push_image(client, "local/hostile/app", "1", img, ph)).status_code == 201
+        sh = await scanner_headers(client)
+        # An error text quoting the repository name ("hostile" contains
+        # "os") was enough for the old worker to call it permanent.
+        await self._fail(
+            client, sh, permanent=True, error="unable to inspect local/hostile/app: unsupported media type"
+        )
+        async with db.session_scope() as s:
+            m = (await s.execute(select(DockerManifest).where(DockerManifest.digest == img.digest))).scalar_one()
+            assert m.scan_status == "failed"
+        resp = await client.get("/v2/local/hostile/app/manifests/1", headers=ph)
+        assert resp.status_code == 503, resp.text
+        # ...and the pull queued it again.
+        claim = await client.post("/api/docker/scanner/claim", json={"worker": "w1"}, headers=sh)
+        assert claim.status_code == 200 and claim.json()["digest"] == img.digest
+        for digest in img.blobs:
+            r = await client.get(f"/v2/local/hostile/app/blobs/{digest}", headers=ph)
+            assert r.status_code == 503, digest
+
+    async def test_strict_mode_refuses_an_image_over_the_scan_limit(self, docker_env):
+        client, fake = docker_env
+        ah = await admin(client)
+        await set_policy(client, ah, strict_mode=True, max_scan_bytes=10)
+        img = Image.build("huge")
+        fake.add_image("library/huge", "1", img)
+        h = await bearer(client, "repository:huge:pull")
+        assert (await client.get("/v2/huge/manifests/1", headers=h)).status_code == 503
+        sh = await scanner_headers(client)
+        claim = await client.post("/api/docker/scanner/claim", json={"worker": "w1"}, headers=sh)
+        assert claim.status_code == 204  # skipped: over the limit
+        resp = await client.get("/v2/huge/manifests/1", headers=h)
+        assert resp.status_code == 403, resp.text
+        message = resp.json()["errors"][0]["message"]
+        assert "could not be scanned" in message and "scan limit" in message
+        # Without strict mode an upstream image is still served unscanned.
+        await set_policy(client, ah, strict_mode=False)
+        assert (await client.get("/v2/huge/manifests/1", headers=h)).status_code == 200
+
+    async def test_the_push_gate_refuses_a_pushed_image_over_the_scan_limit(self, docker_env):
+        client, _ = docker_env
+        ah = await admin(client)
+        await set_policy(client, ah, max_scan_bytes=10, hold_seconds=0.5)
+        token = await make_user()
+        ph = await bearer(client, "repository:local/team/huge:pull,push", token)
+        assert (await push_image(client, "local/team/huge", "1", Image.build("huge"), ph)).status_code == 201
+        sh = await scanner_headers(client)
+        assert (await client.post("/api/docker/scanner/claim", json={"worker": "w1"}, headers=sh)).status_code == 204
+        resp = await client.get("/v2/local/team/huge/manifests/1", headers=ph)
+        assert resp.status_code == 403, resp.text
+        assert "could not be scanned" in resp.json()["errors"][0]["message"]
+        await set_policy(client, ah, push_require_scan=False)
+        assert (await client.get("/v2/local/team/huge/manifests/1", headers=ph)).status_code == 200
+
+
+class TestWorkerFailureReports:
+    def _load_worker(self):
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[2] / "scanner" / "worker.py"
+        spec = importlib.util.spec_from_file_location("minireg_scanner_worker", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_no_failure_is_reported_as_permanent(self, monkeypatch):
+        """The old guess ("unsupported" and "os" anywhere in the text)
+        matched repository names and Trivy's ordinary errors."""
+        worker = self._load_worker()
+        sent = []
+
+        def fake_api_json(method, path, payload=None):
+            if path.endswith("/claim"):
+                return {"job_id": 7, "mode": "image", "image": "local/hostile/app@sha256:x", "lease_seconds": 120}
+            sent.append((path, payload))
+            return {}
+
+        def failing_scan(job, workdir):
+            raise RuntimeError(
+                "unable to inspect minireg:8000/local/hostile/app@sha256:abc: unsupported media type; unsupported os"
+            )
+
+        monkeypatch.setattr(worker, "ensure_db", lambda: None)
+        monkeypatch.setattr(worker, "api_json", fake_api_json)
+        monkeypatch.setattr(worker, "scan_image", failing_scan)
+        assert worker.work_one() is True
+        [(path, payload)] = sent
+        assert path == "/api/docker/scanner/jobs/7/fail"
+        assert not payload.get("permanent")
+        assert "unsupported" in payload["error"]
+
+
 class TestPushBarFollowsTheRepository:
     """The push rules apply to what local/ serves, whatever the bytes'
     origin, and never to what an upstream repository serves. The manifest

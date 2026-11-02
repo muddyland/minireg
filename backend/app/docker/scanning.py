@@ -148,10 +148,14 @@ async def renew(session: AsyncSession, job: DockerScanJob) -> None:
     job.lease_until = datetime.now(UTC) + LEASE
 
 
-async def fail(session: AsyncSession, job: DockerScanJob, error: str) -> None:
+async def fail(session: AsyncSession, job: DockerScanJob, error: str, *, retry: bool = True) -> None:
+    """Record a failed attempt; retried up to MAX_ATTEMPTS unless ``retry``
+    is off. Either way the image ends up ``failed``, not ``not_applicable``:
+    a failed image counts as unscanned (strict mode and the push gate refuse
+    it) and the next pull queues it again."""
     job.error = (error or "unknown error")[:2000]
     manifest = await session.get(DockerManifest, job.manifest_id)
-    if job.attempts >= MAX_ATTEMPTS:
+    if job.attempts >= MAX_ATTEMPTS or not retry:
         job.status = "failed"
         job.finished_at = datetime.now(UTC)
         if manifest is not None:
@@ -167,7 +171,8 @@ async def fail(session: AsyncSession, job: DockerScanJob, error: str) -> None:
 
 
 async def skip(session: AsyncSession, job: DockerScanJob, reason: str) -> None:
-    """The job cannot be scanned by design (too big, not an image)."""
+    """The job cannot be scanned by design (too big, not an image). Only the
+    registry decides that; a worker's failure report never does."""
     job.status = "done"
     job.error = reason[:2000]
     job.finished_at = datetime.now(UTC)

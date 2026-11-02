@@ -1462,8 +1462,11 @@ async def _read_upload(upload: UploadFile, limit: int) -> bytes:
 class FailRequest(BaseModel):
     worker: str = Field(max_length=128)
     error: str = Field(max_length=4000)
-    #: The worker decided this image cannot be scanned at all (e.g. no
-    #: supported OS). Recorded, not retried.
+    #: The worker thinks retrying is pointless. The job is not retried, but
+    #: the image is recorded as failed, not as unscannable: the worker's
+    #: error text is untrusted (it can quote repository names and layer
+    #: contents), and "unscannable" used to let an image past strict mode
+    #: and the push gate for good. The next pull queues it again.
     permanent: bool = False
 
 
@@ -1475,10 +1478,7 @@ async def scanner_fail(
     identity: Identity = Depends(require_scanner),
 ) -> dict:
     job = await _running_job(session, job_id, payload.worker)
-    if payload.permanent:
-        await scanning.skip(session, job, payload.error)
-    else:
-        await scanning.fail(session, job, payload.error)
+    await scanning.fail(session, job, payload.error, retry=not payload.permanent)
     await session.commit()
     return {"status": job.status}
 
