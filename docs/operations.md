@@ -362,5 +362,5 @@ expire within `META_CACHE_TTL`. Restarting the app does not clear them, because
 they live in Valkey, a separate container; flush it to clear them at once:
 
 ```bash
-docker compose exec redis valkey-cli FLUSHDB
+docker compose exec redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" valkey-cli FLUSHDB'
 ```

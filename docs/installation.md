@@ -13,6 +13,12 @@ Nothing else is needed on the host. Postgres, Valkey, and the application are
 all containers, and the application image is built locally from the included
 `Dockerfile` — nothing is pulled from an image registry.
 
+Postgres and Valkey sit on an internal network (`backend`) that only the app
+joins; it has no route out. The app and the optional scanner share a second
+network for the published port, upstream traffic and the scanner API. The
+scanner, which unpacks untrusted image layers, cannot open a connection to
+either data service, and both of them need a password.
+
 The app container runs unprivileged, on a read-only root filesystem, with all
 Linux capabilities dropped and a PID limit. Only the data volume and a small
 tmpfs are writable. If you add a sidecar or change the entrypoint, expect to
@@ -27,9 +33,11 @@ git clone <your-fork> minireg
 cd minireg
 cp .env.example .env
 
-# Generate the two secrets
+# Generate the secrets
 python3 -c "import secrets; print('SECRET_KEY=' + secrets.token_urlsafe(48))"
 python3 -c "import secrets; print('CREDENTIAL_KEY=' + secrets.token_urlsafe(48))"
+python3 -c "import secrets; print('POSTGRES_PASSWORD=' + secrets.token_urlsafe(32))"
+python3 -c "import secrets; print('REDIS_PASSWORD=' + secrets.token_urlsafe(32))"
 
 $EDITOR .env          # paste those in, and set PUBLIC_URL
 chmod 600 .env        # it holds every secret this deployment has
@@ -99,7 +107,7 @@ not either. To clear them at once, flush Valkey, which holds nothing but
 caches, locks and rate-limit counters:
 
 ```bash
-docker compose exec redis valkey-cli FLUSHDB
+docker compose exec redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" valkey-cli FLUSHDB'
 ```
 
 ---
@@ -344,6 +352,21 @@ Back up the database before upgrading.
 
 Operator-visible changes:
 
+- **`POSTGRES_PASSWORD` and `REDIS_PASSWORD` are now required.** The compose
+  file refuses to start without them. `POSTGRES_PASSWORD` no longer falls back
+  to `minireg`: if your `.env` never set it, the existing database still has
+  that password, so either set `POSTGRES_PASSWORD=minireg` or change it in the
+  database first (`docker compose exec postgres psql -U minireg -c "ALTER USER
+  minireg PASSWORD '<new>'"`) and then in `.env`. `REDIS_PASSWORD` is new:
+  generate one (`python3 -c "import secrets; print(secrets.token_urlsafe(32))"`);
+  Valkey holds only caches, so nothing needs migrating. Both go into URLs, so
+  keep them URL-safe.
+- **Postgres and Valkey moved to an internal network.** They are on `backend`
+  (no route out, only the app attached); the scanner stays on `minireg` with
+  the app. `docker compose up -d` recreates the containers. Anything else you
+  attached to the old network to reach Postgres or Valkey must join
+  `minireg_backend` instead. Flushing Valkey now needs the password, e.g.
+  `docker compose exec redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" valkey-cli FLUSHDB'`.
 - **Private-address upstreams need the flag for metadata too.**
   `UPSTREAM_ALLOW_PRIVATE_ADDRESSES` and `UPSTREAM_ALLOW_PLAINTEXT_HTTP` now
   govern packument, simple-page, index and search requests, not only artifact

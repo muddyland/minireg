@@ -39,11 +39,13 @@ credentials undecryptable — they must be re-entered. Set both from the start.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://…` | Must use the `asyncpg` driver. |
+| `DATABASE_URL` | `postgresql+asyncpg://…` | Must use the `asyncpg` driver. The compose file builds it from `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB`. |
+| `POSTGRES_PASSWORD` | none (compose) | **Required** by the compose file, which refuses to start without it. Goes into `DATABASE_URL` as is, so use a URL-safe value. |
+| `REDIS_PASSWORD` | none (compose) | **Required** by the compose file: Valkey is started with `--requirepass`, and `REDIS_URL` is built as `redis://:<password>@redis:6379/0`. URL-safe value. |
 | `DB_POOL_SIZE` | `20` | Per process. With N replicas, Postgres needs `N × (pool + overflow)` connections. |
 | `DB_MAX_OVERFLOW` | `20` | Burst above the pool. |
 | `DB_ECHO` | `false` | Logs every SQL statement. Debugging only. |
-| `REDIS_URL` | `redis://redis:6379/0` | Optional. Valkey or Redis, same protocol. Without it the registry still works, just slower. When it is unreachable the app stops asking it for 2 s at a time, doubling up to 30 s, instead of paying a timeout on every call, and reconnects by itself. |
+| `REDIS_URL` | `redis://redis:6379/0` | Optional. Valkey or Redis, same protocol. Put a password in it as `redis://:<password>@host:6379/0`; it is masked in the log. Without it the registry still works, just slower. When it is unreachable the app stops asking it for 2 s at a time, doubling up to 30 s, instead of paying a timeout on every call, and reconnects by itself. |
 | `META_CACHE_TTL` | `60` | Seconds a rendered packument / index page stays fresh. After that, the refresh is a conditional request (`If-None-Match` / `If-Modified-Since`) to the upstream that served the document; a `304` just extends freshness, and only versions that changed are rewritten. |
 | `META_NEGATIVE_CACHE_TTL` | `30` | How long a "not found" is remembered. |
 | `SEARCH_CACHE_TTL` | `120` | Search result caching. |

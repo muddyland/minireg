@@ -13,13 +13,14 @@ spec, so `docker pull`, `docker push`, Podman and containerd work too — see
 [Container images](docs/containers.md).
 
 ```bash
-cp .env.example .env     # set SECRET_KEY and PUBLIC_URL, then chmod 600 .env
+cp .env.example .env     # set SECRET_KEY, POSTGRES_PASSWORD, REDIS_PASSWORD and PUBLIC_URL; chmod 600 .env
 docker compose up -d --build
 docker compose exec minireg python -c "print(open('/data/initial-admin-password').read())"
 ```
 
-The app will not start in production with a placeholder `SECRET_KEY`. Generate
-one with `python3 -c "import secrets; print(secrets.token_urlsafe(48))"`.
+The app will not start in production with a placeholder `SECRET_KEY`, and
+compose will not start without the two passwords. Generate each with
+`python3 -c "import secrets; print(secrets.token_urlsafe(48))"`.
 
 Then [read the setup guide](docs/installation.md).
 

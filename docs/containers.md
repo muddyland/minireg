@@ -193,7 +193,8 @@ docker compose --profile scanner up -d
 ```
 
 The worker talks to minireg inside the compose network at
-`http://minireg:8000`. `DOCKER_INTERNAL_URL` tells minireg to accept that as
+`http://minireg:8000`. It is not attached to the internal `backend` network
+that Postgres and Valkey are on, so a compromised scan cannot reach them. `DOCKER_INTERNAL_URL` tells minireg to accept that as
 an origin, so the token challenge sends the worker back to the internal
 address and not out through your public proxy. The **Image policy** page shows
 when each worker last checked in, and warns when none has.
