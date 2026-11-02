@@ -95,3 +95,27 @@ class TestNoBlockingResolve:
         )
         with pytest.raises(BlockedUrl):
             await artifacts._open_upstream("https://files.upstream.test/x.tgz", None, "x.tgz")
+
+
+class TestKevFeedResolve:
+    @respx.mock
+    async def test_kev_refresh_resolves_off_the_loop(self, loop_bound_resolver, monkeypatch):
+        """The daily KEV refresh ran the same blocking check on the loop."""
+        from app.docker import scanning
+
+        calls, release = loop_bound_resolver
+        url = "https://kev.upstream.test/kev.json"
+        monkeypatch.setattr(settings, "kev_feed_url", url)
+        respx.get(url).mock(return_value=httpx.Response(200, json={"vulnerabilities": []}))
+
+        releaser = asyncio.create_task(release())
+        try:
+            # An empty feed is refused after the fetch, before the session is
+            # touched -- the resolve is all this test is about.
+            with pytest.raises(scanning.ReportInvalid):
+                await scanning.refresh_kev(None)
+        finally:
+            await releaser
+
+        assert calls, "the KEV host must still be checked"
+        assert not any(on_loop for _host, on_loop in calls), calls

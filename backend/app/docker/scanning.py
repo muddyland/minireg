@@ -604,13 +604,13 @@ async def prune_jobs(session: AsyncSession, older_than_days: int = 14) -> int:
 async def refresh_kev(session: AsyncSession) -> int:
     """Load the KEV catalogue and re-flag findings."""
     from ..upstreams.base import get_http_client
-    from ..upstreams.netguard import check_fetchable
+    from ..upstreams.netguard import check_fetchable_async
 
     url = settings.kev_feed_url
     if not url:
         return 0
     host = url.split("/")[2] if "://" in url else ""
-    check_fetchable(url, upstream_url=f"https://{host}")
+    await check_fetchable_async(url, upstream_url=f"https://{host}")
     resp = await get_http_client().get(url, timeout=60)
     resp.raise_for_status()
     if len(resp.content) > 32 * 1024 * 1024:
