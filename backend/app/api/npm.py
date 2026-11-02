@@ -251,18 +251,39 @@ async def npm_web_login() -> Response:
 # --------------------------------------------------------------------------- #
 # Search
 # --------------------------------------------------------------------------- #
+#: registry.npmjs.org's bounds for ``size``; it clamps rather than refusing.
+SEARCH_MAX_SIZE = 250
+SEARCH_DEFAULT_SIZE = 20
+#: Past any real result set, and inside a 32-bit OFFSET on every backend;
+#: `from=1e30` must not reach the driver as an out-of-range integer.
+SEARCH_MAX_OFFSET = 2**31 - 1
+
+
+def _query_int(raw: str | None, default: int) -> int:
+    """A query-string integer the way npmjs reads one: junk is the default.
+
+    Parsed by hand rather than declared ``int`` on the route: FastAPI would
+    answer ``from=abc`` with a 422 the npm CLI does not understand, and the
+    old ``int()`` call answered it with a 500.
+    """
+    try:
+        return int((raw or "").strip())
+    except ValueError:
+        return default
+
+
 @router.get("/-/v1/search")
 async def search(
     request: Request,
     text: str = "",
-    size: int = 20,
-    from_: int = 0,
     session: AsyncSession = Depends(get_session),
     identity: Identity = Depends(rate_limited_read),
 ) -> Response:
-    # npm sends the offset as `from`, which is a Python keyword.
-    offset = int(request.query_params.get("from", from_) or 0)
-    size = max(1, min(int(size), 250))
+    # npm sends the offset as `from`, which is a Python keyword. A negative
+    # one reached the query as a negative OFFSET, which PostgreSQL rejects.
+    offset = min(max(0, _query_int(request.query_params.get("from"), 0)), SEARCH_MAX_OFFSET)
+    size = _query_int(request.query_params.get("size"), SEARCH_DEFAULT_SIZE)
+    size = max(1, min(size, SEARCH_MAX_SIZE))
     query = (text or "").strip()
 
     cache_id = f"search:npm:{query}:{size}:{offset}"
