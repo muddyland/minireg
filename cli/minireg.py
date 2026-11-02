@@ -471,9 +471,14 @@ def cmd_configure(args):
 
     host = registry.split("://", 1)[-1]
     changed = []
+    # Every URL is built from the address given to `minireg login` (as
+    # configure_docker does), not taken from the server's PUBLIC_URL. The
+    # credentials below are scoped to that address; behind a split horizon or
+    # a port-forward PUBLIC_URL names another host, and npm would then send
+    # no token to the registry it was told to use.
 
     if "npm" in wanted:
-        lines = [f"registry={client['npm']['registry']}"]
+        lines = [f"registry={registry}/npm/"]
         if token:
             lines.append(f"//{host}/npm/:_authToken={token}")
         else:
@@ -488,7 +493,7 @@ def cmd_configure(args):
         pip_conf = Path(
             os.environ.get("XDG_CONFIG_HOME") or os.path.join(Path.home(), ".config")
         ) / "pip" / "pip.conf"
-        index_url = client["pip"]["index_url"]
+        index_url = f"{registry}/pypi/simple/"
         if token:
             # pip has no auth-token header; credentials go in the URL.
             scheme, _, rest = index_url.partition("://")
@@ -527,7 +532,7 @@ def cmd_configure(args):
                 'replace-with = "minireg"',
                 "",
                 "[source.minireg]",
-                f'registry = "{cargo["registry"]}"',
+                f'registry = "sparse+{registry}/cargo/index/"',
             ]
             if args.dry_run:
                 print(f"\n{bold(str(cargo_conf))}\n" + "\n".join(lines))

@@ -136,6 +136,11 @@ registry = "sparse+https://registry.example.com/cargo/index/"
 Anything else in those files is left alone, and re-running replaces the block
 rather than appending a second copy.
 
+Every URL is built from the address you gave `minireg login` (or `--url`),
+like the token scoping next to it, not from the server's `PUBLIC_URL`: behind
+a port-forward or split-horizon DNS those differ, and only the address that
+works from this machine is any use.
+
 `configure` on its own covers npm, pip and cargo. Docker is opt-in (see
 [Containers](#containers) below), because it stores a credential in Docker's
 own config, which a plain `minireg configure` in CI should not start doing. `~/.npmrc` and `pip.conf` are written mode

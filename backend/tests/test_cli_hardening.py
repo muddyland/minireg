@@ -8,6 +8,7 @@ text, and what it writes into the user's package-manager config files.
 from __future__ import annotations
 
 import argparse
+import configparser
 import importlib.util
 import io
 import json
@@ -413,3 +414,68 @@ class TestFixReportsHonestly:
         out = capsys.readouterr()
         assert "already at or above the fixed version: vite ^6.0.0" in out.out
         assert "not declared" in out.err and "minimist>=1.2.6" in out.err
+
+
+# --------------------------------------------------------------------------- #
+# configure: what lands in the package managers' config files
+# --------------------------------------------------------------------------- #
+PUBLIC = "https://public.example"
+
+
+@pytest.fixture
+def home(monkeypatch, tmp_path):
+    """A scratch HOME/XDG/CARGO_HOME, a stored login, and a server whose
+    PUBLIC_URL differs from the address the CLI was given."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setenv("CARGO_HOME", str(tmp_path / ".cargo"))
+    monkeypatch.delenv("MINIREG_TOKEN", raising=False)
+    monkeypatch.delenv("MINIREG_URL", raising=False)
+    cli.save_config({"registry": "http://localhost:5055", "token": "mrg_tok"})
+
+    def fake_api(registry, path, *a, **k):
+        assert path == "/api/client-config"
+        return {
+            "npm": {"registry": f"{PUBLIC}/npm/"},
+            "pip": {"index_url": f"{PUBLIC}/pypi/simple/"},
+            "cargo": {"registry": f"sparse+{PUBLIC}/cargo/index/"},
+        }
+
+    monkeypatch.setattr(cli, "api", fake_api)
+    return tmp_path
+
+
+def configure(target):
+    assert cli.main(["configure", target]) == 0
+
+
+def pip_conf(home):
+    return home / ".config" / "pip" / "pip.conf"
+
+
+def parsed_pip_conf(home):
+    # pip reads it with RawConfigParser, which is strict: a duplicate
+    # section or option is an error that breaks pip entirely.
+    conf = configparser.RawConfigParser()
+    conf.read(pip_conf(home))
+    return conf
+
+
+class TestConfigureUsesTheGivenAddress:
+    def test_npm_registry_and_token_name_the_same_host(self, home):
+        configure("npm")
+        npmrc = (home / ".npmrc").read_text()
+        assert "registry=http://localhost:5055/npm/" in npmrc
+        assert "//localhost:5055/npm/:_authToken=mrg_tok" in npmrc
+        assert "public.example" not in npmrc
+
+    def test_pip_index_is_the_given_address(self, home):
+        configure("pip")
+        url = parsed_pip_conf(home).get("global", "index-url")
+        assert url == "http://__token__:mrg_tok@localhost:5055/pypi/simple/"
+
+    def test_cargo_index_is_the_given_address(self, home):
+        configure("cargo")
+        text = (home / ".cargo" / "config.toml").read_text()
+        assert "sparse+http://localhost:5055/cargo/index/" in text
+        assert "public.example" not in text
