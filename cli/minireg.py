@@ -1435,13 +1435,66 @@ _REQ_PIN_RE = re.compile(
 _NPM_RANGE_RE = re.compile(r"^(?P<op>[\^~]|>=|>)?(?P<version>\d.*)$")
 
 
+#: What a fix version must look like before it goes into a file or a printed
+#: command. It comes from the server, which takes it from advisory data, and
+#: it is spliced into requirements.txt lines, package.json strings and shell
+#: commands: a newline there adds a line (`--extra-index-url https://evil`),
+#: a quote adds JSON keys, a `;` adds a command. PEP 440 for PyPI (the
+#: spec's permissive pattern, minus surrounding whitespace), semver for npm
+#: and cargo.
+_FIX_VERSION_RE = {
+    "pypi": re.compile(
+        r"v?(?:[0-9]+!)?[0-9]+(?:\.[0-9]+)*"
+        r"(?:[-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?"
+        r"(?:-[0-9]+|[-_.]?(?:post|rev|r)[-_.]?[0-9]*)?"
+        r"(?:[-_.]?dev[-_.]?[0-9]*)?"
+        r"(?:\+[a-z0-9]+(?:[-_.][a-z0-9]+)*)?",
+        re.IGNORECASE,
+    ),
+    "npm": re.compile(
+        r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+        r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    ),
+}
+_FIX_VERSION_RE["cargo"] = _FIX_VERSION_RE["npm"]
+#: Package names that are safe to print inside a suggested command.
+_COMMAND_SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def valid_fix_version(ecosystem: str, version) -> bool:
+    pattern = _FIX_VERSION_RE.get(ecosystem)
+    return bool(pattern and isinstance(version, str) and pattern.fullmatch(version))
+
+
+def usable_fixes(ecosystem: str, findings: list[dict]) -> list[dict]:
+    """The findings whose fix version may be written or printed; says which
+    were dropped rather than silently treating them as unfixable."""
+    usable = []
+    for finding in findings:
+        version = finding.get("fix_version")
+        if not version:
+            continue
+        if valid_fix_version(ecosystem, version) and _COMMAND_SAFE_NAME_RE.fullmatch(
+            finding.get("name") or ""
+        ):
+            usable.append(finding)
+        else:
+            info(
+                yellow(
+                    f"    ignoring a malformed fix version for {finding.get('name')!r}: "
+                    f"{version!r}"
+                )
+            )
+    return usable
+
+
 def _print_cargo_fix_advice(path: Path, findings: list[dict]) -> int:
     """Hand back the `cargo update` lines that would clear what we found.
 
     Returns how many were printed, so the caller can tell "we told you what to
     run" apart from "there is nothing to do".
     """
-    fixes = sorted({(f["name"], f["fix_version"]) for f in findings if f.get("fix_version")})
+    fixes = sorted({(f["name"], f["fix_version"]) for f in usable_fixes("cargo", findings)})
     if not fixes:
         if findings:
             print(f"    {dim(path.name)}: nothing with a published fix")
@@ -1470,7 +1523,7 @@ def plan_requirements_fix(path: Path, fixes: dict) -> tuple[str, list[str]]:
             continue
 
         target = fixes.get(normalize_key("pypi", match.group("name")))
-        if not target or target == match.group("version"):
+        if not valid_fix_version("pypi", target) or target == match.group("version"):
             out.append(line)
             continue
 
@@ -1503,7 +1556,7 @@ def plan_package_json_fix(path: Path, fixes: dict) -> tuple[str, list[str], list
     ):
         for name, spec in (data.get(section) or {}).items():
             target = fixes.get(normalize_key("npm", name))
-            if not target or not isinstance(spec, str):
+            if not valid_fix_version("npm", target) or not isinstance(spec, str):
                 continue
 
             match = _NPM_RANGE_RE.match(spec.strip())
@@ -1563,8 +1616,7 @@ def apply_fixes(args, registry, token, root: Path, per_source) -> None:
 
         fixable = {
             normalize_key(ecosystem, f["name"]): f["fix_version"]
-            for f in findings
-            if f.get("fix_version")
+            for f in usable_fixes(ecosystem, findings)
         }
         unfixable = [f for f in findings if f.get("cves") and not f.get("fix_version")]
 
