@@ -113,8 +113,8 @@ minireg configure cargo
 minireg configure --dry-run # print what would be written
 ```
 
-Writes a marked block into `~/.npmrc`, `~/.config/pip/pip.conf` and
-`~/.cargo/config.toml`:
+Writes a marked block into `~/.npmrc`, `~/.config/pip/pip.conf`,
+`~/.cargo/config.toml` and, when you are logged in, `~/.cargo/credentials.toml`:
 
 ```ini
 # >>> minireg >>>
@@ -128,8 +128,17 @@ registry=https://registry.example.com/npm/
 [source.crates-io]
 replace-with = "minireg"
 
-[source.minireg]
-registry = "sparse+https://registry.example.com/cargo/index/"
+[registries.minireg]
+index = "sparse+https://registry.example.com/cargo/index/"
+credential-provider = "cargo:token"
+# <<< minireg <<<
+```
+
+```toml
+# ~/.cargo/credentials.toml
+# >>> minireg >>>
+[registries.minireg]
+token = "mrg_…"
 # <<< minireg <<<
 ```
 
@@ -143,10 +152,15 @@ works from this machine is any use.
 
 `configure` on its own covers npm, pip and cargo. Docker is opt-in (see
 [Containers](#containers) below), because it stores a credential in Docker's
-own config, which a plain `minireg configure` in CI should not start doing. `~/.npmrc` and `pip.conf` are written mode
-`600` because they contain a token; the cargo block carries none, because
-reads are anonymous and cargo only sends credentials to an index that declares
-`auth-required`.
+own config, which a plain `minireg configure` in CI should not start doing. The files are written mode `600`;
+`~/.npmrc`, `pip.conf` and `credentials.toml` contain a token. Cargo sends its
+token only to an index that declares `auth-required`, which minireg does when
+anonymous reads are switched off, so with them on the token is never sent.
+The crates.io replacement points at a `[registries]` entry rather than a
+`[source]` one because cargo will only attach a credential to a registry. If
+either cargo file already defines one of these tables outside the block,
+`configure` leaves cargo alone and says so, since TOML forbids defining a table
+twice.
 
 In `pip.conf` the block goes directly under your `[global]` header (or at the
 end, with its own `[global]`, when there is none), because an option belongs
@@ -155,8 +169,8 @@ is left alone with a warning: a second copy is an error that makes pip ignore
 the whole file.
 
 The cargo block goes at the *end* of the file on first write. That matters for
-TOML in a way it does not for the other two: `[source.…]` are table headers, so
-anything placed after them would be read as part of `[source.minireg]`.
+TOML in a way it does not for the other two: these are table headers, so
+anything placed after them would be read as part of `[registries.minireg]`.
 
 ### Containers
 
@@ -553,6 +567,7 @@ for a person and a pipeline with no branching.
 | `~/.npmrc` | Written by `configure`, in a marked block |
 | `~/.config/pip/pip.conf` | Written by `configure`, in a marked block |
 | `~/.cargo/config.toml` | Written by `configure`, in a marked block. Honours `CARGO_HOME` |
+| `~/.cargo/credentials.toml` | The cargo token, written by `configure` in a marked block. Mode `600` |
 | `~/.docker/config.json` | Written by `docker login` when you run `configure docker`, not by minireg |
 
 ---

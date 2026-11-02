@@ -15,7 +15,9 @@ import json
 import pathlib
 import re
 import shlex
+import stat
 import sys
+import tomllib
 import urllib.error
 
 import pytest
@@ -530,3 +532,58 @@ class TestPipConfLandsUnderGlobal:
         configure("pip")
         assert path.read_text() == original
         assert "already sets index_url" in capsys.readouterr().err
+
+
+OLD_CARGO_BLOCK = (
+    '[build]\njobs = 4\n\n# >>> minireg >>>\n[source.crates-io]\nreplace-with = "minireg"\n\n'
+    '[source.minireg]\nregistry = "sparse+http://old/cargo/index/"\n# <<< minireg <<<\n'
+)
+
+
+class TestCargoCredential:
+    """With ALLOW_ANONYMOUS_READ=false cargo must send a token. It only does
+    so for a `[registries]` entry with a credential provider (checked against
+    cargo 1.9x: a `[source.minireg]` replacement fails with "authenticated
+    registries require a credential-provider"), and only to an index whose
+    config.json declares auth-required, so writing it is harmless otherwise."""
+
+    def cargo_files(self, home):
+        return home / ".cargo" / "config.toml", home / ".cargo" / "credentials.toml"
+
+    def test_registry_entry_and_token_are_written(self, home):
+        conf_path, creds_path = self.cargo_files(home)
+        creds_path.parent.mkdir(parents=True)
+        creds_path.write_text('[registry]\ntoken = "crates-io-token"\n')
+        conf_path.write_text(OLD_CARGO_BLOCK)
+        configure("cargo")
+
+        conf = tomllib.loads(conf_path.read_text())
+        assert conf["build"] == {"jobs": 4}
+        assert conf["source"] == {"crates-io": {"replace-with": "minireg"}}
+        assert conf["registries"]["minireg"] == {
+            "index": "sparse+http://localhost:5055/cargo/index/",
+            "credential-provider": "cargo:token",
+        }
+        creds = tomllib.loads(creds_path.read_text())
+        assert creds == {"registry": {"token": "crates-io-token"}, "registries": {"minireg": {"token": "mrg_tok"}}}
+        assert stat.S_IMODE(creds_path.stat().st_mode) == 0o600
+
+        before = (conf_path.read_text(), creds_path.read_text())
+        configure("cargo")
+        assert (conf_path.read_text(), creds_path.read_text()) == before
+
+    def test_no_token_no_credentials_file(self, home):
+        cli.save_config({"registry": "http://localhost:5055"})
+        configure("cargo")
+        _conf, creds_path = self.cargo_files(home)
+        assert not creds_path.exists()
+
+    def test_an_existing_table_is_not_defined_twice(self, home, capsys):
+        conf_path, creds_path = self.cargo_files(home)
+        creds_path.parent.mkdir(parents=True)
+        original = '[registries.minireg]\ntoken = "mine"\n'
+        creds_path.write_text(original)
+        configure("cargo")
+        assert creds_path.read_text() == original
+        assert not conf_path.exists()
+        assert "already has [registries.minireg]" in capsys.readouterr().err

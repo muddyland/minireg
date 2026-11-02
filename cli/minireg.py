@@ -513,6 +513,30 @@ def plan_pip_conf(existing: str, settings: list[str], marker: str = "minireg"):
     return "".join(lines), None
 
 
+def _toml_conflict(path: Path, lines: list[str]) -> bool:
+    """True (and says so) when ``path`` already defines, outside our block, a
+    table our block defines. TOML forbids defining a table twice, and cargo
+    then refuses to read its config at all."""
+    if not path.is_file():
+        return False
+    outside = _without_block(path.read_text(), "minireg")
+    ours = {line.strip() for line in lines if line.strip().startswith("[")}
+    theirs = {
+        line.split("#", 1)[0].strip()
+        for line in outside.splitlines()
+        if line.strip().startswith("[")
+    }
+    clash = sorted(ours & theirs)
+    if clash:
+        info(
+            yellow(
+                f"  {path} already has {', '.join(clash)}; cargo not configured. "
+                "Remove it and re-run."
+            )
+        )
+    return bool(clash)
+
+
 def cmd_configure(args):
     registry = require_registry(args)
     config = load_config()
@@ -586,31 +610,48 @@ def cmd_configure(args):
             changed.append(str(pip_conf))
 
     if "cargo" in wanted:
-        cargo_conf = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo")) / "config.toml"
+        cargo_home = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo"))
+        cargo_conf = cargo_home / "config.toml"
+        cargo_creds = cargo_home / "credentials.toml"
         cargo = client.get("cargo")
         if not cargo:
             info(dim("  registry does not serve a cargo index; skipping"))
         else:
-            # Source replacement, not a `[registries]` entry: it redirects every
-            # crates.io dependency without editing a single Cargo.toml. No token
-            # is written -- cargo only sends credentials to an index that
-            # declares `auth-required`, and a read-only mirror does not.
+            # Source replacement redirects every crates.io dependency without
+            # editing a single Cargo.toml. The replacement is a `[registries]`
+            # entry rather than a `[source]` one because only a registry can
+            # carry a credential: with anonymous reads off, cargo refuses a
+            # `[source.minireg]` ("authenticated registries require a
+            # credential-provider"), even with `[registries.minireg]` beside
+            # it. The token goes in credentials.toml, as `cargo login` would
+            # put it. Cargo sends it only to an index whose config.json says
+            # `auth-required`, so with anonymous reads on it stays unused.
             lines = [
                 "[source.crates-io]",
                 'replace-with = "minireg"',
                 "",
-                "[source.minireg]",
-                f'registry = "sparse+{registry}/cargo/index/"',
+                "[registries.minireg]",
+                f'index = "sparse+{registry}/cargo/index/"',
+                'credential-provider = "cargo:token"',
             ]
+            cred_lines = ["[registries.minireg]", f"token = {json.dumps(token)}"] if token else []
             if args.dry_run:
                 print(f"\n{bold(str(cargo_conf))}\n" + "\n".join(lines))
-            else:
+                if token:
+                    print(f"\n{bold(str(cargo_creds))}\n[registries.minireg]\ntoken = \"…\"")
+            elif not (
+                _toml_conflict(cargo_conf, lines)
+                or (token and _toml_conflict(cargo_creds, cred_lines))
+            ):
                 # The managed block goes at the end of the file on first write.
                 # That matters for TOML in a way it does not for npmrc: these
                 # are table headers, so anything following them would be read as
-                # part of `[source.minireg]`.
+                # part of `[registries.minireg]`.
                 _upsert_lines(cargo_conf, lines, "minireg")
                 changed.append(str(cargo_conf))
+                if token:
+                    _upsert_lines(cargo_creds, cred_lines, "minireg")
+                    changed.append(str(cargo_creds))
 
     if "docker" in wanted:
         configure_docker(args, registry, token, config)

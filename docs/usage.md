@@ -202,7 +202,10 @@ replace-with = "minireg"
 registry = "sparse+https://registry.example.com/cargo/index/"
 ```
 
-Then `cargo build` as usual. `minireg configure` writes exactly this block.
+Then `cargo build` as usual. `minireg configure` writes the equivalent with
+`[registries.minireg]` in place of `[source.minireg]`, plus your token in
+`~/.cargo/credentials.toml`, because cargo only attaches a credential to a
+registry entry (see [the CLI](cli.md#configuring-package-managers)).
 
 Two details are load-bearing:
 
