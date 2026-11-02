@@ -210,6 +210,42 @@ Two details are load-bearing:
 - **The trailing slash** on the index URL. Without it cargo joins the shard
   paths against the parent segment and every crate 404s.
 
+### When reads need a token
+
+With `ALLOW_ANONYMOUS_READ=false`, the index's `config.json` declares
+`"auth-required": true` and answers an anonymous request with `401` and a
+`WWW-Authenticate: Cargo login_url="…/tokens"` challenge, the protocol cargo
+uses for private registries (stable since cargo 1.74). Cargo then sends its
+token on every index and download request, as the bare `Authorization` value.
+
+Cargo sends a token only to a registry defined under `[registries]` with a
+credential provider, so define the registry there and point source
+replacement at it:
+
+```toml
+# ~/.cargo/config.toml
+[registries.minireg]
+index = "sparse+https://registry.example.com/cargo/index/"
+credential-provider = "cargo:token"
+
+[source.crates-io]
+replace-with = "minireg"
+```
+
+Then store a `read` token once, pasted on stdin:
+
+```bash
+cargo login --registry minireg
+```
+
+That writes it to `~/.cargo/credentials.toml` as
+`[registries.minireg] token = "mrg_…"`. In CI, set
+`CARGO_REGISTRIES_MINIREG_TOKEN` instead. Without the `credential-provider`
+line cargo stops with "authenticated registries require a
+credential-provider to be configured"; without a token it says "no token found
+for `minireg`". The same block also works while anonymous reads are allowed:
+cargo then sends no token at all.
+
 ### Commit it to the project
 
 Put the same block in `.cargo/config.toml` at the repository root and it
@@ -254,9 +290,10 @@ Hosting genuinely private crates needs a *separate* registry entry
 different feature from mirroring rather than an extension of it.
 
 For the same reason, `config.json` omits the `api` key. That key is what tells
-cargo that `publish`, `yank`, `search` and `login` work against a registry;
-leaving it out gets a clear "registry does not support API commands" instead of
-a failure from somewhere deeper in the command.
+cargo that `publish`, `yank` and `search` work against a registry; leaving it
+out gets a clear "registry does not support API commands" instead of a failure
+from somewhere deeper in the command. (`cargo login` only stores a token
+locally, and works without it.)
 
 ---
 
@@ -284,8 +321,11 @@ in the audit log and can be revoked without disrupting anyone.
     EOF
 ```
 
-Cargo needs no token here: reads are anonymous, and cargo only sends
-credentials to an index that declares `auth-required`.
+Cargo needs no token here while reads are anonymous: cargo only sends
+credentials to an index that declares `auth-required`. With
+`ALLOW_ANONYMOUS_READ=false`, use the `[registries.minireg]` block from
+[When reads need a token](#when-reads-need-a-token) and set
+`CARGO_REGISTRIES_MINIREG_TOKEN: ${{ secrets.MINIREG_TOKEN }}` in the step's `env`.
 
 ### GitLab CI
 

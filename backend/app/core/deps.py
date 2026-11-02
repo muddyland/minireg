@@ -6,6 +6,7 @@ Client credential shapes we must accept, because the tooling is not negotiable:
 * pip  -> ``Authorization: Basic base64("__token__:<token>")`` (PyPI convention)
          and ``Basic base64("<user>:<token>")``
 * twine -> same as pip
+* cargo -> ``Authorization: <token>`` (no scheme, RFC 3139)
 * UI   -> session JWT in an HttpOnly cookie
 """
 
@@ -452,6 +453,14 @@ async def resolve_identity(
             if username not in ("__token__", "token"):
                 return await _basic_password_identity(session, request, username, password)
             return Identity()
+
+        # Cargo (RFC 3139) sends the token as the whole header value, with
+        # no scheme. Anything shaped like one of our tokens is tried as one;
+        # other unknown schemes stay anonymous.
+        raw = auth_header.strip()
+        if raw.startswith(f"{settings.token_prefix}_") and " " not in raw:
+            identity = await _token_identity(session, raw)
+            return identity or Identity()
 
         # An Authorization scheme we do not implement.
         return Identity()

@@ -476,3 +476,80 @@ class TestCargoProxy:
 
         download = await cargo_client.get("/cargo/api/v1/crates/leftpad/1.0.0/download")
         assert download.status_code == 403
+
+
+class TestPrivateRegistry:
+    """With ALLOW_ANONYMOUS_READ=false cargo could never authenticate: it
+    sends ``Authorization: <token>`` with no scheme (RFC 3139), which the
+    server did not read, and only sends it at all to an index whose
+    config.json says ``auth-required``, which ours never did. Errors were
+    FastAPI's ``{"detail"}``, which cargo does not show."""
+
+    @pytest.fixture(autouse=True)
+    def private(self, monkeypatch):
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "allow_anonymous_read", False)
+
+    async def _token(self, scopes=("read",)) -> str:
+        from app.core.security import generate_token
+        from app.models import ApiToken, User
+
+        full, prefix, token_hash = generate_token()
+        async with db_module.session_scope() as session:
+            user = User(username="rustacean", password_hash=None)
+            session.add(user)
+            await session.flush()
+            session.add(
+                ApiToken(
+                    user_id=user.id, name="cargo", prefix=prefix, token_hash=token_hash,
+                    scopes=list(scopes),
+                )
+            )
+        return full
+
+    def test_config_json_declares_auth_required(self, monkeypatch):
+        from app.config import settings
+
+        assert cargo_render.render_config_json()["auth-required"] is True
+        monkeypatch.setattr(settings, "allow_anonymous_read", True)
+        assert "auth-required" not in cargo_render.render_config_json()
+
+    async def test_an_anonymous_request_gets_cargos_challenge(self, cargo_client):
+        resp = await cargo_client.get("/cargo/index/config.json")
+        assert resp.status_code == 401
+        assert resp.json() == {"errors": [{"detail": "authentication required"}]}
+        assert resp.headers["www-authenticate"] == 'Cargo login_url="http://registry.test/tokens"'
+
+    @respx.mock
+    async def test_cargos_scheme_less_token_is_accepted(self, cargo_client):
+        mock_cargo_upstream()
+        token = await self._token()
+        headers = {"authorization": token}
+        config = await cargo_client.get("/cargo/index/config.json", headers=headers)
+        assert config.status_code == 200
+        assert config.json()["auth-required"] is True
+        index = await cargo_client.get("/cargo/index/le/ft/leftpad", headers=headers)
+        assert index.status_code == 200
+        crate = await cargo_client.get(
+            "/cargo/api/v1/crates/leftpad/1.0.0/download", headers=headers
+        )
+        assert crate.status_code == 200
+        assert crate.content == CRATE
+
+    async def test_a_bad_or_scopeless_token_is_refused_cargo_style(self, cargo_client):
+        resp = await cargo_client.get(
+            "/cargo/index/config.json", headers={"authorization": "mrg_nothere_secret"}
+        )
+        assert resp.status_code == 401
+        assert resp.json()["errors"][0]["detail"]
+        # Something that is not a token shape is not looked up at all.
+        resp = await cargo_client.get(
+            "/cargo/index/config.json", headers={"authorization": "Negotiate abc"}
+        )
+        assert resp.status_code == 401
+
+    async def test_other_registries_keep_their_error_shape(self, cargo_client):
+        resp = await cargo_client.get("/api/auth/me")
+        assert resp.status_code == 401
+        assert resp.json() == {"detail": "authentication required"}

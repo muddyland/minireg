@@ -13,11 +13,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request, status
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import defer
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .api import auth as auth_api
 from .api import cargo as cargo_api
@@ -681,6 +683,19 @@ async def health_detailed(
         {"status": "ok" if healthy else "degraded", "checks": checks},
         status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
     )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request: Request, exc: StarletteHTTPException):
+    """Errors in the shape each client reads.
+
+    Only /cargo differs from FastAPI's ``{"detail": ...}``: the shared auth
+    and rate-limit guards raise HTTPException, and cargo shows a registry's
+    message only from ``{"errors": [{"detail": ...}]}``.
+    """
+    if request.url.path.startswith("/cargo/"):
+        return cargo_api.cargo_http_error(exc)
+    return await http_exception_handler(request, exc)
 
 
 # API routers first, then the registry mounts, then the SPA catch-all.
