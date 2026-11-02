@@ -424,7 +424,12 @@ async def _run_fill(
         sha256 = digests.sha256.hexdigest()
         stored = digests.stored(store.relative_path_for(sha256), already_existed=False)
         if expected.verify:
-            _verify_digests(expected, stored, require=expected.require_digest)
+            extra: dict[str, bytes] = {}
+            if sri_algorithm(expected.integrity) == "sha384":
+                # Not computed while streaming (npm never publishes it);
+                # read it back off the partial file rather than skip it.
+                extra["sha384"] = await asyncio.to_thread(_file_digest, fill.path, "sha384")
+            _verify_digests(expected, stored, require=expected.require_digest, extra=extra)
         store.adopt(fill.path, sha256)
         await _record(expected.file_id, stored)
         fill.sha256 = sha256
@@ -736,19 +741,96 @@ def _digest_required(upstream: Upstream | None) -> bool:
     return True if value is None else bool(value)
 
 
-def _verify_digests(file_row, stored, *, require: bool = False) -> None:
+#: SRI algorithms, strongest first. sha1 is not in the SRI spec, but npm's
+#: own ssri accepts it and old packuments still carry it.
+_SRI_STRENGTH = ("sha512", "sha384", "sha256", "sha1")
+
+
+def _parse_sri(integrity: str) -> dict[str, list[bytes | None]]:
+    """``{algorithm: [digest, ...]}`` from an SRI string.
+
+    An SRI value is a whitespace-separated list of ``<alg>-<base64>[?opts]``
+    tokens. Unknown algorithms are skipped, as the spec says; a value that
+    does not decode, or decodes to the wrong length for its algorithm, is
+    kept as ``None`` so the caller can refuse it rather than skip it.
+    """
+    import base64
+    import binascii
+    import hashlib
+
+    groups: dict[str, list[bytes | None]] = {}
+    for token in integrity.split():
+        algorithm, sep, rest = token.partition("-")
+        algorithm = algorithm.lower()
+        if not sep or algorithm not in _SRI_STRENGTH:
+            continue
+        try:
+            value: bytes | None = base64.b64decode(rest.split("?", 1)[0], validate=True)
+        except (binascii.Error, ValueError):
+            value = None
+        if value is not None and len(value) != hashlib.new(algorithm).digest_size:
+            value = None
+        groups.setdefault(algorithm, []).append(value)
+    return groups
+
+
+def sri_algorithm(integrity: str | None) -> str | None:
+    """The algorithm an SRI string is checked with: its strongest one."""
+    groups = _parse_sri(integrity or "")
+    return next((a for a in _SRI_STRENGTH if a in groups), None)
+
+
+def _check_sri(filename: str, integrity: str, actual: dict[str, bytes]) -> bool:
+    """Check an SRI string; returns whether a digest was actually compared.
+
+    Per the SRI spec only the strongest algorithm present counts, and the
+    bytes pass if they match any of its values. The old check looked only at
+    a string that *started* with sha256/sha512, and passed silently on
+    sha384, on a value that did not decode, on a length mismatch, and on a
+    list of several hashes -- so ``require_digest`` was satisfied by an
+    integrity string that verified nothing.
+    """
+    groups = _parse_sri(integrity)
+    algorithm = next((a for a in _SRI_STRENGTH if a in groups), None)
+    if algorithm is None:
+        return False
+    computed = actual.get(algorithm)
+    if computed is None:
+        return False
+    values = groups[algorithm]
+    if computed in values:
+        return True
+    if all(v is None for v in values):
+        raise DigestMismatch(
+            f"{filename}: SRI integrity value for {algorithm} is not a valid digest"
+        )
+    raise DigestMismatch(f"{filename}: SRI integrity mismatch ({algorithm})")
+
+
+def _file_digest(path, algorithm: str) -> bytes:
+    import hashlib
+
+    with open(path, "rb") as fh:
+        return hashlib.file_digest(fh, algorithm).digest()
+
+
+def _verify_digests(
+    file_row, stored, *, require: bool = False, extra: dict[str, bytes] | None = None
+) -> None:
     """Compare against whatever the upstream told us to expect.
 
     ``file_row`` is a PackageFile or anything with the same digest
     attributes. We check every digest we were given, not just one: an
     upstream that publishes sha1 (npm) and one that publishes sha256 (PyPI)
-    both get checked.
+    both get checked. ``extra`` carries digests the download did not
+    compute as it went (sha384, for the rare SRI string that needs it).
 
-    With ``require`` set, an artifact whose metadata carried *no* digest at all
-    is rejected rather than accepted on trust. Verification is otherwise
-    opt-in by the upstream: no advertised digest meant no check, and the
-    digest we then served to clients was derived from whatever bytes arrived,
-    so the client's own verification proved nothing.
+    With ``require`` set, an artifact for which no digest was actually
+    compared is rejected rather than accepted on trust -- whether its
+    metadata carried none at all or only one this code cannot check.
+    Verification is otherwise opt-in by the upstream: no advertised digest
+    meant no check, and the digest we then served to clients was derived from
+    whatever bytes arrived, so the client's own verification proved nothing.
     """
     checks = (
         ("sha256", file_row.sha256, stored.sha256),
@@ -756,38 +838,32 @@ def _verify_digests(file_row, stored, *, require: bool = False) -> None:
         ("md5", file_row.md5, stored.md5),
         ("blake2b_256", file_row.blake2b_256, stored.blake2b_256),
     )
-    if require and not any(expected for _, expected, _ in checks) and not file_row.integrity:
-        raise ArtifactError(
-            f"{file_row.filename}: upstream published no digest for this artifact "
-            "and this upstream is configured to require one"
-        )
+    compared = False
     for algorithm, expected, actual in checks:
-        if expected and expected.lower() != actual.lower():
+        if not expected:
+            continue
+        if expected.lower() != actual.lower():
             raise DigestMismatch(
                 f"{file_row.filename}: {algorithm} mismatch "
                 f"(expected {expected}, got {actual})"
             )
+        compared = True
 
     # npm SRI integrity string, e.g. "sha512-<base64>".
-    if file_row.integrity and "-" in file_row.integrity:
-        import base64
-        import hashlib
+    if file_row.integrity:
+        actual_raw = {
+            "sha512": bytes.fromhex(stored.sha512),
+            "sha256": bytes.fromhex(stored.sha256),
+            "sha1": bytes.fromhex(stored.sha1),
+            **(extra or {}),
+        }
+        compared = _check_sri(file_row.filename, file_row.integrity, actual_raw) or compared
 
-        algorithm, _, encoded = file_row.integrity.partition("-")
-        algorithm = algorithm.lower()
-        if algorithm in ("sha256", "sha512"):
-            try:
-                expected_bytes = base64.b64decode(encoded)
-            except Exception:
-                return
-            actual_hex = stored.sha512 if algorithm == "sha512" else stored.sha256
-            if (
-                hashlib.new(algorithm).digest_size == len(expected_bytes)
-                and expected_bytes.hex() != actual_hex
-            ):
-                raise DigestMismatch(
-                    f"{file_row.filename}: SRI integrity mismatch ({algorithm})"
-                )
+    if require and not compared:
+        raise ArtifactError(
+            f"{file_row.filename}: upstream published no digest for this artifact "
+            "that could be verified, and this upstream is configured to require one"
+        )
 
 
 # --------------------------------------------------------------------------- #

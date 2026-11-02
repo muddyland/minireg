@@ -130,7 +130,11 @@ any upstream claims a pattern, matching names are only ever resolved from
 upstreams that claim it — a public registry can then never answer for an
 internal package, whatever the tier order and whatever the internal upstream
 is doing at the time. **Require digest** refuses to cache an artifact the
-upstream published no hash for.
+upstream published no hash for, or only a hash minireg cannot check. A hex
+digest (sha256, sha1, md5, blake2b) or an npm `integrity` string counts; for
+`integrity` the strongest algorithm listed is checked (sha512, sha384, sha256,
+or npm's legacy sha1), and a value that does not decode is a mismatch, not a
+pass.
 
 ### Container images
 
