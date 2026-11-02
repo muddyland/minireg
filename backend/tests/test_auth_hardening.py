@@ -512,3 +512,61 @@ class TestDisabledAccountsCannotUseSso:
         assert row.oidc_subject is None
         assert row.provider == AuthProvider.local
         assert row.password_hash  # untouched
+
+
+class TestSsoDemotionTakesBackPublish:
+    """Promotion to the OIDC admin group switched can_publish on, and
+    demotion only cleared is_admin: a demoted admin kept publishing."""
+
+    async def test_demotion_revokes_the_implicit_grant(self, app_client, provider):
+        provider.update({"sub": "boss", "preferred_username": "boss", "groups": ["minireg-admins"]})
+        assert (await sso(app_client)).status_code == 302
+        row = await user_row("boss")
+        assert row.is_admin and row.can_publish and row.publish_via_oidc_admin
+
+        app_client.cookies.clear()
+        provider.update({"groups": []})
+        assert (await sso(app_client)).status_code == 302
+        row = await user_row("boss")
+        assert not row.is_admin
+        assert not row.can_publish
+        # The SSO session reflects it: a publish token is refused.
+        resp = await app_client.post(
+            "/api/auth/tokens", json={"name": "t", "scopes": ["publish"]}, headers=SAME_ORIGIN
+        )
+        assert resp.status_code == 403
+
+    async def test_an_explicit_grant_survives_demotion(self, app_client, provider):
+        provider.update({"sub": "lead", "preferred_username": "lead", "groups": ["minireg-admins"]})
+        assert (await sso(app_client)).status_code == 302
+        app_client.cookies.clear()
+        provider.update({"groups": []})
+        assert (await sso(app_client)).status_code == 302
+        app_client.cookies.clear()
+        uid = (await user_row("lead")).id
+        resp = await app_client.patch(
+            f"/api/admin/users/{uid}", json={"can_publish": True}, headers=auth(app_client, "admin")
+        )
+        assert resp.status_code == 200
+        # Promoted and demoted again: the admin's grant stays.
+        provider.update({"groups": ["minireg-admins"]})
+        assert (await sso(app_client)).status_code == 302
+        app_client.cookies.clear()
+        provider.update({"groups": []})
+        assert (await sso(app_client)).status_code == 302
+        row = await user_row("lead")
+        assert not row.is_admin
+        assert row.can_publish
+
+    async def test_a_publisher_promoted_and_demoted_keeps_publishing(self, app_client, provider):
+        """can_publish that predates the promotion was never implicit."""
+        provider.update(
+            {"sub": "p", "preferred_username": "p", "email": "pub@test", "email_verified": True,
+             "groups": ["minireg-admins"]}
+        )
+        assert (await sso(app_client)).status_code == 302
+        app_client.cookies.clear()
+        provider.update({"groups": []})
+        assert (await sso(app_client)).status_code == 302
+        row = await user_row("publisher")
+        assert not row.is_admin and row.can_publish

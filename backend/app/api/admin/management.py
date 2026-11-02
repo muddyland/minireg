@@ -168,6 +168,11 @@ async def update_user(
         if value is not None and getattr(user, field) != value:
             changes[field] = value
             setattr(user, field, value)
+    if "can_publish" in changes:
+        # An admin changed this explicitly, so it is no longer the implicit
+        # grant an SSO admin-group demotion would take back. (The edit form
+        # always sends the field, so an unchanged value is not a decision.)
+        user.publish_via_oidc_admin = False
     if payload.password:
         if user.provider == AuthProvider.oidc:
             raise HTTPException(

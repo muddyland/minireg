@@ -130,6 +130,10 @@ class User(Base):
     session_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     can_publish: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # can_publish was switched on only because the identity provider put this
+    # account in the admin group. Demotion takes it away again; an explicit
+    # grant by an admin clears the flag, so that one survives.
+    publish_via_oidc_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     provider: Mapped[AuthProvider] = mapped_column(
         Enum(AuthProvider, native_enum=False, length=16), default=AuthProvider.local, nullable=False

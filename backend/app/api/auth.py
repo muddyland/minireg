@@ -743,10 +743,17 @@ async def oidc_callback(
         created = True
 
     # Group membership is authoritative on every login, so revoking a group in
-    # Authentik takes effect immediately here.
+    # Authentik takes effect immediately here. Admins may publish; when that
+    # is the only reason this account can, demotion takes it away again --
+    # it used to stay, so a demoted admin kept publishing.
     user.is_admin = profile.is_admin
     if profile.is_admin:
-        user.can_publish = True
+        if not user.can_publish:
+            user.can_publish = True
+            user.publish_via_oidc_admin = True
+    elif user.publish_via_oidc_admin:
+        user.can_publish = False
+        user.publish_via_oidc_admin = False
     user.email = profile.email or user.email
     user.full_name = profile.full_name or user.full_name
     user.last_login_at = datetime.now(UTC)

@@ -108,6 +108,7 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("upstreams", "require_digest", "BOOLEAN NOT NULL DEFAULT TRUE"),
     ("users", "session_version", "INTEGER NOT NULL DEFAULT 0"),
     ("api_tokens", "docker_repo_prefixes", "JSONB"),
+    ("users", "publish_via_oidc_admin", "BOOLEAN NOT NULL DEFAULT FALSE"),
 ]
 
 # One-off corrections to existing rows, applied at startup after the columns

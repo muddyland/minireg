@@ -431,7 +431,12 @@ Issuer* field.
 
 Group membership is re-applied on **every** sign-in, so removing someone from
 the admin group demotes them the next time they log in — you do not have to
-touch the local account.
+touch the local account. Admins may publish, so promotion switches publishing
+on for an account that did not have it; demotion switches it off again,
+unless an admin has since set **Can publish** on the account by hand.
+Accounts promoted by a release before this rule existed cannot be told
+apart and keep publishing after demotion; untick it under **Users** if that
+is not wanted.
 
 An OIDC login whose email matches an existing local account links to it rather
 than creating a duplicate — only when the provider says the email is
