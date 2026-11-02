@@ -361,6 +361,12 @@ Operator-visible changes:
   generate one (`python3 -c "import secrets; print(secrets.token_urlsafe(32))"`);
   Valkey holds only caches, so nothing needs migrating. Both go into URLs, so
   keep them URL-safe.
+- **Two new columns on `package_versions`** (`has_advisories`,
+  `is_malicious`) are added and backfilled from the stored advisory links at
+  startup. A version that has no advisories is no longer caught by a CVE range
+  starting at 0, and a version named by a `MAL-*` advisory is blocked
+  whenever the CVE policy is enabled, also with **Only block when a fix
+  exists** on. See [Package policy](policy.md#cve-policy).
 - **Postgres and Valkey moved to an internal network.** They are on `backend`
   (no route out, only the app attached); the scanner stays on `minireg` with
   the app. `docker compose up -d` recreates the containers. Anything else you
