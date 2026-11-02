@@ -97,7 +97,7 @@ Mounted at `/pypi`.
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/pypi/simple/` | Project index. HTML or JSON by content negotiation |
-| `GET` | `/pypi/simple/{project}/` | Project detail. Non-normalized names 301 to the PEP 503 form |
+| `GET` | `/pypi/simple/{project}/` | Project detail. Non-normalized names 301 to the PEP 503 form, keeping the query string |
 | `GET` | `/pypi/files/{project}/{filename}` | Artifact |
 | `GET` | `/pypi/files/{project}/{filename}.metadata` | PEP 658 metadata sidecar |
 | `GET` | `/pypi/{project}/json` | Warehouse-compatible JSON (subset) |
@@ -122,7 +122,11 @@ by name: an `Accept` of `text/html` or `*/*`, or no `Accept` at all, gets
 the project page advertises each with the sha256 of exactly those bytes.
 
 Advertised API version is **1.1** (PEP 700). Implements PEP 503, 592, 629, 658,
-691, 700, and 714.
+691, 700, and 714. The one exception: a JSON project page listing a file whose
+size is not known yet (not yet cached, from an upstream that only serves
+PEP 503 HTML) leaves `size` out for that file and declares `1.0`, where `size`
+is not defined, rather than send a false `0`. The page returns to `1.1` once
+the file is cached and the rendered page's cache (`META_CACHE_TTL`) expires.
 
 ---
 

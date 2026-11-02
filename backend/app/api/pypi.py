@@ -148,10 +148,15 @@ async def simple_project(
     normalized = normalize_pypi_name(project)
 
     # PEP 503 requires the normalized URL; redirect so caches stay coherent.
+    # The query string goes along: `?format=` is PEP 691 negotiation, and
+    # dropping it turned a JSON request into an HTML answer.
     if project != normalized:
+        location = pypi_render.project_url(normalized)
+        if request.url.query:
+            location += f"?{request.url.query}"
         return Response(
             status_code=status.HTTP_301_MOVED_PERMANENTLY,
-            headers={"location": f"{settings.pypi_base}/simple/{normalized}/"},
+            headers={"location": location},
         )
 
     policy = PolicyEngine(session)

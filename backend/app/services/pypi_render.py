@@ -10,7 +10,9 @@ PEP 691  JSON Simple API
 PEP 700  ``versions`` key, mandatory ``size``, optional ``upload-time``
 PEP 714  ``core-metadata`` (with the ``dist-info-metadata`` alias retained)
 
-We advertise API version 1.1, which is exactly the feature set above. Digests
+We advertise API version 1.1, which is exactly the feature set above, except
+on a JSON project page listing a file whose size we do not know yet (see
+``BASE_API_VERSION``). Digests
 go in the URL fragment for HTML (PEP 503) and in the ``hashes`` object for JSON
 (PEP 691); pip verifies both.
 """
@@ -28,8 +30,17 @@ from ..config import settings
 from ..core.naming import normalize_pypi_name, sort_pypi_versions
 from ..models import Package, PackageFile, PackageVersion
 from .pypi_publish import stored_metadata_bytes
+from .storage import get_store
 
 API_VERSION = "1.1"
+#: Declared by a JSON project page holding a file whose size is unknown (an
+#: uncached file from an HTML-only upstream). PEP 700 requires ``size`` on
+#: every file at 1.1; 1.0 has no such key, and clients ignore the extra
+#: ``versions`` and ``upload-time`` keys there (PEP 691). Saying 0 instead
+#: would be a false size, and fetching every size upstream to render one page
+#: would turn a page view into a request per file. HTML has no size field, so
+#: HTML pages stay at 1.1.
+BASE_API_VERSION = "1.0"
 
 JSON_CONTENT_TYPE = "application/vnd.pypi.simple.v1+json"
 HTML_CONTENT_TYPE = "application/vnd.pypi.simple.v1+html"
@@ -175,6 +186,20 @@ def _hashes_for(file_row: PackageFile) -> dict[str, str]:
     return hashes
 
 
+def _known_size(file_row: PackageFile) -> int | None:
+    """The file's size in bytes, or None while nobody knows it.
+
+    An HTML-only (PEP 503) upstream does not state sizes, so an uncached file
+    from one has none. Once cached, the fill records it on the row; a row
+    cached before that was recorded still has the blob to ask.
+    """
+    if file_row.size:
+        return file_row.size
+    if file_row.blob_sha256:
+        return get_store().size_of(file_row.blob_sha256)
+    return None
+
+
 def _upload_time(file_row: PackageFile) -> str | None:
     """PEP 700 format: ``yyyy-mm-ddThh:mm:ssZ``, UTC."""
     when = file_row.upload_time
@@ -194,6 +219,7 @@ def render_project_json(
     excluded = excluded_versions or set()
     files: list[dict[str, Any]] = []
     versions: list[str] = []
+    sizes_known = True
 
     for version_row in package.versions:
         if version_row.version in excluded:
@@ -205,9 +231,15 @@ def render_project_json(
                 "url": file_url(package.name, file_row.filename),
                 # PEP 691 requires the key even when we have no digest.
                 "hashes": _hashes_for(file_row),
-                # PEP 700 makes size mandatory.
-                "size": file_row.size or 0,
             }
+            # PEP 700 makes size mandatory at API version 1.1. A size we do
+            # not know is left out rather than sent as 0, and the document
+            # then declares 1.0 (below), where size is not part of the spec.
+            size = _known_size(file_row)
+            if size is not None:
+                entry["size"] = size
+            else:
+                sizes_known = False
             requires_python = file_row.requires_python or version_row.requires_python
             if requires_python:
                 entry["requires-python"] = requires_python
@@ -229,7 +261,7 @@ def render_project_json(
             files.append(entry)
 
     return {
-        "meta": {"api-version": API_VERSION},
+        "meta": {"api-version": API_VERSION if sizes_known else BASE_API_VERSION},
         "name": normalize_pypi_name(package.name),
         "files": files,
         "versions": sort_pypi_versions(versions),
@@ -353,7 +385,7 @@ def render_json_api_project(
                 "packagetype": f.packagetype,
                 "python_version": f.python_version,
                 "requires_python": f.requires_python,
-                "size": f.size or 0,
+                "size": _known_size(f) or 0,
                 "digests": _hashes_for(f),
                 "yanked": bool(f.yanked),
                 "yanked_reason": f.yanked_reason,

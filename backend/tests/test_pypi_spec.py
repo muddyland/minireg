@@ -114,6 +114,24 @@ class TestJsonProjectPage:
     def test_name_is_normalized(self, doc):
         assert doc["name"] == "my-package"
 
+    def test_unknown_size_is_left_out_not_zeroed(self):
+        # An uncached file from an HTML-only upstream: nobody knows its size.
+        # PEP 700 makes size mandatory at 1.1, so 0 would be a lie and a
+        # missing key a violation; the page declares 1.0 instead.
+        package = make_pypi_package()
+        unknown = package.versions[0].files[0]
+        unknown.size = None
+        unknown.blob_sha256 = None
+        doc = render_project_json(package)
+        assert doc["meta"]["api-version"] == "1.0"
+        by_name = {entry["filename"]: entry for entry in doc["files"]}
+        assert "size" not in by_name[unknown.filename]
+        assert all(
+            entry["size"] == 1024 for name, entry in by_name.items() if name != unknown.filename
+        )
+        # HTML has no size field; PEP 700 leaves it unchanged at 1.1.
+        assert f'content="{API_VERSION}"' in render_project_html(package)
+
     def test_required_file_keys(self, doc):
         for entry in doc["files"]:
             # PEP 691: filename, url, hashes are required.

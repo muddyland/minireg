@@ -10,6 +10,8 @@ import io
 import zipfile
 from datetime import UTC, datetime
 
+from sqlalchemy import update
+
 from app import db as db_module
 from app.models import Ecosystem, Package, PackageFile, PackageVersion, RetiredVersion, Setting
 from app.services.policy import invalidate_policy_cache
@@ -252,3 +254,40 @@ class TestWheelMetadata:
         assert 'data-requires-python="&gt;=3.10"' in html
         api = (await app_client.get("/pypi/mdpkg/json")).json()
         assert api["info"]["requires_python"] == ">=3.10"
+
+
+# --------------------------------------------------------------------------- #
+# Simple API details
+# --------------------------------------------------------------------------- #
+class TestSimpleApi:
+    async def test_normalizing_redirect_keeps_the_query(self, app_client):  # noqa: F811
+        response = await app_client.get("/pypi/simple/Foo_Bar/?format=json", follow_redirects=False)
+        assert response.status_code == 301
+        assert response.headers["location"].endswith("/pypi/simple/foo-bar/?format=json")
+        bare = await app_client.get("/pypi/simple/Foo_Bar/", follow_redirects=False)
+        assert bare.headers["location"].endswith("/pypi/simple/foo-bar/")
+
+    async def test_redirected_format_query_still_negotiates_json(self, app_client):  # noqa: F811
+        assert (await upload_wheel(app_client, "foo-bar", "1.0")).status_code == 200
+        response = await app_client.get(
+            "/pypi/simple/Foo_Bar/?format=json", follow_redirects=True
+        )
+        assert response.headers["content-type"].startswith("application/vnd.pypi.simple.v1+json")
+        assert response.json()["name"] == "foo-bar"
+
+    async def test_size_falls_back_to_the_cached_blob(self, app_client):  # noqa: F811
+        content = build_wheel("sizepkg", "1.0")
+        filename = "sizepkg-1.0-py3-none-any.whl"
+        response = await upload(
+            app_client, "sizepkg", "1.0", filename, content, filetype="bdist_wheel"
+        )
+        assert response.status_code == 200, response.text
+        # A row cached before its size was recorded.
+        async with db_module.session_scope() as session:
+            await session.execute(update(PackageFile).values(size=None))
+
+        doc = (await app_client.get("/pypi/simple/sizepkg/", headers=JSON)).json()
+        assert doc["meta"]["api-version"] == "1.1"
+        assert doc["files"][0]["size"] == len(content)
+        api = (await app_client.get("/pypi/sizepkg/json")).json()
+        assert api["releases"]["1.0"][0]["size"] == len(content)
