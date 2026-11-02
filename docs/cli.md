@@ -429,6 +429,9 @@ minireg audit --refresh    # re-query OSV even for versions already scanned
 ```
 
 `--offline` is instant but blind to anything this registry has never served.
+`--refresh` is the opposite: it asks OSV again even about versions the
+registry already has CVE data for, so an advisory published since its last
+refresh shows up now. The two cannot be combined.
 Without it, anything the registry lacks CVE data for is looked up on demand —
 including packages it has mirrored but not yet scanned, which is the normal
 state of a new registry.
@@ -505,6 +508,9 @@ for a person and a pipeline with no branching.
 
 ### Global flags
 
+`--url` and `--insecure` go before or after the command
+(`minireg --url URL whoami` and `minireg whoami --url URL` are the same).
+
 | Flag | Purpose |
 |---|---|
 | `--url URL` | Override the stored registry |
@@ -553,7 +559,7 @@ a side effect of traffic it was making anyway and says one line when it has
 fallen behind:
 
 ```
-  note: this registry ships CLI 1.4.0, you have 1.3.0 — run 'minireg update'
+  note: this registry ships CLI 1.5.0, you have 1.4.0 — run 'minireg update'
 ```
 
 That costs no extra request, and it goes to stderr — piping `--json` output

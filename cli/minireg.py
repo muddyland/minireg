@@ -51,7 +51,7 @@ if sys.version_info < MIN_PYTHON:
     )
     raise SystemExit(1)
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 DEFAULT_TIMEOUT = 30
 USER_AGENT = f"minireg-cli/{__version__}"
@@ -1147,7 +1147,12 @@ def audit_request(registry, token, ecosystem, packages, args) -> dict:
             registry,
             "/api/cli/audit",
             "POST",
-            {"ecosystem": ecosystem, "packages": chunk, "scan_unknown": not args.offline},
+            {
+                "ecosystem": ecosystem,
+                "packages": chunk,
+                "scan_unknown": not args.offline,
+                "refresh": bool(getattr(args, "refresh", False)),
+            },
             token=token,
             timeout=180,
             insecure=args.insecure,
@@ -2003,9 +2008,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--insecure", action="store_true", help="skip TLS verification (development only)"
     )
+    # The same two options again on every subcommand, so they can follow it
+    # (`minireg login --url ...`, the documented first command) as well as
+    # precede it. SUPPRESS as the default: a subcommand that was not given
+    # them must leave the top-level values alone rather than reset them.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--url", default=argparse.SUPPRESS, help="registry URL (defaults to the stored one)"
+    )
+    common.add_argument(
+        "--insecure",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="skip TLS verification (development only)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    login = sub.add_parser("login", help="authenticate via the browser")
+    login = sub.add_parser("login", parents=[common], help="authenticate via the browser")
     login.add_argument("--no-browser", action="store_true", help="do not open a browser")
     login.add_argument(
         "--scopes",
@@ -2014,18 +2033,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     login.set_defaults(func=cmd_login)
 
-    sub.add_parser("logout", help="forget the stored token").set_defaults(func=cmd_logout)
+    sub.add_parser("logout", parents=[common], help="forget the stored token").set_defaults(
+        func=cmd_logout
+    )
 
-    update = sub.add_parser("update", help="update this CLI from the registry")
+    update = sub.add_parser("update", parents=[common], help="update this CLI from the registry")
     update.add_argument(
         "--check", action="store_true", help="report whether an update exists, exit 1 if so"
     )
     update.add_argument("--force", action="store_true", help="reinstall even if versions match")
     update.set_defaults(func=cmd_update)
-    sub.add_parser("whoami", help="show the current identity").set_defaults(func=cmd_whoami)
+    sub.add_parser("whoami", parents=[common], help="show the current identity").set_defaults(
+        func=cmd_whoami
+    )
 
     configure = sub.add_parser(
-        "configure", help="point npm / pip / cargo / docker at the registry"
+        "configure", parents=[common], help="point npm / pip / cargo / docker at the registry"
     )
     configure.add_argument(
         "target",
@@ -2041,7 +2064,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     configure.set_defaults(func=cmd_configure)
 
-    audit_cmd = sub.add_parser("audit", help="check this project's dependencies for CVEs")
+    audit_cmd = sub.add_parser("audit", parents=[common], help="check this project's dependencies for CVEs")
     audit_cmd.add_argument("path", nargs="?", default=".", help="project directory or lockfile")
     audit_cmd.add_argument(
         "--fail-on",
@@ -2065,8 +2088,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="treat dependencies that could not be checked as acceptable",
     )
-    audit_cmd.add_argument(
+    freshness = audit_cmd.add_mutually_exclusive_group()
+    freshness.add_argument(
         "--offline", action="store_true", help="do not scan packages the registry has not seen"
+    )
+    freshness.add_argument(
+        "--refresh",
+        action="store_true",
+        help="re-query OSV even for versions the registry has already scanned",
     )
     audit_cmd.add_argument(
         "--fix",
@@ -2097,13 +2126,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit_cmd.set_defaults(func=cmd_audit)
 
-    search = sub.add_parser("search", help="search the registry")
+    search = sub.add_parser("search", parents=[common], help="search the registry")
     search.add_argument("query")
     search.add_argument("--ecosystem", choices=["npm", "pypi", "cargo", "docker"])
     search.add_argument("--limit", type=int, default=25)
     search.set_defaults(func=cmd_search)
 
-    info_cmd = sub.add_parser("info", help="show a package or container image")
+    info_cmd = sub.add_parser("info", parents=[common], help="show a package or container image")
     info_cmd.add_argument("package", help="package name, or an image reference with --ecosystem docker")
     info_cmd.add_argument(
         "--ecosystem",
