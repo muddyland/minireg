@@ -156,3 +156,25 @@ async def test_version_route_resolves_latest_like_the_packument(env):
     assert nxt.status_code == 403
     assert "blocked" in nxt.json()["error"]
     assert (await client.get("/npm/vdoc/nonesuch")).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Build metadata
+# --------------------------------------------------------------------------- #
+async def test_build_metadata_cannot_reuse_a_withdrawn_or_taken_version(env):
+    """``1.0.0+r`` is 1.0.0 to every range and installer, but was stored as
+    its own string: it passed both the tombstone of an unpublished 1.0.0 and
+    the duplicate check beside a live 1.1.0."""
+    client, tokens = env
+    as_user(client, tokens["alice"])
+    for version in ("1.0.0", "1.1.0"):
+        assert (await client.put("/npm/tomb", json=publish_body("tomb", version))).status_code == 201
+    assert (await client.delete("/npm/tomb/-/tomb-1.0.0.tgz/-rev/1")).status_code == 200
+    assert (await client.put("/npm/tomb", json=publish_body("tomb", "1.0.0", b"x"))).status_code == 409
+
+    for sneaky in ("1.0.0+r", "1.1.0+dup", "2.0.0-rc.1+b5"):
+        response = await client.put("/npm/tomb", json=publish_body("tomb", sneaky, b"bad"))
+        assert response.status_code == 400, (sneaky, response.text)
+        assert "build metadata" in response.json()["error"]
+
+    assert sorted((await client.get("/npm/tomb")).json()["versions"]) == ["1.1.0"]

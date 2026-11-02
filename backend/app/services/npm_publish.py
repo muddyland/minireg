@@ -126,6 +126,16 @@ def parse_publish_document(doc: Any, path_name: str) -> PublishRequest:
     for version, meta in versions.items():
         if not is_valid_semver(version):
             raise PublishError(f"'{version}' is not a valid semver version")
+        if "+" in version:
+            # Build metadata does not take part in precedence: 1.0.0+r *is*
+            # 1.0.0 to every semver range, lockfile and `npm install`. Stored
+            # as a separate string it walked past the duplicate check and
+            # the unpublish tombstone of 1.0.0. npm itself never sends it --
+            # `npm publish` normalises the manifest with semver.clean().
+            raise PublishError(
+                f"version '{version}' carries build metadata; publish "
+                f"'{version.split('+', 1)[0]}' instead (npm ignores everything after '+')"
+            )
         if not isinstance(meta, dict):
             raise PublishError(f"version '{version}' metadata must be an object")
         declared = meta.get("version")
