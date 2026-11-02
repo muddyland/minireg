@@ -15,8 +15,15 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..core.cache import rate_limit, rate_limit_retry_after
-from ..core.deps import Identity, client_ip, require_primary_credential, require_user, resolve_identity
+from ..core.deps import (
+    Identity,
+    begin_login_attempt,
+    client_ip,
+    forgive_login_attempt,
+    require_primary_credential,
+    require_user,
+    resolve_identity,
+)
 from ..core.security import (
     create_session_token,
     create_state_token,
@@ -112,18 +119,14 @@ async def login(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     ip = client_ip(request)
-    # Throttle by IP *and* username so neither a single source nor a single
-    # account can be brute-forced. Fail closed: with the cache down these fall
-    # back to an in-process counter instead of letting every guess through.
-    # The Basic-auth path in core/deps.py shares these buckets and already did.
-    for key in (f"login:ip:{ip}", f"login:user:{payload.username}"):
-        allowed, _ = await rate_limit(key, settings.rate_limit_login_per_minute, fail_closed=True)
-        if not allowed:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="too many login attempts; try again shortly",
-                headers={"Retry-After": str(rate_limit_retry_after())},
-            )
+    # Throttle by IP, by account and by the pair, so neither a single source
+    # nor a single account can be brute-forced, while a stranger guessing at
+    # someone's name only throttles their own address. Only failures count.
+    # Fail closed: with the cache down these fall back to an in-process
+    # counter. The Basic-auth path in core/deps.py shares these buckets.
+    started = await begin_login_attempt(
+        ip or "unknown", payload.username, detail="too many login attempts; try again shortly"
+    )
 
     user = (
         await session.execute(select(User).where(User.username == payload.username))
@@ -162,6 +165,7 @@ async def login(
         await session.commit()
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account is disabled")
 
+    await forgive_login_attempt(ip or "unknown", payload.username, started)
     if needs_rehash(user.password_hash or ""):
         user.password_hash = hash_password(payload.password)
 

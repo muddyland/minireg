@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 
 from app import db as db_module
 from app.config import settings
-from app.core import security
+from app.core import cache, security
 from app.models import ApiToken, Package, User
 from tests import test_integration as _integration
 from tests.test_integration import auth, npm_publish_body
@@ -176,3 +176,92 @@ class TestEveryLoginPaysForOneVerify:
         )
         assert resp.status_code == 401
         assert len(verifies) == 1
+
+
+# --------------------------------------------------------------------------- #
+class TestLoginThrottleCountsOnlyFailures:
+    """Every Basic-password request -- successes included -- was counted in
+    the login buckets, so a client sending its password got 429 after ten
+    requests a minute and locked its owner out of the web login too. And the
+    per-account bucket was global: ten wrong guesses from anywhere locked the
+    real user out of every client."""
+
+    @pytest.fixture(autouse=True)
+    def throttled(self, monkeypatch):
+        monkeypatch.setattr(settings, "rate_limit_enabled", True)
+        monkeypatch.setattr(settings, "rate_limit_login_per_minute", 3)
+
+        async def no_cache():
+            return None
+
+        # The in-process fallback the login buckets use with the cache down.
+        monkeypatch.setattr(cache, "ensure_redis", no_cache)
+        cache._local_counters.clear()
+        yield
+        cache._local_counters.clear()
+
+    @staticmethod
+    def frm(ip):
+        return {"x-forwarded-for": ip}
+
+    async def test_successes_are_not_counted(self, app_client):
+        statuses = [
+            (await app_client.get("/api/auth/me", headers=password_basic())).status_code
+            for _ in range(10)
+        ]
+        assert statuses == [200] * 10
+        await login(app_client)
+
+    async def test_a_stranger_cannot_lock_the_owner_out(self, app_client):
+        attacker = self.frm("203.0.113.66")
+        for _ in range(3):
+            resp = await app_client.post(
+                "/api/auth/login",
+                json={"username": "publisher", "password": "guess"},
+                headers=attacker,
+            )
+            assert resp.status_code == 401
+        # The attacker's address is throttled for this account...
+        resp = await app_client.post(
+            "/api/auth/login", json={"username": "publisher", "password": "guess"}, headers=attacker
+        )
+        assert resp.status_code == 429
+        assert resp.headers.get("retry-after")
+        # ...even with the right password, so guessing stays capped.
+        resp = await app_client.get(
+            "/api/auth/me", headers={**password_basic(), **attacker}
+        )
+        assert resp.status_code == 429
+        # The owner, elsewhere, is not.
+        owner = self.frm("198.51.100.7")
+        resp = await app_client.get("/api/auth/me", headers={**password_basic(), **owner})
+        assert resp.status_code == 200
+        resp = await app_client.post(
+            "/api/auth/login",
+            json={"username": "publisher", "password": "publisher-password-1"},
+            headers={**SAME_ORIGIN, **owner},
+        )
+        assert resp.status_code == 200
+
+    async def test_one_address_cannot_spray_many_accounts(self, app_client):
+        source = self.frm("203.0.113.67")
+        codes = []
+        for name in ("a1", "a2", "a3", "a4"):
+            resp = await app_client.post(
+                "/api/auth/login", json={"username": name, "password": "guess"}, headers=source
+            )
+            codes.append(resp.status_code)
+        assert codes == [401, 401, 401, 429]
+
+    async def test_a_distributed_guess_hits_the_account_ceiling(self, app_client):
+        # 3/min per address, 30/min per account across all addresses.
+        for n in range(30):
+            resp = await app_client.get(
+                "/api/auth/me",
+                headers={**password_basic("publisher", "guess"), **self.frm(f"203.0.113.{n}")},
+            )
+            assert resp.status_code == 401, n
+        resp = await app_client.get(
+            "/api/auth/me", headers={**password_basic(), **self.frm("198.51.100.8")}
+        )
+        assert resp.status_code == 429

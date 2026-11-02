@@ -191,6 +191,15 @@ the caller. Your reverse proxy must append rather than overwrite for this to
 be correct, which is what the nginx snippet in
 [installation](installation.md) does.
 
+`RATE_LIMIT_LOGIN_PER_MINUTE` counts **failed** password attempts (the login
+form and HTTP Basic with a password); a correct password is not counted, so a client that sends its
+password on every request never throttles itself. Failures are capped per
+client address, per account from one address, and per account from all
+addresses together at ten times the limit. Someone guessing at your username
+therefore throttles only their own address until the guessing is spread over
+many addresses, at which point the account itself is throttled for the rest
+of the minute.
+
 Login and CLI device-flow limits fall back to an in-process counter when the
 cache is unreachable, rather than failing open — a cache outage should not
 open the door to password guessing.

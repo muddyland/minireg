@@ -189,7 +189,7 @@ win when a fleet asks for hundreds of packages at once.
 | Upstream credentials encrypted at rest, never returned | The API can say *whether* one is set, never what it is |
 | Publishing always requires a token | Passwords are refused for publishing; an account password over HTTP Basic is read-only |
 | Digests verified before serving | A compromised upstream cannot poison the cache |
-| Login limited per IP **and** per username | Neither a single source nor a single account can be brute-forced |
+| Failed logins limited per IP, per username from that IP, and per username overall | Neither a single source nor a single account can be brute-forced, and a stranger cannot lock you out with ten guesses |
 | CLI login via device authorization | No password reaches the terminal; SSO works unchanged |
 | Blocks enforced on metadata, artifacts, and publish | No path bypasses policy |
 | Cookie-authenticated writes refused when cross-site | The cookie is the one credential a browser attaches on its own |

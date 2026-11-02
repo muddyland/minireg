@@ -287,8 +287,9 @@ the ones that matter for that job.
 - An `Authorization` header is authoritative — a rejected token never falls
   back to a session cookie. Sessions carry a version that a password change
   bumps, so changing it ejects every other session.
-- Login attempts limited per IP **and** per username, over Basic auth as well
-  as the login endpoint, and both outcomes audited. Those limits fall back to
+- Failed login attempts limited per IP, per username from that IP, and per
+  username overall (at a higher ceiling), over Basic auth as well as the
+  login endpoint, and both outcomes audited. Those limits fall back to
   an in-process counter rather than failing open if the cache is unreachable.
 - OIDC links to an existing local account only on a provider-verified email,
   and the login flow is bound to the browser that started it.

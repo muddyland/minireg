@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import ipaddress
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -23,7 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..core.cache import rate_limit, rate_limit_retry_after
+from ..core.cache import rate_limit, rate_limit_refund, rate_limit_retry_after
 from ..core.security import (
     decode_session_token,
     extract_bearer,
@@ -299,6 +300,66 @@ async def _token_identity(session: AsyncSession, presented: str) -> Identity | N
     return Identity(user=user, token=token, method="token")
 
 
+#: An account's failed logins from *all* addresses together may reach this
+#: many times RATE_LIMIT_LOGIN_PER_MINUTE before the account is throttled
+#: everywhere. Per address it is throttled at the plain limit.
+LOGIN_ACCOUNT_CEILING_FACTOR = 10
+
+
+def _login_buckets(ip: str, username: str) -> list[tuple[str, int]]:
+    """The fixed-window buckets one password attempt is counted in.
+
+    Per address, so one source cannot guess at many accounts; per account
+    *and* address, so one source cannot guess at one account; and per
+    account overall at a much higher ceiling, so a botnet spreading guesses
+    over many addresses is still capped. The account bucket used to be the
+    plain limit on its own: ten wrong guesses a minute from anywhere locked
+    the real owner out of every client.
+    """
+    per_minute = settings.rate_limit_login_per_minute
+    name = username[:150]
+    return [
+        (f"login:ip:{ip}", per_minute),
+        (f"login:user:{name}:ip:{ip}", per_minute),
+        (f"login:user:{name}", per_minute * LOGIN_ACCOUNT_CEILING_FACTOR),
+    ]
+
+
+async def begin_login_attempt(
+    ip: str, username: str, *, detail: str = "too many login attempts"
+) -> float:
+    """Count a password attempt against the login buckets, or raise 429.
+
+    The attempt is counted *before* the password is checked, so a burst of
+    concurrent guesses cannot all pass the limit before any is counted. Call
+    :func:`forgive_login_attempt` with the returned timestamp when the
+    password turns out to be right: only failures stay counted, so a client
+    sending its password on every request never throttles itself. Fails
+    closed (an in-process counter) when the cache is down.
+    """
+    started = time.time()
+    taken: list[tuple[str, int]] = []
+    for key, limit in _login_buckets(ip, username):
+        allowed, _ = await rate_limit(key, limit, fail_closed=True, now=started)
+        taken.append((key, limit))
+        if not allowed:
+            # Refused before any password was checked: not an attempt.
+            for k, lim in taken:
+                await rate_limit_refund(k, lim, fail_closed=True, now=started)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=detail,
+                headers={"Retry-After": str(rate_limit_retry_after())},
+            )
+    return started
+
+
+async def forgive_login_attempt(ip: str, username: str, started: float) -> None:
+    """Un-count an attempt from :func:`begin_login_attempt` that succeeded."""
+    for key, limit in _login_buckets(ip, username):
+        await rate_limit_refund(key, limit, fail_closed=True, now=started)
+
+
 async def _basic_password_identity(
     session: AsyncSession, request: Request, username: str, password: str
 ) -> Identity:
@@ -313,22 +374,11 @@ async def _basic_password_identity(
     :func:`require_primary_credential` refuses it, so a password sent this
     way can fetch packages but cannot publish, administer or mint tokens.
     """
-    from ..core.cache import rate_limit
     from ..core.security import verify_password
     from ..services.audit import LOGIN_FAILED, record_audit
 
     ip = client_ip(request) or "unknown"
-    for key, limit in (
-        (f"login:ip:{ip}", settings.rate_limit_login_per_minute),
-        (f"login:user:{username[:150]}", settings.rate_limit_login_per_minute),
-    ):
-        allowed, _ = await rate_limit(key, limit, fail_closed=True)
-        if not allowed:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="too many login attempts",
-                headers={"Retry-After": str(rate_limit_retry_after())},
-            )
+    started = await begin_login_attempt(ip, username)
 
     user = (
         await session.execute(select(User).where(User.username == username))
@@ -338,6 +388,7 @@ async def _basic_password_identity(
     # unknown names in microseconds, which enumerates accounts.
     password_ok = verify_password(password, user.password_hash if user else None)
     if user and user.is_active and password_ok:
+        await forgive_login_attempt(ip, username, started)
         return Identity(user=user, method=PASSWORD_BASIC)
 
     with contextlib.suppress(Exception):
