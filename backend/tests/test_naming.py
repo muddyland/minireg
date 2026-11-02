@@ -16,6 +16,7 @@ from app.core.naming import (
     npm_scope,
     npm_tarball_filename,
     parse_dist_filename,
+    pypi_versions_equal,
     sort_pypi_versions,
     sort_semver,
 )
@@ -91,6 +92,26 @@ class TestPEP440Versions:
         # Legacy upstream files must stay reachable even with junk versions.
         assert normalize_pypi_version("not-a-version") == "not-a-version"
 
+    @pytest.mark.parametrize(
+        ("a", "b", "equal"),
+        [
+            ("2.0", "2.0.0", True),
+            ("2", "2.0.0.0", True),
+            ("v1.0", "1.0.0", True),
+            ("1.0+local", "1.0.0+local", True),
+            ("1.0", "1.0.1", False),
+            ("1.0", "1.0.post0", False),
+            ("1.0", "1.0+local", False),
+            ("not-a-version", "not-a-version", True),
+            ("not-a-version", "1.0", False),
+        ],
+    )
+    def test_equality_ignores_trailing_zeros(self, a, b, equal):
+        # The storage key keeps them, so "is this the same release" cannot be
+        # answered by comparing keys.
+        assert pypi_versions_equal(a, b) is equal
+        assert pypi_versions_equal(b, a) is equal
+
     def test_ordering(self):
         versions = ["1.0", "1.0.1", "0.9", "2.0a1", "2.0", "1.0.post1", "1.0.dev1"]
         assert sort_pypi_versions(versions) == [
@@ -131,6 +152,12 @@ class TestDistFilenameParsing:
     def test_rejects_garbage(self):
         assert parse_dist_filename("not-a-package") is None
         assert parse_dist_filename("noversion.whl") is None
+
+    def test_egg_needs_a_real_version(self):
+        # Upstream indexes still list eggs; one whose "version" is not PEP 440
+        # is not a release and must not become one.
+        assert parse_dist_filename("eggpkg-latest.egg") is None
+        assert parse_dist_filename("eggpkg-1.0-py2.7.egg") == ("eggpkg", "1.0", "bdist_egg")
 
 
 class TestNpmNames:

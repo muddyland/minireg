@@ -5,6 +5,8 @@ the parts unit tests of pure functions cannot cover.
 """
 
 import base64
+import io
+import zipfile
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -319,9 +321,24 @@ class TestNpmPublishFlow:
         assert (await app_client.get("/npm/does-not-exist")).status_code == 404
 
 
+def build_wheel(name="my-package", version="1.0.0", extra: bytes = b"") -> bytes:
+    """The smallest wheel the upload accepts: one dist-info with METADATA."""
+    dist = name.replace("-", "_")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            f"{dist}-{version}.dist-info/METADATA",
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+        )
+        archive.writestr(f"{dist}/__init__.py", extra)
+    return buffer.getvalue()
+
+
 class TestPypiPublishFlow:
-    def _upload(self, name="my-package", version="1.0.0", filename=None, content=b"wheel-bytes"):
+    def _upload(self, name="my-package", version="1.0.0", filename=None, content=None):
         filename = filename or f"{name.replace('-', '_')}-{version}-py3-none-any.whl"
+        if content is None:
+            content = build_wheel(name, version)
         return (
             {
                 ":action": "file_upload",
@@ -373,7 +390,7 @@ class TestPypiPublishFlow:
         assert doc["meta"]["api-version"] == "1.1"
         assert doc["name"] == "my-package"
         assert doc["versions"] == ["1.0.0"]
-        assert doc["files"][0]["size"] == len(b"wheel-bytes")
+        assert doc["files"][0]["size"] == len(files["content"][1])
 
     async def test_non_normalized_url_redirects(self, app_client):
         response = await app_client.get("/pypi/simple/My.Package/", follow_redirects=False)
@@ -381,7 +398,7 @@ class TestPypiPublishFlow:
         assert response.headers["location"].endswith("/pypi/simple/my-package/")
 
     async def test_file_download_roundtrip(self, app_client):
-        payload = b"the-wheel-bytes-here"
+        payload = build_wheel(extra=b"the-wheel-bytes-here")
         data, files = self._upload(content=payload)
         await app_client.post(
             "/pypi/legacy/", data=data, files=files, headers=basic_auth(app_client)
@@ -405,7 +422,9 @@ class TestPypiPublishFlow:
         assert "already exists" in response.text
 
     async def test_only_one_sdist_per_release(self, app_client):
-        for filename in ("my_package-1.0.0.tar.gz", "my_package-1.0.0.zip"):
+        # Two spellings of the same sdist name; a .zip is no longer accepted
+        # as an sdist at all.
+        for filename in ("my_package-1.0.0.tar.gz", "my-package-1.0.0.tar.gz"):
             data, files = self._upload(filename=filename)
             data["filetype"] = "sdist"
             response = await app_client.post(
