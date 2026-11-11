@@ -371,6 +371,13 @@ All require an admin identity and, for token auth, the `admin` scope.
 **Policy** — `GET|POST /api/admin/rules`, `PATCH|DELETE /api/admin/rules/{id}`,
 `POST /api/admin/rules/test`, `POST /api/admin/rules/preview-spec`
 
+**Risk** — `GET /api/admin/risk` (`source=all|packages|images`, `min_severity`,
+`in_use_days`, `only_in_use`, `search`, `limit`): one row per vulnerability id
+across package advisories and image findings, exposed first;
+`GET /api/admin/risk/detail?id=CVE-…`: every affected package version (with
+its current policy verdict) and image (repository, tags, platform, package
+inside, fixed version, last pull)
+
 **Settings** — `GET /api/admin/settings`,
 `PUT /api/admin/settings/cve-policy`, `PUT /api/admin/settings/release-age`, `PUT /api/admin/settings/new-packages`, `PUT /api/admin/settings/allowlist-mode`
 

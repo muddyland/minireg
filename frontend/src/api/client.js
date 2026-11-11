@@ -109,6 +109,9 @@ export const api = {
   previewSpec: (payload) =>
     request('/api/admin/rules/preview-spec', { method: 'POST', body: payload }),
 
+  risk: (params) => request(`/api/admin/risk${qs(params)}`),
+  riskDetail: (id) => request(`/api/admin/risk/detail${qs({ id })}`),
+
   getSettings: () => request('/api/admin/settings'),
   updateCvePolicy: (payload) =>
     request('/api/admin/settings/cve-policy', { method: 'PUT', body: payload }),

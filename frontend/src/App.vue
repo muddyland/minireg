@@ -65,6 +65,9 @@ onMounted(() => auth.loadOidcStatus())
         <router-link v-if="auth.isAdmin" class="nav-link" :to="{ name: 'dashboard' }">
           <NavIcon name="dashboard" /> Dashboard
         </router-link>
+        <router-link v-if="auth.isAdmin" class="nav-link" :to="{ name: 'risk' }">
+          <NavIcon name="alert" /> Risk
+        </router-link>
         <router-link class="nav-link" :to="{ name: 'setup' }">
           <NavIcon name="setup" /> Client setup
         </router-link>
