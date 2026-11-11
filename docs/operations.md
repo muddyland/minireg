@@ -46,6 +46,8 @@ An hourly loop inside the app handles:
 |---|---|
 | Log retention | Prunes `download_log` and `audit_log` past their retention windows |
 | Orphan collection | Deletes blobs no package file references, and blob files with no database row once they are 24 hours old |
+| Expiry | Evicts cached artifacts nobody downloaded, and cached images nobody pulled, for 90 days (**Storage → Cache cleanup**). See [Eviction](#eviction) |
+| Download rollup | Rolls closed days of `download_log` up into the daily tables the dashboard reads |
 | Quota | With `STORAGE_QUOTA_BYTES` set, evicts cached upstream artifacts back down to 90% of it. See [Eviction](#eviction) |
 | Temp cleanup | Removes staging files orphaned by a crash |
 | Container images | Garbage collection, eviction, watched tags, and the `orphans` step, which reconciles image blob files that have had no database row for 6 hours (see [Container images](containers.md#storage)) |
@@ -83,8 +85,18 @@ before.
 
 ### Eviction
 
-**Storage → Purge cached artifacts.** Filter by ecosystem, age, and whether
-anything ever downloaded it.
+**Storage → Cache cleanup → Automatic.** A cached artifact nobody has
+downloaded for 90 days, and a cached image nobody has pulled for 90 days, is
+evicted by the hourly housekeeping. Both numbers are settings; 0 keeps
+everything. The cache otherwise only ever grows, which is the wrong default
+for the small disks a home or school registry runs on. Never expired: files
+published here, artifacts cached from a disabled upstream, images pushed
+here, pinned repositories and watched tags. An expired artifact or image is
+fetched from its upstream again on the next request, so the cost of expiring
+something still needed is one slower install.
+
+**Storage → Cache cleanup → Purge now.** Filter by ecosystem, age, and
+whether anything ever downloaded it.
 
 Evicted artifacts re-download from their upstream on next request. **Files
 published directly to this registry are never evicted** — there is nowhere to

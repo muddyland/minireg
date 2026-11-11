@@ -56,6 +56,7 @@ async def run_housekeeping() -> dict:
     for name, step in (
         ("uploads", _uploads),
         ("watch", _watch),
+        ("expire", _expire),
         ("evict", _evict),
         ("gc", _gc),
         ("orphans", _orphan_files),
@@ -372,6 +373,69 @@ async def _orphan_files() -> dict:
             freed,
         )
     return {"adopted": adopted, "deleted": deleted, "freed_bytes": freed}
+
+
+async def _expire(now: datetime | None = None) -> dict:
+    """Unlink cached images nobody has pulled for ``images_unused_days``.
+
+    Same exclusions as budget eviction: images pushed here, pinned
+    repositories and watched tags are never expired. GC deletes the layers
+    once nothing references them; a later pull fetches the image again.
+    """
+    from ..services.artifacts import load_cache_expiry
+
+    async with session_scope() as session:
+        days = (await load_cache_expiry(session)).images_unused_days
+        if not days:
+            return {"unused_days": 0}
+        cutoff = (now or datetime.now(UTC)) - timedelta(days=days)
+        candidates = (
+            await session.execute(
+                select(DockerRepoManifest, DockerManifest, DockerRepository)
+                .join(DockerManifest, DockerManifest.id == DockerRepoManifest.manifest_id)
+                .join(DockerRepository, DockerRepository.id == DockerRepoManifest.repository_id)
+                .where(
+                    DockerRepository.is_local.is_(False),
+                    DockerRepository.pinned.is_(False),
+                    DockerManifest.upstream_id.isnot(None),
+                    DockerRepoManifest.last_pulled_at < cutoff,
+                )
+                .order_by(DockerRepoManifest.last_pulled_at.asc())
+                .limit(2000)
+            )
+        ).all()
+        expired = 0
+        for link_row, manifest, repo in candidates:
+            if repo.watched_tags and await _has_watched_tag(session, repo, manifest):
+                continue
+            await session.execute(
+                delete(DockerTag).where(
+                    DockerTag.repository_id == repo.id, DockerTag.manifest_id == manifest.id
+                )
+            )
+            await session.delete(link_row)
+            expired += 1
+        await session.commit()
+    if expired:
+        bump("docker.expired", expired)
+        log.info("expired %d cached images not pulled for %d days", expired, days)
+    return {"expired": expired, "unused_days": days}
+
+
+async def _has_watched_tag(session: AsyncSession, repo, manifest) -> bool:
+    return bool(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(DockerTag)
+                .where(
+                    DockerTag.repository_id == repo.id,
+                    DockerTag.manifest_id == manifest.id,
+                    DockerTag.tag.in_(repo.watched_tags),
+                )
+            )
+        ).scalar_one()
+    )
 
 
 async def _evict() -> dict:

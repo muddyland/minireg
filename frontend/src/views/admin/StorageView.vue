@@ -12,6 +12,30 @@ const message = ref(null)
 const busy = ref(false)
 
 const purgeOptions = ref({ ecosystem: '', older_than_days: 30, unused_only: true })
+const expiry = ref({ packages_unused_days: 90, images_unused_days: 90 })
+const savingExpiry = ref(false)
+
+async function loadExpiry() {
+  try {
+    expiry.value = { ...(await api.getSettings()).cache_expiry }
+  } catch {
+    // The figures still render; the form keeps its defaults.
+  }
+}
+
+async function saveExpiry() {
+  savingExpiry.value = true
+  error.value = null
+  message.value = null
+  try {
+    expiry.value = await api.updateCacheExpiry(expiry.value)
+    message.value = 'Automatic cleanup saved.'
+  } catch (err) {
+    error.value = errorMessage(err, 'Could not save automatic cleanup.')
+  } finally {
+    savingExpiry.value = false
+  }
+}
 
 const diskUsed = computed(() =>
   stats.value ? percent(stats.value.disk.used, stats.value.disk.total) : 0,
@@ -78,7 +102,10 @@ async function gc() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadExpiry()
+})
 </script>
 
 <template>
@@ -201,13 +228,33 @@ onMounted(load)
       </div>
 
       <div class="card">
-        <div class="card-head"><h3>Package cache eviction</h3></div>
+        <div class="card-head"><h3>Cache cleanup</h3></div>
         <div class="card-body">
           <p class="dim small mb">
-            Evicted artifacts are re-downloaded from their upstream on the next request. Files
-            published directly to this registry are never evicted — there is nowhere to fetch them
-            from.
+            Evicted artifacts and images are fetched from their upstream again on the next request.
+            Files published to this registry, images pushed here, pinned repositories and watched
+            tags are never evicted — there is nowhere to fetch them from.
           </p>
+
+          <h4 class="small">Automatic</h4>
+          <div class="row" style="gap: 0.8rem">
+            <div class="field" style="flex: 1">
+              <label for="storage-expire-packages">Packages unused for (days)</label>
+              <input id="storage-expire-packages" v-model.number="expiry.packages_unused_days" type="number" min="0" max="3650" />
+            </div>
+            <div class="field" style="flex: 1">
+              <label for="storage-expire-images">Images unpulled for (days)</label>
+              <input id="storage-expire-images" v-model.number="expiry.images_unused_days" type="number" min="0" max="3650" />
+            </div>
+          </div>
+          <p class="field-hint" style="margin-top: -0.5rem">
+            Checked hourly. 0 keeps them forever. An artifact counts as used when it is downloaded,
+            an image when it is pulled.
+          </p>
+          <button class="btn btn-primary" :disabled="savingExpiry" @click="saveExpiry">Save</button>
+
+          <hr style="border: none; border-top: 1px solid var(--border); margin: 1.1rem 0" />
+          <h4 class="small">Purge now</h4>
 
           <div class="field">
             <label for="storage-purge-ecosystem">Ecosystem</label>
