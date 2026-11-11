@@ -10,7 +10,9 @@ Evaluation order:
 3. **Malware** — deny versions a malicious-package advisory names. On by default.
 4. **CVE score policy** — deny versions inside the configured score range. On
    by default for high and critical (7.0–10.0).
-5. **Hold on new releases** — deny releases a public registry published less
+5. **New packages** — deny every version of a package that first appeared on
+   a public registry less than 30 days ago. On by default.
+6. **Hold on new releases** — deny releases a public registry published less
    than 3 days ago. On by default.
 
 A fresh install protects its users without anyone opening this page: known
@@ -104,6 +106,42 @@ surviving version rather than left dangling at something that will not install.
 
 ---
 
+## New packages
+
+**Package policy → New releases and packages → Block new packages.** On by
+default, for 30 days.
+
+A package that first appeared on a public registry less than 30 days ago is
+refused outright, every version of it:
+
+```
+blocked as a new package: reqeusts-helper first appeared on its registry on
+2026-11-05 UTC, and this registry only serves packages that are at least 30
+days old, from 2026-12-05 UTC. A name that new is how typosquatted and
+AI-hallucinated packages are published: check this is the package you meant.
+If it is, ask an admin to exempt it
+```
+
+Attackers register the names people mistype (*typosquatting*) and the names
+AI assistants invent when they hallucinate a dependency (*slopsquatting*),
+then wait for someone to install them. Such a name is almost always days or
+weeks old; the packages people actually mean to use have usually existed for
+months or years. The message is written for whoever reads it, and that is
+increasingly an AI agent: it says the name may be wrong, which is what makes
+an agent go and check instead of looking for a way round the block.
+
+"First appeared" is npm's `time.created`; elsewhere it is the package's oldest
+release, when every release carries a date. A crate with releases from before
+crates.io started dating them (`pubtime`, 2025) is old by definition and
+never counts as new, and so is any package whose age is unknown.
+
+The same exemptions as the hold apply: packages published to this registry,
+upstreams that are not public, and **exempt** rules are never refused as new.
+Packages cached before this check existed are dated from their stored
+releases on the first start after upgrading.
+
+---
+
 ## Hold on new releases
 
 **Package policy → Hold new releases.** On by default, for 3 days.
@@ -146,12 +184,13 @@ What is never held:
 
 ### Exempt rules
 
-An **exempt** rule (**Add exemption**) skips the hold for what it matches:
-a pattern, optionally a version range, the same as any rule. Use it for a
-package you need on release day, or one you trust enough to take the risk.
+An **exempt** rule (**Add exemption**) skips the hold and the new-package
+check for what it matches: a pattern, optionally a version range, the same as
+any rule. Use it for a package you need on release day, a new package you
+have checked, or one you trust enough to take the risk.
 
-An exemption only skips the hold. A block rule, malware and the CVE policy
-still apply: they run first.
+An exemption only skips those two checks. A block rule, malware and the CVE
+policy still apply: they run first.
 
 ---
 

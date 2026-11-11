@@ -110,12 +110,25 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("package_versions", "is_malicious", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("docker_repo_manifests", "push_block_reason", "TEXT"),
     ("upstreams", "is_public", "BOOLEAN"),
+    ("packages", "first_published_at", "TIMESTAMP WITH TIME ZONE"),
 ]
 
 # Backfills for the columns above, run after them on every start. Each must be
 # idempotent (it runs again on every boot) and portable SQL (SQLite runs it
 # too). Keep the WHERE narrow so a re-run touches no rows.
 DATA_FIXES: list[str] = [
+    # first_published_at: packages cached before the column existed get their
+    # oldest upstream release, when every release has a date (an undated one
+    # means the package predates dates, so it stays NULL: not new). The next
+    # refresh from the upstream replaces this with npm's `time.created`.
+    "UPDATE packages SET first_published_at = ("
+    "SELECT MIN(v.published_at) FROM package_versions v "
+    "WHERE v.package_id = packages.id AND v.is_local = FALSE) "
+    "WHERE first_published_at IS NULL AND is_local = FALSE "
+    "AND EXISTS (SELECT 1 FROM package_versions v "
+    "WHERE v.package_id = packages.id AND v.is_local = FALSE) "
+    "AND NOT EXISTS (SELECT 1 FROM package_versions v "
+    "WHERE v.package_id = packages.id AND v.is_local = FALSE AND v.published_at IS NULL)",
     # An OIDC login used to link a local account by email but leave its
     # password in place, so the password kept working beside SSO -- past an
     # IdP group removal or a disabled IdP account. Linked accounts sign in

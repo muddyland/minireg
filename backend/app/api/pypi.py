@@ -197,7 +197,12 @@ async def simple_project(
 
     if excluded and len(excluded) == len(package.versions):
         return PlainTextResponse(
-            "all versions of this project are blocked by policy",
+            await policy.all_blocked_reason(
+                ECOSYSTEM,
+                package.normalized_name,
+                package.versions,
+                "all versions of this project are blocked by policy",
+            ),
             status_code=status.HTTP_403_FORBIDDEN,
         )
 

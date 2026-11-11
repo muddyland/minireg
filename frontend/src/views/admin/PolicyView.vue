@@ -68,6 +68,7 @@ const cve = ref({
   block_malware: true,
 })
 const releaseAge = ref({ enabled: true, min_days: 3, exempt_security_fixes: true })
+const newPackages = ref({ enabled: true, min_days: 30 })
 const allowlistMode = ref(false)
 
 const blockRules = computed(() => rules.value.filter((r) => r.action === 'block'))
@@ -85,6 +86,7 @@ async function load() {
     settings.value = s
     cve.value = { ...s.cve_policy }
     releaseAge.value = { ...s.release_age }
+    newPackages.value = { ...s.new_packages }
     allowlistMode.value = s.allowlist_mode
   } catch (err) {
     error.value = errorMessage(err, 'Could not load policy.')
@@ -178,11 +180,11 @@ async function saveReleaseAge() {
   error.value = null
   message.value = null
   try {
-    await api.updateReleaseAge(releaseAge.value)
-    message.value = 'Release hold saved.'
+    await Promise.all([api.updateReleaseAge(releaseAge.value), api.updateNewPackages(newPackages.value)])
+    message.value = 'New release and package settings saved.'
     await load()
   } catch (err) {
-    error.value = errorMessage(err, 'Could not save the release hold.')
+    error.value = errorMessage(err, 'Could not save the new release and package settings.')
   }
 }
 
@@ -342,9 +344,9 @@ onMounted(load)
     <div class="grid grid-2 mb">
       <div class="card">
         <div class="card-head">
-          <h3>Hold new releases</h3>
-          <span class="badge" :class="releaseAge.enabled ? 'badge-warn' : ''">
-            {{ releaseAge.enabled ? `${releaseAge.min_days} days` : 'off' }}
+          <h3>New releases and packages</h3>
+          <span class="badge" :class="releaseAge.enabled || newPackages.enabled ? 'badge-warn' : ''">
+            {{ releaseAge.enabled || newPackages.enabled ? 'enforcing' : 'off' }}
           </span>
         </div>
         <div class="card-body">
@@ -370,7 +372,24 @@ onMounted(load)
             A release an advisory names as the fix for an older version is not held, so the hold
             never keeps a vulnerable version in place.
           </p>
-          <button class="btn btn-primary mt" @click="saveReleaseAge">Save release hold</button>
+
+          <hr style="border: none; border-top: 1px solid var(--border); margin: 1.1rem 0" />
+
+          <p class="dim small mb">
+            Refuses packages that first appeared on a public registry recently. Attackers publish
+            under names people mistype and names AI assistants invent, then wait; the packages
+            people mean to use have usually existed for months.
+          </p>
+          <label class="check mb">
+            <input v-model="newPackages.enabled" type="checkbox" />
+            Block new packages
+          </label>
+          <div class="field">
+            <label for="policy-new-days">Serve packages once they are (days old)</label>
+            <input id="policy-new-days" v-model.number="newPackages.min_days" type="number" min="1" max="365" step="1" style="width: 110px" />
+          </div>
+
+          <button class="btn btn-primary mt" @click="saveReleaseAge">Save</button>
         </div>
       </div>
 
@@ -381,8 +400,9 @@ onMounted(load)
         </div>
         <div class="card-body tight">
           <p class="dim small" style="padding: 0.8rem 1rem 0">
-            Packages that skip the hold on new releases, for ones you trust or need on release day.
-            An exemption never overrides a block rule, malware or the CVE policy.
+            Packages that skip the hold on new releases and the new-package check: ones you trust,
+            or need on release day. An exemption never overrides a block rule, malware or the CVE
+            policy.
           </p>
           <div v-if="!exemptRules.length" class="empty">No exemptions.</div>
           <div v-else class="table-wrap">
@@ -503,7 +523,7 @@ onMounted(load)
           <select id="policy-rule-action" v-model="ruleForm.action">
             <option value="block">Block — never serve this package</option>
             <option value="allow">Allow — permit in allowlist mode</option>
-            <option value="exempt">Exempt — skip the hold on new releases</option>
+            <option value="exempt">Exempt — skip the new release and new package checks</option>
           </select>
         </div>
         <div class="field">

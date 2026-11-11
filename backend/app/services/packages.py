@@ -332,6 +332,27 @@ _HASH_COLUMNS = {
 }
 
 
+def first_published_at(remote) -> datetime | None:
+    """When ``remote`` first appeared on its registry, or None if unknown.
+
+    npm records it as ``time.created``. Elsewhere it is the oldest release,
+    but only when every release is dated: crates.io added ``pubtime`` in 2025
+    and an undated entry means the crate is older than that, so the oldest
+    *dated* release would make an old crate look new.
+    """
+    created = (remote.time or {}).get("created") if isinstance(remote.time, dict) else None
+    if isinstance(created, str):
+        try:
+            parsed = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    dates = [v.published_at for v in remote.versions]
+    if not dates or any(d is None for d in dates):
+        return None
+    return min(d if d.tzinfo else d.replace(tzinfo=UTC) for d in dates)
+
+
 async def persist_remote_package(
     session: AsyncSession,
     ecosystem: Ecosystem,
@@ -413,6 +434,10 @@ async def persist_remote_package(
         package.cached_document = remote.raw
     package.cached_etag = validators.encode() if validators else None
     package.cached_at = datetime.now(UTC)
+
+    first_published = first_published_at(remote)
+    if first_published is not None:
+        _set(package, "first_published_at", first_published)
 
     existing_versions = {v.normalized_version: v for v in package.versions}
     default_source = upstream.id if upstream else None
