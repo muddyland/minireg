@@ -31,6 +31,7 @@ const routes = [
   { path: '/admin/policy', name: 'policy', component: () => import('@/views/admin/PolicyView.vue'), meta: { admin: true } },
   { path: '/admin/container-upstreams', name: 'docker-upstreams', component: () => import('@/views/admin/DockerUpstreamsView.vue'), meta: { admin: true } },
   { path: '/admin/image-policy', name: 'image-policy', component: () => import('@/views/admin/ImagePolicyView.vue'), meta: { admin: true } },
+  { path: '/admin/risk', name: 'risk', component: () => import('@/views/admin/RiskView.vue'), meta: { admin: true } },
   { path: '/admin/security', name: 'security', component: () => import('@/views/admin/SecurityView.vue'), meta: { admin: true } },
   { path: '/admin/packages', name: 'admin-packages', component: () => import('@/views/admin/PackagesView.vue'), meta: { admin: true } },
   { path: '/admin/storage', name: 'storage', component: () => import('@/views/admin/StorageView.vue'), meta: { admin: true } },

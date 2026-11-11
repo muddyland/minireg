@@ -320,6 +320,25 @@ updates the denormalized per-version maximums the policy engine reads.
 
 ---
 
+## Where's my risk
+
+**Risk** (admins, top of the sidebar) lists every known vulnerability in your
+cached packages and images in one place, one row per vulnerability: a CVE
+that is in an npm version *and* in a container image is one row with both
+counted. What was served or pulled in the last 30 days (7 and 90 are a click
+away) is **in use** and sorts first, then anything on CISA's known-exploited
+list (KEV) or flagged as malware, then severity. That ordering is the point:
+a critical CVE in a version nobody has downloaded for a year matters less than
+a high one in an image every CI job pulls.
+
+"Served" means one of the version's cached artifacts was downloaded; "pulled"
+means a client fetched an affected image manifest. Expand a row to see which
+versions carry it and whether policy currently blocks them, and which images
+(repository, tags, platform, the package inside the image, its fixed version)
+were pulled when. Suppressed advisories are left out.
+
+---
+
 ## Testing before it bites
 
 **Package policy → Test a package against the policy.** Enter an ecosystem,
