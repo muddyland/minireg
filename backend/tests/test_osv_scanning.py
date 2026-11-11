@@ -458,6 +458,27 @@ class TestAdvisoryPresence:
             assert (await session.get(PackageVersion, clean_id)).has_advisories is False
 
 
+class TestCvePolicyDefaults:
+    def test_a_fresh_install_blocks_high_and_critical(self):
+        for policy in (CvePolicy(), CvePolicy.from_dict(None), CvePolicy.from_dict({})):
+            assert policy.enabled is True
+            assert policy.block_malware is True
+            assert policy.blocks(7.5, scanned=True)
+            assert policy.blocks(9.8, scanned=True)
+            assert not policy.blocks(6.9, scanned=True)
+            assert not policy.blocks(0.0, scanned=True, has_advisories=False)
+
+    def test_a_saved_policy_keeps_its_choice(self):
+        policy = CvePolicy.from_dict({"enabled": False, "min_score": 9.0, "max_score": 10.0})
+        assert policy.enabled is False
+        assert not policy.blocks(9.8, scanned=True)
+
+    async def test_the_settings_api_reports_the_defaults(self, db):
+        from app.api.admin.management import CvePolicyUpdate
+
+        assert CvePolicy(**CvePolicyUpdate().model_dump()) == CvePolicy()
+
+
 class TestCvePolicyZeroRange:
     def test_clean_is_never_in_range(self):
         policy = CvePolicy(enabled=True, min_score=0.0, max_score=10.0, block_unscored=True)
@@ -509,6 +530,40 @@ class TestMaliciousFlag:
                 malicious=row.is_malicious,
             )
         assert verdict.blocked
+
+    async def _malware_verdict(self, policy_value):
+        from app.models import Setting
+        from app.services.policy import KEY_CVE_POLICY, PolicyEngine
+
+        if policy_value is not None:
+            async with db_module.session_scope() as session:
+                session.add(Setting(key=KEY_CVE_POLICY, value=policy_value))
+        async with db_module.session_scope() as session:
+            return await PolicyEngine(session).evaluate(
+                "npm", "evil", "1.0.0", max_cvss=None, scanned=True,
+                has_advisories=True, malicious=True,
+            )
+
+    async def test_malware_is_blocked_on_a_fresh_install(self, db):
+        # No policy ever saved: the out-of-the-box posture.
+        verdict = await self._malware_verdict(None)
+        assert verdict.blocked
+        assert verdict.source == "malware"
+
+    async def test_malware_stays_blocked_with_the_cve_policy_off(self, db):
+        # A policy saved before the malware switch existed, with the score
+        # policy disabled: that used to serve malware.
+        verdict = await self._malware_verdict(
+            {"enabled": False, "min_score": 7.0, "max_score": 10.0}
+        )
+        assert verdict.blocked
+        assert verdict.source == "malware"
+
+    async def test_malware_is_served_only_when_explicitly_allowed(self, db):
+        verdict = await self._malware_verdict(
+            {"enabled": False, "min_score": 7.0, "max_score": 10.0, "block_malware": False}
+        )
+        assert verdict.allowed
 
     async def test_a_cached_malicious_record_still_flags_the_version(self, db):
         await seed_version("evil", "2.0.0")

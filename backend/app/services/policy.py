@@ -6,8 +6,10 @@ Evaluation order (deliberate, and the block list is *always* enforced):
    not an allow rule, not allowlist mode, not an admin's CVE suppression.
 2. Allowlist mode (optional). When enabled, a package must match an allow rule
    to pass. This is the "default deny" posture.
-3. CVE policy. A version whose highest CVSS score falls inside the configured
-   block range is denied, and so is one a malicious-package advisory names.
+3. Malware. A version a malicious-package (``MAL-*``) advisory names is denied.
+   This is its own switch, on by default, and does not depend on the CVE policy.
+4. CVE policy. A version whose highest CVSS score falls inside the configured
+   block range is denied.
 
 Rules are cached in Redis and in-process because they are consulted on every
 single request; the cache is invalidated whenever a rule is written.
@@ -43,7 +45,7 @@ class Verdict:
     allowed: bool
     reason: str | None = None
     rule_id: int | None = None
-    # "block_rule" | "allowlist" | "cve" | None
+    # "block_rule" | "allowlist" | "malware" | "cve" | None
     source: str | None = None
 
     @property
@@ -58,16 +60,23 @@ ALLOWED = Verdict(allowed=True)
 class CvePolicy:
     """Block when ``min_score <= max_cvss <= max_score``.
 
-    Defaults to disabled. ``block_unscored`` covers the fail-closed posture for
-    a package we could not scan in time.
+    Enabled by default, blocking high and critical (7.0-10.0): minireg is
+    meant to protect people who never open the policy page, so a fresh install
+    has to refuse known-dangerous releases on its own. ``block_unscored``
+    covers the fail-closed posture for a package we could not scan in time.
+
+    ``block_malware`` refuses versions a malicious-package advisory names. It
+    is independent of ``enabled``: turning the score range off is a choice
+    about vulnerable code, and must not quietly start serving malware too.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     min_score: float = 7.0
     max_score: float = 10.0
     block_unscored: bool = False
     # Deny only when the CVE has a fix available upstream, if set.
     require_fix_available: bool = False
+    block_malware: bool = True
 
     def blocks(
         self,
@@ -112,6 +121,7 @@ class CvePolicy:
             "max_score": self.max_score,
             "block_unscored": self.block_unscored,
             "require_fix_available": self.require_fix_available,
+            "block_malware": self.block_malware,
         }
 
     @classmethod
@@ -119,11 +129,14 @@ class CvePolicy:
         if not data:
             return cls()
         return cls(
-            enabled=bool(data.get("enabled", False)),
+            enabled=bool(data.get("enabled", True)),
             min_score=float(data.get("min_score", 7.0)),
             max_score=float(data.get("max_score", 10.0)),
             block_unscored=bool(data.get("block_unscored", False)),
             require_fix_available=bool(data.get("require_fix_available", False)),
+            # Saved before the switch existed: malware blocking was tied to
+            # `enabled` then, and is on for everyone now.
+            block_malware=bool(data.get("block_malware", True)),
         )
 
 
@@ -339,19 +352,23 @@ class PolicyEngine:
                     source="allowlist",
                 )
 
-        # 3. CVE score policy.
+        # 3. Malware.
         policy = await self.get_cve_policy()
-        if version is not None and policy.enabled and malicious:
+        if version is not None and policy.block_malware and malicious:
             # A malicious-package advisory says the release *is* malware.
             # There is no fixed version of a backdoor -- OSV records have no
             # `fixed` event -- so require_fix_available let every one of them
-            # through, and a score range is the wrong question to ask.
+            # through, and a score range is the wrong question to ask. It used
+            # to apply only while the CVE score policy was on, so an install
+            # that had never enabled it served known malware.
             return Verdict(
                 allowed=False,
-                reason="blocked by CVE policy: an OSV malicious-package advisory "
-                "names this version as malware",
-                source="cve",
+                reason="blocked as malware: an OSV malicious-package advisory "
+                "names this version as malicious",
+                source="malware",
             )
+
+        # 4. CVE score policy.
         if version is not None and policy.blocks(
             max_cvss, scanned=scanned, has_advisories=has_advisories
         ):

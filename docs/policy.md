@@ -7,7 +7,14 @@ Evaluation order:
 
 1. **Block rules** — if any matches, deny. Nothing overrides this.
 2. **Allowlist mode** (optional) — when on, a package must match an allow rule.
-3. **CVE score policy** — deny versions inside the configured score range.
+3. **Malware** — deny versions a malicious-package advisory names. On by default.
+4. **CVE score policy** — deny versions inside the configured score range. On
+   by default for high and critical (7.0–10.0).
+
+A fresh install protects its users without anyone opening this page: known
+malware and high/critical CVEs are refused from the first install. Everything
+here can be loosened, but loosening it is a decision someone makes, not the
+starting point.
 
 ---
 
@@ -110,7 +117,9 @@ deliberate block.
 
 ## CVE policy
 
-Blocks versions whose highest CVSS base score falls inside a range.
+Blocks versions whose highest CVSS base score falls inside a range. It is on
+by default, blocking 7.0–10.0 (high and critical). An install that saved its
+CVE policy before this default changed keeps what it saved.
 
 | Range | Effect |
 |---|---|
@@ -171,12 +180,17 @@ It never applies to malware: see below.
 
 ### Malicious packages
 
-A version named by a malicious-package advisory (`MAL-*`) is blocked whenever
-the CVE policy is enabled, whatever the range and whatever **Only block when a
-fix exists** says. Such an advisory says the release *is* malware; there is no
-fixed version of a backdoor, so the fix switch used to let every one of them
-through, and how it scores is not the question. Turn the CVE policy off and it
-is served like anything else.
+A version named by a malicious-package advisory (`MAL-*`) is blocked by
+**Block known malware**, which is on by default and does not depend on the CVE
+score policy: turning the score range off, narrowing it, or setting **Only
+block when a fix exists** never lets malware through. Such an advisory says
+the release *is* malware; there is no fixed version of a backdoor, and how it
+scores is not the question.
+
+Turn **Block known malware** off only on a registry used to study malware.
+Before this switch existed, malware was blocked only while the CVE policy was
+enabled; existing installs have it on after upgrading whatever their CVE
+policy says.
 
 ### Where scores come from
 
