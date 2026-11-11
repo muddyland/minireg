@@ -272,27 +272,6 @@ class BlobStore:
                 break
         return True
 
-    async def disk_usage(self) -> dict[str, int]:
-        def _walk() -> dict[str, int]:
-            total = count = 0
-            for dirpath, _dirs, files in os.walk(self.blobs_dir):
-                for name in files:
-                    try:
-                        total += os.stat(os.path.join(dirpath, name)).st_size
-                        count += 1
-                    except OSError:
-                        continue
-            usage = shutil.disk_usage(self.root) if self.root.exists() else None
-            return {
-                "blob_bytes": total,
-                "blob_count": count,
-                "disk_total": usage.total if usage else 0,
-                "disk_used": usage.used if usage else 0,
-                "disk_free": usage.free if usage else 0,
-            }
-
-        return await asyncio.to_thread(_walk)
-
     def cleanup_tmp(self, older_than_seconds: int = 3600) -> int:
         """Reap staging files, partial fills and fill markers left by a crash.
 
@@ -324,11 +303,15 @@ class BlobStore:
             return []
 
     @staticmethod
-    def scan_shard(shard: Path, cutoff: float) -> list[str]:
+    def scan_shard(shard: Path, cutoff: float, totals: dict | None = None) -> list[str]:
         """Names of blob files under one shard last modified before ``cutoff``.
 
         One shard is ~1/256 of the store, so the list stays small even for a
-        store of millions of blobs; the caller walks shard by shard.
+        store of millions of blobs; the caller walks shard by shard. When
+        ``totals`` is given, every blob file's size is added to
+        ``totals["bytes"]`` and counted in ``totals["files"]``: the hourly
+        sweep is the only walk of the store, and what it measures is what the
+        storage page shows.
         """
         found: list[str] = []
         for dirpath, _dirs, files in os.walk(shard):
@@ -336,11 +319,29 @@ class BlobStore:
                 if len(name) != 64 or not _is_hex(name):
                     continue
                 try:
-                    if os.stat(os.path.join(dirpath, name)).st_mtime < cutoff:
-                        found.append(name)
+                    stat = os.stat(os.path.join(dirpath, name))
                 except OSError:
                     continue
+                if totals is not None:
+                    totals["files"] = totals.get("files", 0) + 1
+                    totals["bytes"] = totals.get("bytes", 0) + stat.st_size
+                if stat.st_mtime < cutoff:
+                    found.append(name)
         return found
+
+    def disk_space(self) -> dict[str, int]:
+        """Size and free space of the volume holding the store.
+
+        A single statvfs, so it is safe on a request path. Walking the blob
+        tree (``disk_usage``) is not: it stats every file, which took the
+        dashboard and the storage page tens of seconds on a large store.
+        """
+        usage = shutil.disk_usage(self.root) if self.root.exists() else None
+        return {
+            "disk_total": usage.total if usage else 0,
+            "disk_used": usage.used if usage else 0,
+            "disk_free": usage.free if usage else 0,
+        }
 
     def delete_if_older(self, sha256: str, cutoff: float) -> int:
         """Delete a blob file unless it was modified since ``cutoff``.

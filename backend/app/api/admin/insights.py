@@ -12,7 +12,7 @@ import orjson
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import and_, desc, func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer, selectinload
 
@@ -35,7 +35,7 @@ from ...models import (
     User,
     Vulnerability,
 )
-from ...services import artifacts, audit, packages
+from ...services import artifacts, audit, packages, rollup
 from ...services.osv import OsvScanner
 from ...services.packages import _escape_like
 from ...services.provenance import package_upstreams
@@ -67,47 +67,26 @@ async def stats_overview(
             )
         ).all()
     )
-    version_count = (await session.execute(select(func.count(PackageVersion.id)))).scalar_one()
     # Indexing an upstream imports bare project names, which can be hundreds of
     # thousands of rows for public PyPI. Counting those as "packages" makes the
     # dashboard meaningless, so report them separately from packages we have
     # actually resolved content for.
-    with_content = (
+    version_count, with_content = (
         await session.execute(
-            select(func.count(func.distinct(PackageVersion.package_id)))
+            select(func.count(PackageVersion.id), func.count(func.distinct(PackageVersion.package_id)))
         )
-    ).scalar_one()
-    file_count = (await session.execute(select(func.count(PackageFile.id)))).scalar_one()
-    cached_count = (
-        await session.execute(
-            select(func.count(PackageFile.id)).where(PackageFile.blob_sha256.isnot(None))
-        )
-    ).scalar_one()
+    ).one()
+    file_count, cached_count = (
+        await session.execute(select(func.count(PackageFile.id), func.count(PackageFile.blob_sha256)))
+    ).one()
 
-    downloads_total = (
-        await session.execute(select(func.count(DownloadLog.id)).where(DownloadLog.ts >= since))
-    ).scalar_one()
-    artifact_downloads = (
-        await session.execute(
-            select(func.count(DownloadLog.id)).where(
-                DownloadLog.ts >= since, DownloadLog.kind == "file"
-            )
-        )
-    ).scalar_one()
-    bytes_served = (
-        await session.execute(
-            select(func.coalesce(func.sum(DownloadLog.bytes_sent), 0)).where(
-                DownloadLog.ts >= since
-            )
-        )
-    ).scalar_one()
-    cache_hits = (
-        await session.execute(
-            select(func.count(DownloadLog.id)).where(
-                DownloadLog.ts >= since, DownloadLog.cache_hit.is_(True)
-            )
-        )
-    ).scalar_one()
+    # One pass over the daily rollup (and today's raw rows) instead of four
+    # scans of the request log; see services.rollup.
+    counted = await rollup.totals(session, days)
+    downloads_total = counted["total"]
+    artifact_downloads = counted["artifacts"]
+    bytes_served = counted["bytes_served"]
+    cache_hits = counted["cache_hits"]
 
     user_count = (await session.execute(select(func.count(User.id)))).scalar_one()
     active_users = (
@@ -188,40 +167,15 @@ async def top_packages(
     kind: str = Query(default="file", pattern="^(file|metadata|all)$"),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    conditions = [DownloadLog.ts >= _since(days)]
-    if ecosystem is not None:
-        conditions.append(DownloadLog.ecosystem == ecosystem.value)
-    if kind != "all":
-        conditions.append(DownloadLog.kind == kind)
+    rows = await rollup.top_packages(
+        session,
+        days,
+        limit,
+        ecosystem=ecosystem.value if ecosystem is not None else None,
+        kind=None if kind == "all" else kind,
+    )
 
-    rows = (
-        await session.execute(
-            select(
-                DownloadLog.ecosystem,
-                DownloadLog.package_name,
-                func.count(DownloadLog.id).label("downloads"),
-                func.coalesce(func.sum(DownloadLog.bytes_sent), 0).label("bytes"),
-                func.count(func.distinct(DownloadLog.user_id)).label("distinct_users"),
-            )
-            .where(and_(*conditions))
-            .group_by(DownloadLog.ecosystem, DownloadLog.package_name)
-            .order_by(desc("downloads"))
-            .limit(limit)
-        )
-    ).all()
-
-    return {
-        "packages": [
-            {
-                "ecosystem": r.ecosystem,
-                "name": r.package_name,
-                "downloads": r.downloads,
-                "bytes": int(r.bytes or 0),
-                "distinct_users": r.distinct_users,
-            }
-            for r in rows
-        ]
-    }
+    return {"packages": rows}
 
 
 @router.get("/stats/downloads-timeline")
@@ -230,34 +184,13 @@ async def downloads_timeline(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Daily download counts, split by ecosystem, for the dashboard chart."""
-    from ...db import get_engine
-
-    # date_trunc is Postgres; SQLite needs a different expression for tests.
-    if get_engine().dialect.name == "postgresql":
-        bucket = func.date_trunc("day", DownloadLog.ts)
-    else:
-        bucket = func.date(DownloadLog.ts)
-
-    rows = (
-        await session.execute(
-            select(
-                bucket.label("day"),
-                DownloadLog.ecosystem,
-                func.count(DownloadLog.id).label("downloads"),
-                func.coalesce(func.sum(DownloadLog.bytes_sent), 0).label("bytes"),
-            )
-            .where(DownloadLog.ts >= _since(days))
-            .group_by("day", DownloadLog.ecosystem)
-            .order_by("day")
-        )
-    ).all()
-
+    rows = await rollup.timeline(session, days)
     return {
         "points": [
             {
-                "day": r.day.isoformat() if hasattr(r.day, "isoformat") else str(r.day),
+                "day": rollup.day_label(r.day),
                 "ecosystem": r.ecosystem,
-                "downloads": r.downloads,
+                "downloads": int(r.downloads or 0),
                 "bytes": int(r.bytes or 0),
             }
             for r in rows
@@ -303,7 +236,11 @@ async def recent_logins(
 
 @router.get("/stats/storage")
 async def storage_stats(session: AsyncSession = Depends(get_session)) -> dict:
-    usage = await get_store().disk_usage()
+    # The volume figures are one statvfs. The blob files on disk are counted
+    # by the hourly orphan sweep, which walks the store anyway; walking it
+    # again here on every page load is what made this page slow.
+    usage = await asyncio.to_thread(get_store().disk_space)
+    measured = await artifacts.disk_measurement(session)
 
     blob_rows = (
         await session.execute(
@@ -358,8 +295,9 @@ async def storage_stats(session: AsyncSession = Depends(get_session)) -> dict:
             "total": usage["disk_total"],
             "used": usage["disk_used"],
             "free": usage["disk_free"],
-            "blob_bytes_on_disk": usage["blob_bytes"],
-            "blob_files_on_disk": usage["blob_count"],
+            "blob_bytes_on_disk": measured["bytes"] if measured else None,
+            "blob_files_on_disk": measured["files"] if measured else None,
+            "measured_at": measured["measured_at"] if measured else None,
         },
         "blobs": {
             "count": blob_rows[0],

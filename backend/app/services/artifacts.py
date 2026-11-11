@@ -1060,8 +1060,9 @@ async def sweep_orphan_files(grace_seconds: int = ORPHAN_FILE_GRACE_SECONDS) -> 
     store = get_store()
     cutoff = time.time() - grace_seconds
     removed = freed = 0
+    totals: dict[str, int] = {"files": 0, "bytes": 0}
     for shard in store.shard_dirs():
-        candidates = await asyncio.to_thread(store.scan_shard, shard, cutoff)
+        candidates = await asyncio.to_thread(store.scan_shard, shard, cutoff, totals)
         for start in range(0, len(candidates), 500):
             batch = candidates[start : start + 500]
             async with session_scope() as session:
@@ -1079,7 +1080,34 @@ async def sweep_orphan_files(grace_seconds: int = ORPHAN_FILE_GRACE_SECONDS) -> 
                     freed += size
     if removed:
         log.info("removed %d unrecorded blob files (%d bytes)", removed, freed)
+    await record_disk_measurement(
+        max(0, totals["files"] - removed), max(0, totals["bytes"] - freed)
+    )
     return {"files": removed, "freed_bytes": freed}
+
+
+DISK_MEASUREMENT_KEY = "storage_measurement"
+
+
+async def record_disk_measurement(files: int, size: int) -> None:
+    """Keep what the hourly walk found, for the storage page to show."""
+    from ..models import Setting
+
+    value = {"files": files, "bytes": size, "measured_at": datetime.now(UTC).isoformat()}
+    async with session_scope() as session:
+        row = await session.get(Setting, DISK_MEASUREMENT_KEY)
+        if row is None:
+            session.add(Setting(key=DISK_MEASUREMENT_KEY, value=value, updated_by="housekeeping"))
+        else:
+            row.value = value
+
+
+async def disk_measurement(session: AsyncSession) -> dict | None:
+    """The last hourly measurement of the blob files on disk, if any."""
+    from ..models import Setting
+
+    row = await session.get(Setting, DISK_MEASUREMENT_KEY)
+    return row.value if row is not None and isinstance(row.value, dict) else None
 
 
 async def run_housekeeping() -> dict:
