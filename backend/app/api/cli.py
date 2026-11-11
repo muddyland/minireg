@@ -529,9 +529,15 @@ async def audit_packages(
         scanned = False
         has_advisories: bool | None = None
         malicious = False
+        held: dict = {}
 
         if entry is not None:
             _name, version_row = entry
+            held = {
+                "published_at": version_row.published_at,
+                "upstream_id": version_row.upstream_id,
+                "is_local": bool(version_row.is_local),
+            }
             cves = by_version.get(version_row.id, [])
             max_cvss = version_row.max_cvss
             has_fix = version_row.has_fix
@@ -579,6 +585,7 @@ async def audit_packages(
             scanned=scanned,
             has_advisories=has_advisories,
             malicious=malicious,
+            **held,
         )
 
         if cves or verdict.blocked:

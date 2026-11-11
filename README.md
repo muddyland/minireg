@@ -88,7 +88,9 @@ documentation, matching the version actually running.
   (`MAL-*`) are always retained and scored critical, whatever the CVE-only
   filter is set to — npm and PyPI malware is rarely assigned a CVE.
 - **Safe out of the box.** Known malware and high/critical CVEs (7.0–10.0)
-  are refused from the first install, with no policy to write first.
+  are refused from the first install, with no policy to write first, and
+  releases younger than 3 days are held back: that is the window in which
+  hijacked-maintainer releases and npm worms get caught and pulled.
 - **Blocks packages** by name glob, by version range, or by CVSS score range.
   Enforced on metadata, downloads, and publishes, without exception.
 - **Audits everything.** Every login and admin action is recorded; every

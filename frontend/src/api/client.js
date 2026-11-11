@@ -112,6 +112,8 @@ export const api = {
   getSettings: () => request('/api/admin/settings'),
   updateCvePolicy: (payload) =>
     request('/api/admin/settings/cve-policy', { method: 'PUT', body: payload }),
+  updateReleaseAge: (payload) =>
+    request('/api/admin/settings/release-age', { method: 'PUT', body: payload }),
   updateAllowlistMode: (enabled) =>
     request('/api/admin/settings/allowlist-mode', { method: 'PUT', body: { enabled } }),
 

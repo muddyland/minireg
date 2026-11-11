@@ -104,6 +104,9 @@ class UpstreamKind(enum.StrEnum):
 class RuleAction(enum.StrEnum):
     block = "block"
     allow = "allow"
+    # Skips the hold on new releases (and new packages) for what it matches.
+    # Never overrides a block, malware or the CVE policy.
+    exempt = "exempt"
 
 
 class AuthProvider(enum.StrEnum):
@@ -293,6 +296,10 @@ class Upstream(Base):
     name_patterns: Mapped[list] = mapped_column(JSONType, default=list)
     # Refuse to cache an artifact this upstream published no digest for.
     require_digest: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Anyone can publish here (npmjs, PyPI, crates.io): new releases are held
+    # for the release-age policy. NULL derives it from the kind, see
+    # upstream_is_public -- a GitLab registry holds your own packages.
+    is_public: Mapped[bool | None] = mapped_column(Boolean)
     priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
@@ -330,6 +337,19 @@ class Upstream(Base):
     created_at: Mapped[datetime] = _now_col()
 
     __table_args__ = (Index("ix_upstream_route", "ecosystem", "enabled", "tier", "priority"),)
+
+
+#: Upstream kinds that are private by default: a GitLab registry serves what
+#: its own users published.
+PRIVATE_UPSTREAM_KINDS = frozenset({"gitlab_npm", "gitlab_pypi", "gitlab_oci"})
+
+
+def upstream_is_public(upstream: Upstream) -> bool:
+    """Whether anyone can publish to ``upstream``; see ``Upstream.is_public``."""
+    if upstream.is_public is not None:
+        return bool(upstream.is_public)
+    kind = getattr(upstream.kind, "value", upstream.kind)
+    return kind not in PRIVATE_UPSTREAM_KINDS
 
 
 # --------------------------------------------------------------------------- #

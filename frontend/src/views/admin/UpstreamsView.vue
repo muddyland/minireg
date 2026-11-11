@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import api from '@/api/client'
 import { relativeTime } from '@/utils/format'
 import { errorMessage } from '@/utils/errors'
@@ -29,6 +29,7 @@ const blank = () => ({
   verify_ssl: true,
   name_patterns: '',
   require_digest: true,
+  is_public: true,
   gitlab_project_id: '',
   gitlab_group_id: '',
   allow_publish: false,
@@ -114,9 +115,19 @@ function openEdit(upstream) {
     web_url_template: upstream.web_url_template || '',
     name_patterns: (upstream.name_patterns || []).join(', '),
     require_digest: upstream.require_digest !== false,
+    is_public: upstream.is_public !== false,
   }
   showForm.value = true
 }
+
+// A new GitLab upstream serves your own packages, so it starts out private;
+// a public registry starts out public. Editing keeps what was saved.
+watch(
+  () => form.value.kind,
+  (kind) => {
+    if (!editing.value) form.value.is_public = !String(kind || '').startsWith('gitlab')
+  },
+)
 
 function onEcosystemChange() {
   form.value.kind = kindOptions.value[0]?.value ?? 'npm'
@@ -484,6 +495,14 @@ onMounted(load)
           <input v-model="form.require_digest" type="checkbox" />
           Require a published digest for every artifact
         </label>
+        <label class="check">
+          <input v-model="form.is_public" type="checkbox" />
+          Public registry: anyone can publish here
+        </label>
+        <p class="field-hint" style="margin-top: -0.3rem">
+          New releases from a public registry are held for the release-age policy. Untick it for
+          a registry only your own people publish to.
+        </p>
         <div class="field">
           <label for="up-name-patterns">Reserved names</label>
           <input

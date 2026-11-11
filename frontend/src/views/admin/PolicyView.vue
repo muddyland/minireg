@@ -67,10 +67,12 @@ const cve = ref({
   require_fix_available: false,
   block_malware: true,
 })
+const releaseAge = ref({ enabled: true, min_days: 3, exempt_security_fixes: true })
 const allowlistMode = ref(false)
 
 const blockRules = computed(() => rules.value.filter((r) => r.action === 'block'))
 const allowRules = computed(() => rules.value.filter((r) => r.action === 'allow'))
+const exemptRules = computed(() => rules.value.filter((r) => r.action === 'exempt'))
 // Rule id whose enable/delete is in flight, so a double click cannot race it.
 const busyRule = ref(null)
 const savingAllowlist = ref(false)
@@ -82,6 +84,7 @@ async function load() {
     rules.value = r.rules
     settings.value = s
     cve.value = { ...s.cve_policy }
+    releaseAge.value = { ...s.release_age }
     allowlistMode.value = s.allowlist_mode
   } catch (err) {
     error.value = errorMessage(err, 'Could not load policy.')
@@ -169,6 +172,23 @@ async function saveCve() {
   } catch (err) {
     error.value = errorMessage(err, 'Could not save the CVE policy.')
   }
+}
+
+async function saveReleaseAge() {
+  error.value = null
+  message.value = null
+  try {
+    await api.updateReleaseAge(releaseAge.value)
+    message.value = 'Release hold saved.'
+    await load()
+  } catch (err) {
+    error.value = errorMessage(err, 'Could not save the release hold.')
+  }
+}
+
+function addExemptRule() {
+  ruleForm.value = { ecosystem: '', pattern: '', action: 'exempt', version_spec: '', reason: '' }
+  showRule.value = true
 }
 
 async function saveAllowlist() {
@@ -319,6 +339,77 @@ onMounted(load)
       </div>
     </div>
 
+    <div class="grid grid-2 mb">
+      <div class="card">
+        <div class="card-head">
+          <h3>Hold new releases</h3>
+          <span class="badge" :class="releaseAge.enabled ? 'badge-warn' : ''">
+            {{ releaseAge.enabled ? `${releaseAge.min_days} days` : 'off' }}
+          </span>
+        </div>
+        <div class="card-body">
+          <p class="dim small mb">
+            Serves a release from a public registry only once it is a few days old. Hijacked
+            maintainer accounts and npm worms publish malware that is usually found and pulled
+            within days; holding new releases keeps your users, and their AI agents, out of that
+            window. Packages published to this registry and GitLab upstreams are never held.
+          </p>
+          <label class="check mb">
+            <input v-model="releaseAge.enabled" type="checkbox" />
+            Hold new releases
+          </label>
+          <div class="field">
+            <label for="policy-release-days">Serve releases after (days)</label>
+            <input id="policy-release-days" v-model.number="releaseAge.min_days" type="number" min="1" max="90" step="1" style="width: 110px" />
+          </div>
+          <label class="check">
+            <input v-model="releaseAge.exempt_security_fixes" type="checkbox" />
+            Serve security fixes straight away
+          </label>
+          <p class="field-hint">
+            A release an advisory names as the fix for an older version is not held, so the hold
+            never keeps a vulnerable version in place.
+          </p>
+          <button class="btn btn-primary mt" @click="saveReleaseAge">Save release hold</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>Exempt rules</h3>
+          <button class="btn btn-sm" @click="addExemptRule">Add exemption</button>
+        </div>
+        <div class="card-body tight">
+          <p class="dim small" style="padding: 0.8rem 1rem 0">
+            Packages that skip the hold on new releases, for ones you trust or need on release day.
+            An exemption never overrides a block rule, malware or the CVE policy.
+          </p>
+          <div v-if="!exemptRules.length" class="empty">No exemptions.</div>
+          <div v-else class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Pattern</th><th>Ecosystem</th><th>Versions</th><th>Reason</th><th></th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="rule in exemptRules" :key="rule.id" :style="rule.enabled ? '' : 'opacity:.5'">
+                  <td class="mono">{{ rule.pattern }}</td>
+                  <td><EcosystemBadge :ecosystem="rule.ecosystem" /></td>
+                  <td class="mono small">{{ rule.version_spec || 'all' }}</td>
+                  <td class="dim small">{{ rule.reason || '—' }}</td>
+                  <td class="num nowrap">
+                    <button class="btn btn-sm" :disabled="busyRule === rule.id" @click="toggleRule(rule)">
+                      {{ rule.enabled ? 'Disable' : 'Enable' }}
+                    </button>
+                    <button class="btn btn-sm btn-danger" :disabled="busyRule === rule.id" @click="deleteRule(rule)">Delete</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="card mb">
       <div class="card-head">
         <h3>Block rules</h3>
@@ -412,6 +503,7 @@ onMounted(load)
           <select id="policy-rule-action" v-model="ruleForm.action">
             <option value="block">Block — never serve this package</option>
             <option value="allow">Allow — permit in allowlist mode</option>
+            <option value="exempt">Exempt — skip the hold on new releases</option>
           </select>
         </div>
         <div class="field">
@@ -454,7 +546,7 @@ onMounted(load)
 
           <div v-if="specPreview" class="alert alert-info small" style="margin-top: 0.5rem">
             Matches <code>{{ specPreview }}</code>
-            <span class="faint"> — prereleases inside the range are blocked too.</span>
+            <span class="faint"> — prereleases inside the range match too.</span>
           </div>
           <div v-else-if="specError" class="alert alert-error small" style="margin-top: 0.5rem">
             {{ specError }}
@@ -469,13 +561,17 @@ onMounted(load)
               class="small"
             />
             <span v-if="specProbe && specProbeResult !== null" class="badge" :class="specProbeResult ? 'badge-danger' : 'badge-ok'">
-              {{ specProbeResult ? 'would be blocked' : 'not affected' }}
+              {{ specProbeResult ? (ruleForm.action === 'block' ? 'would be blocked' : 'matches') : 'not affected' }}
             </span>
           </div>
         </div>
         <div class="field">
           <label for="policy-rule-reason">Reason</label>
-          <input id="policy-rule-reason" v-model="ruleForm.reason" placeholder="Shown to users who are blocked" />
+          <input
+            id="policy-rule-reason"
+            v-model="ruleForm.reason"
+            :placeholder="ruleForm.action === 'exempt' ? 'Why this package is trusted' : 'Shown to users who are blocked'"
+          />
         </div>
       </div>
       <div class="modal-foot">
