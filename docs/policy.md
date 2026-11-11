@@ -337,6 +337,12 @@ versions carry it and whether policy currently blocks them, and which images
 (repository, tags, platform, the package inside the image, its fixed version)
 were pulled when. Suppressed advisories are left out.
 
+Severity follows the rating each side is judged by: CVSS for packages, and
+for images the rating Trivy reports (the distribution's own, for OS packages),
+which is what image policy enforces. A CVE that NVD scores 9.8 but Debian
+rates *low* for its build is listed as low, with the score in the tooltip; a
+CVE in both a package and an image takes the higher of the two.
+
 ---
 
 ## Testing before it bites

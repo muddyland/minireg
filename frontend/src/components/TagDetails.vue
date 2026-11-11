@@ -1,8 +1,13 @@
 <script setup>
 /**
- * Everything about one tag, shown when its row is expanded on the image page:
- * platform picker, scan summary, vulnerabilities, packages (from the SBOM),
- * layers with the build step that made each one, and the image config.
+ * Everything about one tag, the body of the tag page: a summary (platform,
+ * pull command, scan), then tabs for vulnerabilities, packages (from the
+ * SBOM), layers with the build step that made each one, and the image config.
+ *
+ * Vulnerabilities default to one row per package to upgrade (high and
+ * critical first), with what no release fixes yet folded away: a large
+ * image has ~1k findings, mostly the same CVEs across sibling packages, and
+ * a flat table of them buried the few that need action.
  *
  * Each section loads on first view and is cached per digest, so switching
  * tabs or platforms back and forth costs nothing after the first look.
@@ -10,9 +15,9 @@
 import { computed, reactive, ref, watch } from 'vue'
 import api from '@/api/client'
 import CodeBlock from '@/components/CodeBlock.vue'
+import FindingsTable from '@/components/FindingsTable.vue'
 import { errorMessage } from '@/utils/errors'
 import { safeHttpUrl } from '@/utils/url'
-import { useAuthStore } from '@/stores/auth'
 import {
   SEVERITIES,
   formatBytes,
@@ -25,9 +30,10 @@ import {
 const props = defineProps({
   repo: { type: Object, required: true },
   tag: { type: Object, required: true },
+  // The platform to show (from the parent, so it survives a reload).
+  digest: { type: String, default: null },
 })
-const emit = defineEmits(['message', 'error'])
-const auth = useAuthStore()
+const emit = defineEmits(['update:digest'])
 
 // -- platform ---------------------------------------------------------------
 const platforms = computed(() =>
@@ -36,16 +42,27 @@ const platforms = computed(() =>
 const attestations = computed(() =>
   props.tag.manifest.is_index ? props.tag.platforms.filter((p) => p.attestation).length : 0,
 )
+/** The asked-for platform, else the one pulled most recently: the one in use. */
 function defaultDigest() {
   if (!props.tag.manifest.is_index) return props.tag.manifest.digest
   const fetched = platforms.value.filter((p) => p.fetched)
+  if (props.digest && fetched.some((p) => p.digest === props.digest)) return props.digest
+  const used = (p) => Date.parse(p.manifest?.last_accessed_at || '') || 0
   const pick =
+    [...fetched].sort((a, b) => used(b) - used(a)).find((p) => used(p)) ||
     fetched.find((p) => p.platform === 'linux/amd64') ||
     fetched.find((p) => (p.platform || '').startsWith('linux/arm64')) ||
     fetched[0]
   return pick?.digest || null
 }
 const digest = ref(defaultDigest())
+watch(digest, (d) => emit('update:digest', d), { immediate: true })
+const pulledPlatforms = computed(() => platforms.value.filter((p) => p.fetched).length)
+function platformLabel(p) {
+  if (!p.fetched) return `${p.platform || '?'} (not pulled yet)`
+  const worst = p.manifest?.scan_status === 'scanned' ? worstOf(p.manifest.severity_counts) : null
+  return worst ? `${p.platform} · worst: ${worst.toLowerCase()}` : p.platform || '?'
+}
 // The push verdict belongs to this repository, not to the digest (the same
 // bytes pulled through an upstream are judged by the pull rules), so it comes
 // from the repository listing rather than the digest's detail.
@@ -106,9 +123,23 @@ async function loadTab() {
 }
 
 // -- vulnerabilities ------------------------------------------------------------
-const filters = reactive({ severity: '', fixable: '', kev: '', q: '' })
+// High and critical first; the rest is one click away.
+const filters = reactive({ severity: 'CRITICAL,HIGH', fixable: '', kev: '', q: '' })
+const view = ref('package')
 const findings = ref([])
 const findingsShown = ref(0)
+const grouped = ref(null)
+const GROUP_PAGE = 25
+const groupLimit = ref(GROUP_PAGE)
+const unfixedLimit = ref(GROUP_PAGE)
+const openGroups = ref(new Set())
+const groupKey = (g) => `${g.packages.join(',')}@${g.installed_version || ''}`
+function toggleGroup(key) {
+  const next = new Set(openGroups.value)
+  next.has(key) ? next.delete(key) : next.add(key)
+  openGroups.value = next
+}
+const SEVERITY_FILTER_LABEL = { CRITICAL: 'critical', 'CRITICAL,HIGH': 'high or critical', MEDIUM: 'medium', LOW: 'low' }
 const totalFindings = computed(() =>
   Object.values(detail.value?.severity_counts || {}).reduce((a, b) => a + b, 0),
 )
@@ -118,23 +149,39 @@ async function loadFindings() {
     findingsShown.value = 0
     return
   }
+  const common = {
+    severity: filters.severity || undefined,
+    kev: filters.kev === '' ? undefined : filters.kev,
+    q: filters.q || undefined,
+  }
   let data
   try {
-    data = await api.dockerFindings(digest.value, {
-      severity: filters.severity || undefined,
-      fixable: filters.fixable === '' ? undefined : filters.fixable,
-      kev: filters.kev === '' ? undefined : filters.kev,
-      q: filters.q || undefined,
-      limit: 500,
-    })
+    data =
+      view.value === 'package'
+        ? await api.dockerFindings(digest.value, { ...common, group: 'package' })
+        : await api.dockerFindings(digest.value, {
+            ...common,
+            fixable: filters.fixable === '' ? undefined : filters.fixable,
+            limit: 500,
+          })
   } catch (err) {
     sectionError.value = errorMessage(err, 'Could not load the findings.')
     return
   }
-  findings.value = data.findings
-  findingsShown.value = data.total
+  if (view.value === 'package') {
+    grouped.value = data
+    groupLimit.value = GROUP_PAGE
+    unfixedLimit.value = GROUP_PAGE
+    openGroups.value = new Set()
+  } else {
+    findings.value = data.findings
+    findingsShown.value = data.total
+  }
 }
-const expandedFinding = ref(null)
+function showLayer(layerDigest) {
+  tab.value = 'layers'
+  expandedLayer.value = layerDigest
+}
 
 // -- packages -----------------------------------------------------------------
 const pkgQuery = ref('')
@@ -214,93 +261,40 @@ const pullCommand = computed(() =>
     : `docker pull ${props.repo.pull_reference}@${props.tag.manifest.digest}`,
 )
 
-async function rescan(full) {
-  try {
-    const result = await api.dockerRescan(digest.value, full)
-    emit(
-      'message',
-      result.queued
-        ? `Rescan queued (${result.mode === 'sbom' ? 'against the stored SBOM, no image pull' : 'full image scan'}).`
-        : 'A scan is already queued for this image.',
-    )
-    delete cache[digest.value]
-    await loadTab()
-  } catch (err) {
-    emit('error', errorMessage(err, 'Could not queue a rescan.'))
-  }
-}
-
 const countsFor = (m) =>
   SEVERITIES.filter((s) => (m?.severity_counts || {})[s]).map((s) => [s, m.severity_counts[s]])
 const fixableFor = (m, s) => (m?.fixable_counts || {})[s] || 0
 
 watch([digest, tab], loadTab, { immediate: true })
-watch(filters, loadFindings)
+watch([filters, view], loadFindings)
 </script>
 
 <template>
   <div class="tag-details">
-    <!-- platform picker + pull commands -->
-    <div class="td-top">
-      <div v-if="platforms.length" class="td-platforms">
-        <span class="faint small">Platform</span>
-        <button
-          v-for="p in platforms"
-          :key="p.digest"
-          class="eco-chip"
-          :class="{ active: digest === p.digest }"
-          :disabled="!p.fetched"
-          :title="p.fetched ? p.digest : 'Not pulled through this registry yet'"
-          @click="digest = p.digest"
-        >
-          {{ p.platform || '?' }}
-          <span
-            v-if="p.manifest?.scan_status === 'scanned' && worstOf(p.manifest.severity_counts)"
-            class="dot"
-            :class="trivySeverityClass(worstOf(p.manifest.severity_counts))"
-            :title="`worst finding: ${worstOf(p.manifest.severity_counts).toLowerCase()}`"
-          ><span class="sr-only">worst finding: {{ worstOf(p.manifest.severity_counts).toLowerCase() }}</span></span>
-        </button>
-        <span v-if="attestations" class="faint small" title="BuildKit provenance / SBOM attestations: recorded, not scanned">
-          + {{ attestations }} attestation{{ attestations > 1 ? 's' : '' }}
-        </span>
-      </div>
-      <div class="td-pull">
-        <div class="seg seg-sm">
-          <button :class="{ active: pullMode === 'tag' }" @click="pullMode = 'tag'">by tag</button>
-          <button :class="{ active: pullMode === 'digest' }" title="Pinned: the tag can move, the digest cannot" @click="pullMode = 'digest'">by digest</button>
+    <!-- summary: platform, pull command, scan -->
+    <div class="td-summary">
+      <div class="td-row">
+        <div v-if="platforms.length" class="td-platform">
+          <label for="td-platform" class="td-label">Platform</label>
+          <select id="td-platform" v-model="digest">
+            <option v-for="p in platforms" :key="p.digest" :value="p.digest" :disabled="!p.fetched">
+              {{ platformLabel(p) }}
+            </option>
+          </select>
+          <span class="faint small nowrap" :title="attestations ? `+ ${attestations} BuildKit attestation(s): recorded, not scanned` : ''">
+            {{ pulledPlatforms }} of {{ platforms.length }} pulled
+          </span>
         </div>
-        <CodeBlock :code="pullCommand" />
-      </div>
-    </div>
-
-    <div v-if="!digest" class="alert alert-info small">
-      No platform of this tag has been pulled through the registry yet, so there is nothing to show.
-      Pull it once (or use <strong>Refresh</strong>) and it is cached and scanned.
-    </div>
-
-    <template v-else-if="detail">
-      <!-- summary strip -->
-      <div v-if="blockReason" class="alert alert-error small">
-        Pulls of this image are refused: {{ blockReason }}
-      </div>
-      <div v-if="detail.last_job?.status === 'failed'" class="alert alert-error small">
-        Last scan failed after {{ detail.last_job.attempts }} attempts: {{ detail.last_job.error }}
-      </div>
-
-      <div class="td-summary">
-        <div class="td-stat">
-          <div class="td-label">Scan</div>
-          <span
-            class="badge"
-            :class="{
-              'badge-ok': detail.scan_status === 'scanned',
-              'badge-warn': ['queued', 'scanning'].includes(detail.scan_status),
-              'badge-danger': detail.scan_status === 'failed',
-            }"
-          >{{ detail.scan_status.replace('_', ' ') }}</span>
-          <div v-if="detail.scanned_at" class="faint small">{{ relativeTime(detail.scanned_at) }}</div>
+        <div class="td-pull">
+          <div class="seg seg-sm" role="group" aria-label="Pull by">
+            <button :class="{ active: pullMode === 'tag' }" @click="pullMode = 'tag'">by tag</button>
+            <button :class="{ active: pullMode === 'digest' }" title="Pinned: the tag can move, the digest cannot" @click="pullMode = 'digest'">by digest</button>
+          </div>
+          <CodeBlock :code="pullCommand" />
         </div>
+      </div>
+
+      <div v-if="detail" class="td-stats">
         <div class="td-stat td-sev">
           <div class="td-label">Vulnerabilities</div>
           <div v-if="detail.scan_status === 'scanned'" class="sev-bars">
@@ -312,40 +306,45 @@ watch(filters, loadFindings)
             </span>
             <span v-if="!countsFor(detail).length" class="badge badge-ok">none found</span>
           </div>
-          <span v-else class="faint small">—</span>
-          <div v-if="detail.scan_status === 'scanned' && totalFindings" class="faint small">
-            {{ detail.fixable_count }} of {{ totalFindings }} have a fixed version
-          </div>
+          <span
+            v-else
+            class="badge"
+            :class="{
+              'badge-warn': ['queued', 'scanning'].includes(detail.scan_status),
+              'badge-danger': detail.scan_status === 'failed',
+            }"
+          >{{ detail.scan_status.replace('_', ' ') }}</span>
+        </div>
+        <div v-if="detail.scan_status === 'scanned' && totalFindings" class="td-stat">
+          <div class="td-label">Fixable</div>
+          <div><strong>{{ detail.fixable_count }}</strong> <span class="faint small">of {{ totalFindings }}</span></div>
         </div>
         <div class="td-stat">
           <div class="td-label">Size</div>
-          <div>{{ formatBytes(detail.total_size) }}</div>
-          <div class="faint small">{{ detail.layer_count }} layers</div>
+          <div>{{ formatBytes(detail.total_size) }} <span class="faint small">· {{ detail.layer_count }} layers</span></div>
         </div>
-        <div v-if="detail.scans?.[0]" class="td-stat">
-          <div class="td-label">Scanned by</div>
-          <div class="small">Trivy {{ detail.scans[0].trivy_version }}</div>
-          <div class="faint small">
-            {{ detail.scans[0].os || 'unknown OS' }}<template v-if="detail.scans[0].db_updated_at">
-              · DB {{ formatDateTime(detail.scans[0].db_updated_at) }}</template>
+        <div v-if="detail.scanned_at" class="td-stat">
+          <div class="td-label">Scanned</div>
+          <div :title="detail.scans?.[0] ? `Trivy ${detail.scans[0].trivy_version} · ${detail.scans[0].os || 'unknown OS'}${detail.scans[0].db_updated_at ? ` · DB ${formatDateTime(detail.scans[0].db_updated_at)}` : ''}` : ''">
+            {{ relativeTime(detail.scanned_at) }}
+            <span v-if="detail.scans?.[0]?.os" class="faint small">· {{ detail.scans[0].os }}</span>
           </div>
         </div>
-        <div class="td-actions">
-          <a v-if="detail.has_sbom" class="btn btn-sm" :href="api.dockerSbomUrl(detail.digest)" title="CycloneDX JSON">
-            Download SBOM
-          </a>
-          <template v-if="auth.isAdmin && detail.kind === 'image'">
-            <button
-              class="btn btn-sm"
-              :disabled="['queued', 'scanning'].includes(detail.scan_status)"
-              title="Match the stored SBOM against today's vulnerability database"
-              @click="rescan(false)"
-            >Rescan</button>
-            <button class="btn btn-sm" title="Pull the image and scan it again from scratch" @click="rescan(true)">
-              Full rescan
-            </button>
-          </template>
-        </div>
+        <a v-if="detail.has_sbom" class="small td-sbom" :href="api.dockerSbomUrl(detail.digest)" title="CycloneDX JSON">Download SBOM</a>
+      </div>
+    </div>
+
+    <div v-if="!digest" class="alert alert-info small">
+      No platform of this tag has been pulled through the registry yet, so there is nothing to show.
+      Pull it once (or use <strong>Refresh from upstream</strong> in the ⋯ menu) and it is cached and scanned.
+    </div>
+
+    <template v-else-if="detail">
+      <div v-if="blockReason" class="alert alert-error small">
+        Pulls of this image are refused: {{ blockReason }}
+      </div>
+      <div v-if="detail.last_job?.status === 'failed'" class="alert alert-error small">
+        Last scan failed after {{ detail.last_job.attempts }} attempts: {{ detail.last_job.error }}
       </div>
 
       <!-- tabs -->
@@ -374,79 +373,133 @@ watch(filters, loadFindings)
         </div>
         <template v-else>
           <div class="row mb td-filters">
+            <div class="seg" role="group" aria-label="View">
+              <button :class="{ active: view === 'package' }" title="One row per package to upgrade" @click="view = 'package'">By package</button>
+              <button :class="{ active: view === 'all' }" title="Every finding, one row each" @click="view = 'all'">All findings</button>
+            </div>
             <select v-model="filters.severity" aria-label="Severity">
-              <option value="">Any severity</option>
-              <option value="CRITICAL">Critical</option>
               <option value="CRITICAL,HIGH">High and above</option>
+              <option value="CRITICAL">Critical</option>
               <option value="MEDIUM">Medium</option>
               <option value="LOW">Low</option>
+              <option value="">Any severity</option>
             </select>
-            <select v-model="filters.fixable" aria-label="Fix available">
+            <select v-if="view === 'all'" v-model="filters.fixable" aria-label="Fix available">
               <option value="">Fixed or not</option>
               <option :value="true">Has a fix</option>
               <option :value="false">No fix yet</option>
             </select>
-            <select v-model="filters.kev" aria-label="Known exploited">
-              <option value="">Exploited or not</option>
-              <option :value="true">Known exploited (KEV) only</option>
-            </select>
+            <label class="check small nowrap" style="margin: 0">
+              <input v-model="filters.kev" type="checkbox" :true-value="true" false-value="" /> Known exploited only
+            </label>
             <input v-model.lazy="filters.q" type="search" placeholder="CVE or package…" aria-label="Filter findings by CVE or package" class="grow" />
-            <span class="faint small nowrap">{{ findingsShown }} shown</span>
           </div>
-          <div v-if="!findings.length" class="empty small">No findings match.</div>
-          <div v-else class="table-wrap">
-            <table class="td-table">
-              <thead>
-                <tr><th>Vulnerability</th><th>Severity</th><th>Package</th><th>Installed</th><th>Fixed in</th><th>Title</th></tr>
-              </thead>
-              <tbody>
-                <template v-for="f in findings" :key="f.vuln_id + f.pkg_name + f.installed_version">
-                  <tr class="clickable" @click="expandedFinding = expandedFinding === f ? null : f">
-                    <td class="mono nowrap">
-                      {{ f.vuln_id }}
-                      <div class="row-tight">
-                        <span v-if="f.kev" class="badge badge-danger" title="CISA Known Exploited Vulnerability">KEV</span>
-                        <span v-if="f.denied" class="badge badge-danger">denied</span>
-                        <span v-if="f.accepted" class="badge badge-warn">risk accepted</span>
-                      </div>
-                    </td>
-                    <td class="nowrap">
-                      <span class="sev" :class="trivySeverityClass(f.severity)">{{ f.severity.toLowerCase() }}</span>
-                      <div v-if="f.cvss !== null" class="faint small">CVSS {{ f.cvss.toFixed(1) }}</div>
-                    </td>
-                    <td class="mono small">{{ f.pkg_name }}<div class="faint small">{{ f.pkg_type }}</div></td>
-                    <td class="mono small">{{ f.installed_version || '—' }}</td>
-                    <td class="mono small" :class="{ 'fix-available': f.fixed_version }">{{ f.fixed_version || '—' }}</td>
-                    <td class="small td-title"><div class="truncate" :title="f.title">{{ f.title || '—' }}</div></td>
-                  </tr>
-                  <tr v-if="expandedFinding === f" class="td-subrow">
-                    <td colspan="6">
-                      <div class="detail-grid small">
-                        <span class="dim">Title</span><span>{{ f.title || '—' }}</span>
-                        <span class="dim">Package</span><span class="mono">{{ f.pkg_name }} {{ f.installed_version }} ({{ f.pkg_type }})</span>
-                        <span class="dim">Fix</span>
-                        <span>
-                          <template v-if="f.fixed_version">Upgrade to <span class="mono">{{ f.fixed_version }}</span>, usually by rebuilding on a newer base image.</template>
-                          <template v-else>No fixed version published yet.</template>
+
+          <!-- by package -->
+          <template v-if="view === 'package'">
+            <div v-if="!grouped" class="empty small">Loading…</div>
+            <template v-else>
+              <div v-if="!grouped.total" class="empty small">
+                No {{ SEVERITY_FILTER_LABEL[filters.severity] || '' }} findings match.
+                <a v-if="filters.severity" href="#" @click.prevent="filters.severity = ''">Show every severity</a>
+              </div>
+              <template v-else>
+                <p class="small dim td-lead">
+                  <strong>{{ grouped.vulnerabilities }}</strong>
+                  {{ SEVERITY_FILTER_LABEL[filters.severity] || '' }} vulnerabilit{{ grouped.vulnerabilities === 1 ? 'y' : 'ies' }}.
+                  <template v-if="grouped.fixable.length">
+                    Upgrading <strong>{{ grouped.fixable.length }}</strong> package{{ grouped.fixable.length === 1 ? '' : 's' }}
+                    (usually by rebuilding on a newer base image) fixes {{ grouped.fixable_findings }} of them.
+                  </template>
+                  <template v-else>None has a fix yet.</template>
+                </p>
+                <ul v-if="grouped.fixable.length" class="pkg-groups">
+                  <li v-for="g in grouped.fixable.slice(0, groupLimit)" :key="groupKey(g)" :class="{ open: openGroups.has(groupKey(g)) }">
+                    <button class="pg-row" :aria-expanded="openGroups.has(groupKey(g))" @click="toggleGroup(groupKey(g))">
+                      <span class="chev" aria-hidden="true">›</span>
+                      <span class="pg-name mono" :title="g.packages.join(', ')">
+                        {{ g.packages[0] }}<span v-if="g.packages.length > 1" class="faint"> +{{ g.packages.length - 1 }}</span>
+                      </span>
+                      <span class="pg-ver mono small">
+                        {{ g.installed_version || '—' }}<span class="faint arrow" aria-label="upgrade to">→</span><span class="fix-available">{{ g.fixed_version }}</span>
+                      </span>
+                      <span class="pkg-vulns">
+                        <span v-if="g.fixable.kev" class="sev-mini kev" title="Known exploited (CISA KEV)">KEV {{ g.fixable.kev }}</span>
+                        <span
+                          v-for="sev in SEVERITIES.filter((x) => g.fixable.counts[x])"
+                          :key="sev"
+                          class="sev-mini"
+                          :class="trivySeverityClass(sev)"
+                          :title="sev.toLowerCase()"
+                        ><span aria-hidden="true">{{ sev[0] }}</span><span class="sr-only">{{ sev.toLowerCase() }}</span> {{ g.fixable.counts[sev] }}</span>
+                      </span>
+                      <span class="faint small nowrap pg-count">{{ g.fixable.count }} fixed</span>
+                    </button>
+                    <div v-if="openGroups.has(groupKey(g))" class="pg-body">
+                      <p v-if="g.packages.length > 1" class="small dim" style="margin: 0 0 0.5rem">
+                        Built from one source, upgraded together: <span class="mono">{{ g.packages.join(', ') }}</span>
+                      </p>
+                      <FindingsTable :findings="g.fixable.findings" :layers="layers" :show-package="false" @show-layer="showLayer" />
+                    </div>
+                  </li>
+                </ul>
+                <div v-if="grouped.fixable.length > groupLimit" class="row mt" style="justify-content: center">
+                  <button class="btn btn-sm" @click="groupLimit += GROUP_PAGE">
+                    Show {{ Math.min(GROUP_PAGE, grouped.fixable.length - groupLimit) }} more of {{ grouped.fixable.length - groupLimit }}
+                  </button>
+                </div>
+
+                <details v-if="grouped.unfixed.length" class="pg-unfixed" :open="!grouped.fixable.length">
+                  <summary>
+                    No fix available yet: {{ grouped.unfixed_findings }} finding{{ grouped.unfixed_findings === 1 ? '' : 's' }}
+                    in {{ grouped.unfixed.length }} package{{ grouped.unfixed.length === 1 ? '' : 's' }}
+                  </summary>
+                  <p class="small faint" style="margin: 0.5rem 0">
+                    No release fixes these yet, so there is nothing to upgrade to. Images in use are rescanned
+                    on a schedule, so a fix shows up here once one is published.
+                  </p>
+                  <ul class="pkg-groups">
+                    <li v-for="g in grouped.unfixed.slice(0, unfixedLimit)" :key="groupKey(g)" :class="{ open: openGroups.has(`u:${groupKey(g)}`) }">
+                      <button class="pg-row" :aria-expanded="openGroups.has(`u:${groupKey(g)}`)" @click="toggleGroup(`u:${groupKey(g)}`)">
+                        <span class="chev" aria-hidden="true">›</span>
+                        <span class="pg-name mono" :title="g.packages.join(', ')">
+                          {{ g.packages[0] }}<span v-if="g.packages.length > 1" class="faint"> +{{ g.packages.length - 1 }}</span>
                         </span>
-                        <span class="dim">Introduced in</span>
-                        <span class="mono">
-                          <template v-if="f.layer_digest">
-                            layer {{ (layers.findIndex((l) => l.digest === f.layer_digest) + 1) || '?' }} ·
-                            {{ shortDigest(f.layer_digest) }}
-                            <a href="#" class="small" @click.prevent="tab = 'layers'; expandedLayer = f.layer_digest">show layer</a>
-                          </template>
-                          <template v-else>—</template>
+                        <span class="pg-ver mono small">{{ g.installed_version || '—' }}</span>
+                        <span class="pkg-vulns">
+                          <span v-if="g.unfixed.kev" class="sev-mini kev" title="Known exploited (CISA KEV)">KEV {{ g.unfixed.kev }}</span>
+                          <span
+                            v-for="sev in SEVERITIES.filter((x) => g.unfixed.counts[x])"
+                            :key="sev"
+                            class="sev-mini"
+                            :class="trivySeverityClass(sev)"
+                            :title="sev.toLowerCase()"
+                          ><span aria-hidden="true">{{ sev[0] }}</span><span class="sr-only">{{ sev.toLowerCase() }}</span> {{ g.unfixed.counts[sev] }}</span>
                         </span>
-                        <span class="dim">Advisory</span>
-                        <span><a v-if="safeHttpUrl(f.url)" :href="safeHttpUrl(f.url)" target="_blank" rel="noopener noreferrer">{{ f.url }}</a><template v-else>{{ f.url || '—' }}</template></span>
+                        <span class="faint small nowrap pg-count">{{ g.unfixed.count }} open</span>
+                      </button>
+                      <div v-if="openGroups.has(`u:${groupKey(g)}`)" class="pg-body">
+                        <FindingsTable :findings="g.unfixed.findings" :layers="layers" :show-package="false" :show-fix="false" @show-layer="showLayer" />
                       </div>
-                    </td>
-                  </tr>
-                </template>
-              </tbody>
-            </table>
-          </div>
+                    </li>
+                  </ul>
+                  <div v-if="grouped.unfixed.length > unfixedLimit" class="row mt" style="justify-content: center">
+                    <button class="btn btn-sm" @click="unfixedLimit += GROUP_PAGE">
+                      Show {{ Math.min(GROUP_PAGE, grouped.unfixed.length - unfixedLimit) }} more of {{ grouped.unfixed.length - unfixedLimit }}
+                    </button>
+                  </div>
+                </details>
+                <p v-if="grouped.truncated" class="field-hint">Only the first {{ grouped.total }} findings are grouped here; narrow the filters to see the rest.</p>
+              </template>
+            </template>
+          </template>
+
+          <!-- every finding -->
+          <template v-else>
+            <p class="small faint td-lead">{{ findingsShown }} finding{{ findingsShown === 1 ? '' : 's' }}<template v-if="findingsShown > findings.length"> (showing the first {{ findings.length }})</template></p>
+            <div v-if="!findings.length" class="empty small">No findings match.</div>
+            <FindingsTable v-else :findings="findings" :layers="layers" @show-layer="showLayer" />
+          </template>
         </template>
       </section>
 
@@ -500,7 +553,7 @@ watch(filters, loadFindings)
                           :class="trivySeverityClass(sev)"
                           :title="sev.toLowerCase()"
                         ><span aria-hidden="true">{{ sev[0] }}</span><span class="sr-only">{{ sev.toLowerCase() }}</span> {{ pkgFindings(c)[sev] }}</span>
-                        <a href="#" class="small" @click.prevent="filters.q = c.name; tab = 'vulns'">view</a>
+                        <a href="#" class="small" @click.prevent="filters.q = c.name; filters.severity = ''; tab = 'vulns'">view</a>
                       </span>
                     </template>
                     <span v-else class="faint small">—</span>
@@ -671,28 +724,39 @@ watch(filters, loadFindings)
 
 <style scoped>
 .tag-details {
-  padding: 0.9rem 1rem 1.1rem;
-  background: var(--surface-2);
-  border-top: 1px solid var(--border);
+  padding: 0;
 }
-.td-top {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
-  gap: 0.6rem 1.2rem;
-  align-items: center;
-  margin-bottom: 0.9rem;
+/* Summary: what you pull (platform, command), then what is in it. */
+.td-summary {
+  padding: 0.9rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 1rem;
 }
-.td-platforms {
+.td-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.35rem;
+  gap: 0.7rem 1.4rem;
   align-items: center;
 }
-.td-platforms .faint {
-  margin-right: 0.2rem;
+.td-platform {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.td-platform .td-label {
+  margin: 0;
+}
+/* The global select rule sets width: 100%; only an id out-ranks it. */
+#td-platform {
+  width: auto;
+  min-width: 13rem;
+  height: 32px;
 }
 .td-pull {
-  grid-column: 2;
+  flex: 1;
+  min-width: min(100%, 26rem);
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -710,13 +774,17 @@ watch(filters, loadFindings)
 }
 .seg button {
   font: inherit;
-  font-size: 0.78rem;
-  padding: 0.25rem 0.6rem;
+  font-size: 0.8rem;
+  padding: 0.3rem 0.7rem;
   border: none;
   background: var(--surface);
   color: var(--text-dim);
   cursor: pointer;
   white-space: nowrap;
+}
+.seg-sm button {
+  font-size: 0.78rem;
+  padding: 0.25rem 0.6rem;
 }
 .seg button + button {
   border-left: 1px solid var(--border);
@@ -726,28 +794,18 @@ watch(filters, loadFindings)
   color: var(--accent);
   font-weight: 600;
 }
-.td-platforms:only-child,
-.td-pull:only-child {
-  grid-column: 1 / -1;
-}
-.dot {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  margin-left: 0.25rem;
-  background: currentColor;
-}
-.td-summary {
+.td-stats {
   display: flex;
   flex-wrap: wrap;
-  gap: 1rem 2rem;
+  gap: 0.8rem 2.2rem;
   align-items: flex-start;
-  padding: 0.85rem 1rem;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  margin-bottom: 0.4rem;
+  margin-top: 0.85rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--border);
+}
+.td-sbom {
+  margin-left: auto;
+  align-self: center;
 }
 .td-label {
   font-size: 0.72rem;
@@ -755,13 +813,6 @@ watch(filters, loadFindings)
   letter-spacing: 0.05em;
   color: var(--text-faint);
   margin-bottom: 0.25rem;
-}
-.td-actions {
-  margin-left: auto;
-  display: flex;
-  gap: 0.4rem;
-  flex-wrap: wrap;
-  align-self: center;
 }
 .sev-bars {
   display: flex;
@@ -804,27 +855,11 @@ watch(filters, loadFindings)
 .td-table {
   background: var(--surface);
 }
-/* The title is the only column that may give: it truncates (full text is
-   one click away in the expanded row) so the table never runs off the card. */
-.td-title {
-  width: 100%;
-  max-width: 0;
-}
 .td-table {
   width: 100%;
 }
 .fix-available {
   color: var(--ok);
-}
-tr.clickable {
-  cursor: pointer;
-}
-tr.clickable:hover td {
-  background: var(--surface-2);
-}
-.td-subrow td {
-  background: var(--surface-2);
-  padding: 0.7rem 1rem 0.9rem;
 }
 .detail-grid {
   display: grid;
@@ -837,6 +872,88 @@ tr.clickable:hover td {
 }
 .pkg-meta {
   margin-top: -0.2rem;
+}
+.td-lead {
+  margin: 0 0 0.6rem;
+}
+/* vulnerabilities by package */
+.pkg-groups {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow: hidden;
+}
+.pkg-groups > li + li {
+  border-top: 1px solid var(--border);
+}
+.pg-row {
+  display: grid;
+  grid-template-columns: 1rem minmax(9rem, 1.1fr) minmax(10rem, 1.3fr) minmax(9rem, 1fr) 5rem;
+  gap: 0.8rem;
+  align-items: center;
+  width: 100%;
+  padding: 0.55rem 0.8rem;
+  border: none;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.pg-row:hover,
+li.open > .pg-row {
+  background: var(--surface-2);
+}
+.pg-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.chev {
+  display: inline-block;
+  color: var(--text-faint);
+  font-size: 1.1rem;
+  line-height: 1;
+  transition: transform 0.12s ease;
+}
+li.open > .pg-row .chev {
+  transform: rotate(90deg);
+  color: var(--accent);
+}
+.pg-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pg-ver {
+  overflow-wrap: anywhere;
+}
+.pg-ver .arrow {
+  margin: 0 0.4em;
+}
+.pg-count {
+  justify-self: end;
+}
+.pg-body {
+  padding: 0.5rem 0.8rem 0.9rem 2.6rem;
+  background: var(--surface-2);
+}
+.pg-unfixed {
+  margin-top: 1rem;
+}
+.pg-unfixed > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--text-dim);
+  padding: 0.3rem 0;
+}
+.sev-mini.kev {
+  color: var(--critical);
+  outline: 1px solid color-mix(in srgb, currentColor 45%, transparent);
 }
 
 /* layers */
@@ -990,12 +1107,19 @@ li.open .layer-row {
 }
 
 @media (max-width: 1100px) {
-  .td-top,
   .config-grid {
     grid-template-columns: 1fr;
   }
-  .td-pull {
-    grid-column: 1;
+  .pg-row {
+    grid-template-columns: 1rem minmax(0, 1fr) auto;
+  }
+  /* Version on its own line under the name; badges stay beside it. */
+  .pg-ver {
+    grid-column: 2 / -1;
+    grid-row: 2;
+  }
+  .pg-count {
+    display: none;
   }
   .layer-row {
     grid-template-columns: 2rem minmax(0, 1fr) 8rem;

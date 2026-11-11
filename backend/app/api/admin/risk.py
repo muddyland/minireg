@@ -166,9 +166,16 @@ async def risk_overview(
         p = packages.get(key)
         i = images.get(key)
         cvss = max((x["cvss"] for x in (p, i) if x and x["cvss"] is not None), default=None)
-        label = severity_label(cvss) if cvss is not None else (i["severity"] if i else None)
-        if p and p["malicious"]:
-            label = "critical"
+        # Packages are rated by CVSS. Image findings carry the rating of the
+        # distribution that built the package (what image policy enforces),
+        # which can be far below the NVD score for its own build -- so an
+        # image-only CVE takes that rating, not the CVSS.
+        labels = []
+        if p:
+            labels.append("critical" if p["malicious"] else (severity_label(p["cvss"]) if p["cvss"] is not None else None))
+        if i:
+            labels.append(i["severity"])
+        label = max((x for x in labels if x), key=_rank, default=None)
         kev = key in kev_ids or bool(i and i["kev"])
         served = bool(p and p["last_served"] and p["last_served"] >= since)
         pulled = bool(i and i["last_pulled"] and i["last_pulled"] >= since)

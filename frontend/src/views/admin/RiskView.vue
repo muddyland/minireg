@@ -157,7 +157,7 @@ onMounted(load)
             <span class="faint small truncate" :title="item.title">{{ item.title || '—' }}</span>
           </span>
           <span class="risk-sev">
-            <span class="sev-pill" :class="SEV_CLASS[item.severity]">{{ [item.severity || 'unscored', item.cvss !== null ? item.cvss.toFixed(1) : ''].join(' ').trim() }}</span>
+            <span class="sev-pill" :class="SEV_CLASS[item.severity]" :title="item.cvss !== null ? `CVSS ${item.cvss.toFixed(1)}` : ''">{{ item.severity || 'unscored' }}</span>
             <span v-if="item.kev" class="sev-pill sev-critical" title="On CISA's known-exploited vulnerabilities list">KEV</span>
             <span v-if="item.malicious" class="sev-pill sev-critical">malware</span>
           </span>
@@ -216,7 +216,7 @@ onMounted(load)
                   <tbody>
                     <tr v-for="(img, n) in detail[item.id].images" :key="`${img.repository}:${img.digest}:${n}`">
                       <td>
-                        <router-link class="mono" :to="{ name: 'image', params: { name: img.repository } }">{{ img.repository }}</router-link>
+                        <router-link class="mono" :to="{ name: 'image', params: { name: img.repository }, query: img.tags.length ? { tag: img.tags[0] } : {} }">{{ img.repository }}</router-link>
                         <span v-if="img.tags.length" class="faint small">:{{ img.tags.join(', :') }}</span>
                         <span v-if="img.quarantined" class="badge badge-danger">quarantined</span>
                       </td>

@@ -330,7 +330,7 @@ names contain slashes.
 | `GET` | `/api/docker/repository` | user | One repository: tags, digests, scan status. `name` |
 | `GET` | `/api/docker/inspect` | user | Resolve a reference the way `docker pull` would and report its findings and whether a pull would be allowed. `ref`, `platform` (default `linux/amd64`), `findings`. Used by `minireg audit --image` and `minireg info --ecosystem docker` |
 | `GET` | `/api/docker/manifest/{digest}` | user | Manifest detail: layers, platforms, repositories that reference it, latest scan |
-| `GET` | `/api/docker/manifest/{digest}/findings` | user | Trivy findings. `severity` (comma-separated), `fixable`, `kev`, `q`, `limit`, `offset` |
+| `GET` | `/api/docker/manifest/{digest}/findings` | user | Trivy findings. `severity` (comma-separated), `fixable`, `kev`, `q`, `limit`, `offset`. `group=package` returns them grouped instead: one entry per package to upgrade (siblings from one source merged), split into `fixable` (with the highest fixed version) and `unfixed` |
 | `GET` | `/api/docker/manifest/{digest}/config` | user | Entrypoint, env, labels, ports and build history, each layer paired with its step |
 | `GET` | `/api/docker/manifest/{digest}/packages` | user | The SBOM as a package list |
 | `GET` | `/api/docker/manifest/{digest}/sbom` | user | The raw CycloneDX SBOM, as a download |
