@@ -500,8 +500,8 @@ onMounted(load)
           Public registry: anyone can publish here
         </label>
         <p class="field-hint" style="margin-top: -0.3rem">
-          New releases from a public registry are held for the release-age policy. Untick it for
-          a registry only your own people publish to.
+          New releases and new packages from a public registry are held back (Package policy).
+          Untick it for a registry only your own people publish to.
         </p>
         <div class="field">
           <label for="up-name-patterns">Reserved names</label>

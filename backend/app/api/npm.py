@@ -1698,7 +1698,13 @@ async def _packument_response(
         }
         if not document["versions"]:
             return npm_error(
-                "all versions of this package are blocked by policy", status.HTTP_403_FORBIDDEN
+                await policy.all_blocked_reason(
+                    ECOSYSTEM,
+                    package.normalized_name,
+                    package.versions,
+                    "all versions of this package are blocked by policy",
+                ),
+                status.HTTP_403_FORBIDDEN,
             )
         if "latest" not in document["dist-tags"]:
             remaining = max_semver(list(document["versions"]))

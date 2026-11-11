@@ -90,7 +90,9 @@ documentation, matching the version actually running.
 - **Safe out of the box.** Known malware and high/critical CVEs (7.0–10.0)
   are refused from the first install, with no policy to write first, and
   releases younger than 3 days are held back: that is the window in which
-  hijacked-maintainer releases and npm worms get caught and pulled.
+  hijacked-maintainer releases and npm worms get caught and pulled. Packages
+  younger than 30 days are refused outright, which is what typosquatted and
+  AI-hallucinated ("slopsquatted") names look like.
 - **Blocks packages** by name glob, by version range, or by CVSS score range.
   Enforced on metadata, downloads, and publishes, without exception.
 - **Audits everything.** Every login and admin action is recorded; every

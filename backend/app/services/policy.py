@@ -10,7 +10,10 @@ Evaluation order (deliberate, and the block list is *always* enforced):
    This is its own switch, on by default, and does not depend on the CVE policy.
 4. CVE policy. A version whose highest CVSS score falls inside the configured
    block range is denied.
-5. Release age. A version a public upstream published less than
+5. New packages. Every version of a package that first appeared on a public
+   registry less than ``min_days`` ago is refused, unless an ``exempt`` rule
+   covers it: that is what a typosquatted or AI-hallucinated name looks like.
+6. Release age. A version a public upstream published less than
    ``min_days`` ago is held back, unless an ``exempt`` rule covers it or it is
    the fix for a CVE an older version of the package has.
 
@@ -53,6 +56,7 @@ CACHE_TTL = 60
 KEY_ALLOWLIST_MODE = "allowlist_mode"
 KEY_CVE_POLICY = "cve_policy"
 KEY_RELEASE_AGE = "release_age"
+KEY_NEW_PACKAGES = "new_packages"
 
 
 @dataclass(slots=True)
@@ -60,7 +64,7 @@ class Verdict:
     allowed: bool
     reason: str | None = None
     rule_id: int | None = None
-    # "block_rule" | "allowlist" | "malware" | "cve" | "release_age" | None
+    # "block_rule" | "allowlist" | "malware" | "cve" | "new_package" | "release_age" | None
     source: str | None = None
 
     @property
@@ -201,6 +205,43 @@ class ReleaseAgePolicy:
             enabled=bool(data.get("enabled", True)),
             min_days=int(data.get("min_days", 3)),
             exempt_security_fixes=bool(data.get("exempt_security_fixes", True)),
+        )
+
+
+@dataclass(slots=True)
+class NewPackagePolicy:
+    """Refuse packages that first appeared on a public registry recently.
+
+    Attackers register the names people mistype (typosquatting) and the
+    names AI assistants invent when they hallucinate a dependency
+    ("slopsquatting"), then wait for someone to install them. Such a name is
+    almost always days or weeks old, while the packages people actually mean
+    to use have usually existed for months or years. On by default, 30 days.
+    """
+
+    enabled: bool = True
+    min_days: int = 30
+
+    def new_until(self, first_published: datetime | None, now: datetime | None = None):
+        """When a package first published at ``first_published`` stops being
+        new, or None when it is not new (or its age is unknown)."""
+        if not self.enabled or first_published is None or self.min_days <= 0:
+            return None
+        if first_published.tzinfo is None:
+            first_published = first_published.replace(tzinfo=UTC)
+        until = first_published + timedelta(days=self.min_days)
+        return until if (now or datetime.now(UTC)) < until else None
+
+    def to_dict(self) -> dict:
+        return {"enabled": self.enabled, "min_days": self.min_days}
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> NewPackagePolicy:
+        if not data:
+            return cls()
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            min_days=int(data.get("min_days", 30)),
         )
 
 
@@ -353,6 +394,7 @@ class PolicyEngine:
         self._settings: dict[str, object] = {}
         self._public_upstreams: dict[int, bool] | None = None
         self._security_fixes: dict[tuple[str, str], list[str]] = {}
+        self._first_published: dict[tuple[str, str], datetime | None] = {}
 
     # -- loading ------------------------------------------------------------ #
     async def _load_rules(self) -> list[RuleSnapshot]:
@@ -402,6 +444,23 @@ class PolicyEngine:
 
     async def get_release_age_policy(self) -> ReleaseAgePolicy:
         return ReleaseAgePolicy.from_dict(await self.get_setting(KEY_RELEASE_AGE, None))
+
+    async def get_new_package_policy(self) -> NewPackagePolicy:
+        return NewPackagePolicy.from_dict(await self.get_setting(KEY_NEW_PACKAGES, None))
+
+    async def _package_first_published(self, eco: str, name: str) -> datetime | None:
+        key = (eco, name)
+        if key not in self._first_published:
+            self._first_published[key] = (
+                await self.session.execute(
+                    select(Package.first_published_at).where(
+                        Package.ecosystem == eco,
+                        Package.normalized_name == name,
+                        Package.is_local.is_(False),
+                    )
+                )
+            ).scalar_one_or_none()
+        return self._first_published[key]
 
     async def _upstream_public(self, upstream_id: int | None) -> bool:
         """Whether releases from this upstream are held. A version whose
@@ -556,7 +615,31 @@ class PolicyEngine:
                 source="cve",
             )
 
-        # 5. Release age. Only what someone else published: a version
+        # 5. New packages. Only what someone else published, like the hold.
+        if version is not None and not is_local:
+            guard = await self.get_new_package_policy()
+            if guard.enabled:
+                first = await self._package_first_published(eco, name)
+                until = guard.new_until(first)
+                if (
+                    until is not None
+                    and await self._upstream_public(upstream_id)
+                    and not self._exempted(applicable, name, eco, version)
+                ):
+                    return Verdict(
+                        allowed=False,
+                        reason=(
+                            f"blocked as a new package: {normalized_name} first appeared on "
+                            f"its registry on {first:%Y-%m-%d} UTC, and this registry only "
+                            f"serves packages that are at least {guard.min_days} days old, "
+                            f"from {until:%Y-%m-%d} UTC. A name that new is how typosquatted "
+                            "and AI-hallucinated packages are published: check this is the "
+                            "package you meant. If it is, ask an admin to exempt it"
+                        ),
+                        source="new_package",
+                    )
+
+        # 6. Release age. Only what someone else published: a version
         # published to this registry is the operator's own.
         if version is not None and not is_local and published_at is not None:
             hold = await self.get_release_age_policy()
@@ -589,8 +672,9 @@ class PolicyEngine:
     def _exempted(rules: list[RuleSnapshot], name: str, eco: str, version: str | None) -> bool:
         """Whether an ``exempt`` rule covers this package version.
 
-        Exempt rules only skip the hold on new releases. They never override a
-        block rule, malware or the CVE policy, which run first.
+        Exempt rules only skip the new-package guard and the hold on new
+        releases. They never override a block rule, malware or the CVE
+        policy, which run first.
         """
         for rule in rules:
             if rule.action != RuleAction.exempt.value:
@@ -606,6 +690,30 @@ class PolicyEngine:
     ) -> Verdict:
         """:meth:`evaluate` for a stored version row (see :func:`version_facts`)."""
         return await self.evaluate(ecosystem, normalized_name, row.version, **version_facts(row))
+
+    async def all_blocked_reason(
+        self, ecosystem: Ecosystem | str, normalized_name: str, rows, fallback: str
+    ) -> str:
+        """Why a package whose every version is blocked cannot be installed.
+
+        The reason of its newest version, which is the one a client asking
+        for the package would have got: "all versions are blocked by policy"
+        tells a person, or an AI agent, nothing they can act on, where "this
+        package is two days old" or "held until Friday" does.
+        """
+        rows = list(rows)
+        if not rows:
+            return fallback
+        epoch = datetime.min.replace(tzinfo=UTC)
+
+        def when(row):
+            stamp = row.published_at
+            if stamp is None:
+                return epoch
+            return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+
+        verdict = await self.evaluate_version(ecosystem, normalized_name, max(rows, key=when))
+        return verdict.reason or fallback
 
     async def is_name_blocked(self, ecosystem: Ecosystem | str, normalized_name: str) -> Verdict:
         """Package-level check with no version context, used before we have

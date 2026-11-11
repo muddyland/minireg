@@ -395,6 +395,10 @@ class Package(Base):
     cached_document: Mapped[dict | None] = mapped_column(JSONType)
     cached_etag: Mapped[str | None] = mapped_column(String(255))
     cached_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the package first appeared on its upstream registry (npm's
+    # `time.created`, else its oldest release). NULL when unknown -- some
+    # releases carry no date -- which the new-package guard reads as old.
+    first_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     download_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     first_seen_at: Mapped[datetime] = _now_col()

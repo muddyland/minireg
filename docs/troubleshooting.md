@@ -33,7 +33,10 @@ have already explained themselves in one of those two places.
 
 ### `403` with a message
 
-Policy did that, and the message says which. Confirm with **Package policy →
+Policy did that, and the message says which. `blocked as a new package`
+means the package first appeared on its registry less than 30 days ago:
+check the name first (a typo, or a package an AI assistant made up, is the
+usual cause), and if it is right, an admin can exempt it. Confirm with **Package policy →
 Test a package against the policy** — it names the rule.
 
 If it is the CVE policy, **Vulnerabilities** shows which CVE pushed the version

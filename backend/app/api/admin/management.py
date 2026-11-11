@@ -40,8 +40,10 @@ from ...services.packages import (
 from ...services.policy import (
     KEY_ALLOWLIST_MODE,
     KEY_CVE_POLICY,
+    KEY_NEW_PACKAGES,
     KEY_RELEASE_AGE,
     CvePolicy,
+    NewPackagePolicy,
     PolicyEngine,
     ReleaseAgePolicy,
     invalidate_policy_cache,
@@ -1167,6 +1169,11 @@ class ReleaseAgeUpdate(BaseModel):
     exempt_security_fixes: bool = True
 
 
+class NewPackagesUpdate(BaseModel):
+    enabled: bool = True
+    min_days: int = Field(default=30, ge=1, le=365)
+
+
 class AllowlistModeUpdate(BaseModel):
     enabled: bool
 
@@ -1188,6 +1195,7 @@ async def get_settings_(session: AsyncSession = Depends(get_session)) -> dict:
     return {
         "cve_policy": (await engine.get_cve_policy()).to_dict(),
         "release_age": (await engine.get_release_age_policy()).to_dict(),
+        "new_packages": (await engine.get_new_package_policy()).to_dict(),
         "allowlist_mode": await engine.allowlist_mode(),
     }
 
@@ -1238,6 +1246,30 @@ async def update_release_age(
         actor_username=identity.username,
         target_type="setting",
         target_id=KEY_RELEASE_AGE,
+        ip=client_ip(request),
+        detail=policy.to_dict(),
+    )
+    await session.commit()
+    await invalidate_policy_cache()
+    return policy.to_dict()
+
+
+@router.put("/settings/new-packages")
+async def update_new_packages(
+    payload: NewPackagesUpdate,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    identity: Identity = Depends(require_admin),
+) -> dict:
+    policy = NewPackagePolicy(**payload.model_dump())
+    await _write_setting(session, KEY_NEW_PACKAGES, policy.to_dict(), identity)
+    await audit.record_audit(
+        session,
+        audit.SETTING_UPDATED,
+        actor_user_id=identity.user_id,
+        actor_username=identity.username,
+        target_type="setting",
+        target_id=KEY_NEW_PACKAGES,
         ip=client_ip(request),
         detail=policy.to_dict(),
     )
