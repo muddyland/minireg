@@ -218,17 +218,38 @@ worker always speaks the same scanner API as the registry it talks to.
 
 ### What the image page shows
 
-Expand a tag on an image's page (**Images**, then the repository) to see the
-image behind it. For a multi-platform tag, pick the platform first. Only
-platforms pulled through minireg have details.
+**Images**, then a repository, lists its tags: platforms, the worst findings
+across platforms, size and when the tag last changed. Untagged digests are
+listed below; the platform images of a tagged multi-platform image are not
+(they are reached through the tag), and BuildKit attestations are hidden
+unless you tick **Show attestations**.
+
+Click a tag to open its page (`/images/<repository>?tag=<tag>`, so it can be
+linked to). The top of the page sums the image up: the platform (a
+multi-platform tag opens on the platform pulled most recently; only platforms
+pulled through minireg have details), the pull command by tag or by digest,
+the findings by severity, how many have a fix, the size and when it was
+scanned. Below that:
 
 | Tab | Shows |
 |-----|-------|
-| Vulnerabilities | Findings from the latest scan. You can filter by severity, by whether a fix exists and by known-exploited (KEV), or search for a CVE or package. Expand a finding to see the fix and the layer it came from. |
+| Vulnerabilities | **By package** (the default): one row per package to upgrade, with the version that fixes all its findings and their severities, high and critical first. Packages built from one source (`libc6` and `libc-bin`) share a row. Findings no release fixes yet are folded into **No fix available yet**. **All findings** is the flat list, one row per finding. Both filter by severity, known-exploited (KEV) and CVE or package; expand a finding to see the fix, the layer it came from and the advisory. |
 | Packages | Every package in the SBOM, with version, type, licence, the findings against it and the layer that added it. |
 | Layers | Each layer with its size, whether it is cached, and the build step that made it (`RUN …`, `COPY …`). Expand a layer to see the packages it added. |
 | Config | Entrypoint, command, user (flagged when it is root), working directory, ports, volumes, environment, labels and the full build history. |
 | Scan history | Every scan of this digest, with the mode, the Trivy and database versions, and the counts. |
+
+The severity shown for a finding is the one Trivy reports, which for OS
+packages is the distribution's own rating; it is what image policy enforces.
+It can be well below NVD's CVSS score (Debian rates some glibc CVEs *low*
+that NVD scores 9.8) because the distribution judged its own build. Such
+findings are marked with an asterisk; the CVSS score is in the tooltip and in
+the expanded finding.
+
+Admins find the actions in the **⋯** menu at the top right: on a tag page,
+**Refresh from upstream**, **Rescan** (the stored SBOM against today's
+database), **Full rescan** and **Watch this tag**; on both pages, **Pin
+repository**, **Edit watched tags** and **Quarantine repository**.
 
 All of this comes from data minireg already holds: the image config blob and
 the SBOM. You don't have to pull the image. If a cached image's config blob
@@ -300,7 +321,7 @@ everywhere, deny one of its CVEs.
   they are written to disk; the others read the same file as it grows.
 - **Rate-limit headers** from Docker Hub are recorded and shown on the
   **Image policy** page.
-- **Watched tags** (set on an image's page) are revalidated, pre-fetched and
+- **Watched tags** (set from the **⋯** menu on an image's page) are revalidated, pre-fetched and
   rescanned every hour. CI then finds them warm and current, and they are
   never evicted.
 

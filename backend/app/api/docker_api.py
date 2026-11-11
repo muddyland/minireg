@@ -11,6 +11,7 @@ Three audiences, three guards:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -49,6 +50,7 @@ from ..models import (
     UpstreamKind,
 )
 from ..services import audit
+from ..services.packages import _escape_like
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/docker", tags=["docker"])
@@ -257,13 +259,19 @@ async def get_repository(
                 "platforms": children,
             }
         )
+    tagged = select(DockerTag.manifest_id).where(DockerTag.repository_id == repo.id)
     untagged = (
         await session.execute(
             select(DockerManifest)
             .join(DockerRepoManifest, DockerRepoManifest.manifest_id == DockerManifest.id)
             .where(
                 DockerRepoManifest.repository_id == repo.id,
-                DockerManifest.id.notin_(select(DockerTag.manifest_id).where(DockerTag.repository_id == repo.id)),
+                DockerManifest.id.notin_(tagged),
+                # A platform image (or attestation) of a tagged index is
+                # reached through the tag; it is shown under it, not here.
+                DockerManifest.digest.notin_(
+                    select(DockerManifestRef.digest).where(DockerManifestRef.manifest_id.in_(tagged))
+                ),
             )
             .order_by(DockerManifest.last_accessed_at.desc())
             .limit(100)
@@ -565,11 +573,17 @@ async def list_findings(
     fixable: bool | None = None,
     kev: bool | None = None,
     q: str | None = None,
+    group: str | None = Query(default=None, pattern="^package$"),
     limit: int = Query(default=200, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     identity: Identity = Depends(require_user),
 ) -> dict:
+    """Findings of one image, flat (paged) or ``group=package``.
+
+    Grouped, every finding matching the filters comes back as one entry per
+    package to upgrade -- see :func:`group_findings`.
+    """
     m = await _manifest_or_404(session, digest)
     conds = [DockerFinding.manifest_id == m.id]
     if severity:
@@ -581,8 +595,21 @@ async def list_findings(
     if kev is not None:
         conds.append(DockerFinding.kev.is_(kev))
     if q:
-        like = f"%{q.strip()[:100]}%"
-        conds.append(or_(DockerFinding.vuln_id.ilike(like), DockerFinding.pkg_name.ilike(like)))
+        like = f"%{_escape_like(q.strip()[:100])}%"
+        conds.append(
+            or_(
+                DockerFinding.vuln_id.ilike(like, escape="\\"),
+                DockerFinding.pkg_name.ilike(like, escape="\\"),
+            )
+        )
+    if group == "package":
+        policy = await load_policy(session)
+        rows = (
+            await session.execute(
+                select(DockerFinding).where(and_(*conds)).order_by(*FINDING_ORDER).limit(GROUPED_MAX)
+            )
+        ).scalars().all()
+        return group_findings([finding_payload(f, policy) for f in rows], truncated=len(rows) == GROUPED_MAX)
     total = (await session.execute(select(func.count()).select_from(DockerFinding).where(and_(*conds)))).scalar_one()
     rows = (
         await session.execute(
@@ -591,6 +618,98 @@ async def list_findings(
     ).scalars().all()
     policy = await load_policy(session)
     return {"total": total, "findings": [finding_payload(f, policy) for f in rows]}
+
+
+#: Upper bound on findings grouped in one response; a large image has ~1k.
+GROUPED_MAX = 5000
+_SEV_RANK = {"UNKNOWN": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+
+def _version_key(version: str) -> list:
+    """Natural sort key for fixed versions (``1:1.2.13-1``, ``3.0.9``,
+    ``2.36-9+deb12u10``): digit runs compare as numbers. Good enough to pick
+    the highest of a handful of fixed versions for one package; it is a hint
+    on screen, never a policy input."""
+    return [(0, int(t)) if t.isdigit() else (1, t) for t in re.findall(r"\d+|[A-Za-z]+", version)]
+
+
+def _highest(versions: set[str | None]) -> str | None:
+    # Trivy may list several fix lines ("3.0.15, 3.1.7"); the lowest on each
+    # line is enough, so take the first of each before comparing.
+    firsts = {v.split(",")[0].strip() for v in versions if v and v.strip()}
+    return max(firsts, key=_version_key) if firsts else None
+
+
+def group_findings(findings: list[dict[str, Any]], truncated: bool = False) -> dict[str, Any]:
+    """One entry per thing to upgrade, so a long scan reads as a short list.
+
+    Findings are grouped by installed package. Binary packages built from
+    one source (``libc6`` and ``libc-bin``) carry the same version and the
+    same findings, so packages with an identical version and identical set
+    of vulnerabilities are merged into one entry listing every name.
+
+    Each entry is split into what upgrading fixes (``fixable``, with the
+    highest fixed version: upgrading to it clears all of them) and what no
+    release fixes yet (``unfixed``); the page shows the first and folds the
+    second away.
+    """
+    by_package: dict[tuple, list[dict]] = {}
+    for f in findings:
+        key = (f["pkg_name"], f["installed_version"] or "", f["pkg_type"] or "")
+        by_package.setdefault(key, []).append(f)
+
+    merged: dict[tuple, dict] = {}
+    for (name, version, ptype), items in by_package.items():
+        signature = (version, ptype, frozenset(f["vuln_id"] for f in items))
+        entry = merged.get(signature)
+        if entry is None:
+            merged[signature] = {"packages": [name], "installed_version": version or None, "pkg_type": ptype or None, "findings": items}
+        else:
+            entry["packages"].append(name)
+
+    groups = []
+    for entry in merged.values():
+        fixable = [f for f in entry["findings"] if f["fixed_version"]]
+        unfixed = [f for f in entry["findings"] if not f["fixed_version"]]
+
+        def summary(items: list[dict]) -> dict[str, Any]:
+            counts: dict[str, int] = {}
+            for f in items:
+                counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+            return {
+                "count": len(items),
+                "counts": counts,
+                "kev": sum(1 for f in items if f["kev"]),
+                "worst": max((f["severity"] for f in items), key=lambda s: _SEV_RANK.get(s, 0), default=None),
+                "findings": items,
+            }
+
+        groups.append(
+            {
+                "packages": sorted(entry["packages"]),
+                "installed_version": entry["installed_version"],
+                "pkg_type": entry["pkg_type"],
+                "fixed_version": _highest({f["fixed_version"] for f in fixable}),
+                "fixable": summary(fixable),
+                "unfixed": summary(unfixed),
+            }
+        )
+
+    def order(g: dict, part: str) -> tuple:
+        s = g[part]
+        return (-s["kev"], -_SEV_RANK.get(s["worst"] or "", 0), -s["count"], g["packages"][0])
+
+    fixable = sorted((g for g in groups if g["fixable"]["count"]), key=lambda g: order(g, "fixable"))
+    unfixed = sorted((g for g in groups if g["unfixed"]["count"]), key=lambda g: order(g, "unfixed"))
+    return {
+        "total": len(findings),
+        "vulnerabilities": len({f["vuln_id"] for f in findings}),
+        "fixable_findings": sum(g["fixable"]["count"] for g in groups),
+        "unfixed_findings": sum(g["unfixed"]["count"] for g in groups),
+        "fixable": fixable,
+        "unfixed": unfixed,
+        "truncated": truncated,
+    }
 
 
 #: Findings order everywhere: known-exploited first, then by score.

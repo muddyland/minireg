@@ -210,6 +210,39 @@ async def test_detail_lists_versions_with_their_policy_status_and_images(docker_
     assert missing.status_code == 404
 
 
+async def test_an_image_cve_takes_the_rating_policy_uses_not_cvss(docker_env):  # noqa: F811
+    """Debian rates CVE-2019-1010022 low for its glibc build; NVD says 9.8.
+    Image policy enforces the distribution's rating, so the Risk page does too
+    (the score stays available as ``cvss``)."""
+    client, fake = docker_env
+    admin, img = await seed(client)
+    await _image(client, fake, img, pulled_days_ago=1)
+    async with db_module.session_scope() as session:
+        manifest = (
+            await session.execute(select(DockerManifest).where(DockerManifest.digest == img.digest))
+        ).scalar_one()
+        session.add(
+            DockerFinding(
+                manifest_id=manifest.id, scan_id=1, vuln_id="CVE-2019-1010022", pkg_name="libc6",
+                installed_version="2.36-9", severity="LOW", cvss=9.8,
+            )
+        )
+    r = await client.get(
+        "/api/admin/risk", params={"min_severity": "none"},
+        headers={"authorization": f"Bearer {admin}"},
+    )
+    items = {i["id"]: i for i in r.json()["items"]}
+    assert items["CVE-2019-1010022"]["severity"] == "low"
+    assert items["CVE-2019-1010022"]["cvss"] == 9.8
+    # A CVE in both a package (CVSS 9.8) and an image keeps the higher rating.
+    assert items["CVE-2026-0001"]["severity"] == "critical"
+    r = await client.get(
+        "/api/admin/risk", params={"min_severity": "critical"},
+        headers={"authorization": f"Bearer {admin}"},
+    )
+    assert "CVE-2019-1010022" not in {i["id"] for i in r.json()["items"]}
+
+
 async def test_admin_only(docker_env):  # noqa: F811
     client, _fake = docker_env
     reader = await make_user(username="reader", scopes=("read",))

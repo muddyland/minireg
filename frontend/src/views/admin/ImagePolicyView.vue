@@ -372,7 +372,7 @@ onMounted(load)
                   <td class="small">{{ img.platform || '—' }}</td>
                   <td class="small">
                     <div v-for="w in img.where" :key="w">
-                      <router-link class="mono" :to="{ name: 'image', params: { name: w.split(':')[0] } }">{{ w }}</router-link>
+                      <router-link class="mono" :to="{ name: 'image', params: { name: w.split(':')[0] }, query: w.includes(':') ? { tag: w.split(':')[1] } : {} }">{{ w }}</router-link>
                     </div>
                   </td>
                   <td class="mono small">{{ img.a_fixed_version || '—' }}</td>
