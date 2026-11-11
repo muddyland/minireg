@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import api from '@/api/client'
-import { formatBytes, formatNumber, percent } from '@/utils/format'
+import { formatBytes, formatNumber, percent, relativeTime } from '@/utils/format'
 import { errorMessage } from '@/utils/errors'
 import EcosystemBadge from '@/components/EcosystemBadge.vue'
 
@@ -235,12 +235,16 @@ onMounted(load)
           <h4 class="small">On-disk detail</h4>
           <div class="row small" style="justify-content: space-between">
             <span class="dim">Blob files on disk</span>
-            <span>{{ formatNumber(stats.disk.blob_files_on_disk) }}</span>
+            <span>{{ stats.disk.measured_at ? formatNumber(stats.disk.blob_files_on_disk) : '—' }}</span>
           </div>
           <div class="row small" style="justify-content: space-between">
             <span class="dim">Bytes on disk</span>
-            <span>{{ formatBytes(stats.disk.blob_bytes_on_disk) }}</span>
+            <span>{{ stats.disk.measured_at ? formatBytes(stats.disk.blob_bytes_on_disk) : '—' }}</span>
           </div>
+          <p class="field-hint" style="margin: 0.2rem 0 0.4rem">
+            <template v-if="stats.disk.measured_at">Counted by the hourly sweep {{ relativeTime(stats.disk.measured_at) }}.</template>
+            <template v-else>Counted by the hourly sweep; not run yet since this version started.</template>
+          </p>
           <div class="row small" style="justify-content: space-between">
             <span class="dim">Logical size (all references)</span>
             <span>{{ formatBytes(stats.blobs.logical_bytes) }}</span>

@@ -149,6 +149,18 @@ async def _prune_task() -> None:
             )
 
 
+async def _rollup_task() -> None:
+    """Roll closed days of the request log up for the dashboard."""
+    from .services import rollup
+
+    async with session_scope() as session:
+        result = await rollup.run_rollup(session)
+        pruned = await rollup.prune_rollups(session)
+        await session.commit()
+    if result.get("days") or pruned:
+        log.info("housekeeping: download rollup %s, pruned %s", result, pruned)
+
+
 async def _artifact_task() -> None:
     """Orphan rows and files, the storage quota, and stale staging files."""
     from .services.artifacts import run_housekeeping
@@ -336,6 +348,7 @@ async def housekeeping_pass() -> bool:
         return False
     try:
         for name, task in (
+            ("rollup", _rollup_task),
             ("prune", _prune_task),
             ("artifacts", _artifact_task),
             ("docker", _docker_task),
@@ -696,7 +709,9 @@ async def health_detailed(
     checks["redis"] = checks["cache"]
 
     try:
-        usage = await get_store().disk_usage()
+        # statvfs only: walking the blob tree here made every dashboard load,
+        # and every anonymous monitor probe, stat each cached file.
+        usage = await asyncio.to_thread(get_store().disk_space)
         checks["storage"] = {"ok": True, **(usage if detailed else {})}
     except Exception as exc:
         log.error("health: storage check failed: %s", exc)

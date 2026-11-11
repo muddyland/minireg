@@ -725,6 +725,58 @@ class DownloadLog(Base):
     )
 
 
+class DownloadDaily(Base):
+    """Downloads per UTC day, package and kind: what the dashboard reads.
+
+    The dashboard used to aggregate ``download_log`` itself, which is one row
+    per request: millions of rows a month on a busy registry, scanned several
+    times per page load. Closed days are rolled up here once (see
+    ``services.rollup``) and only today is read from the raw log.
+    """
+
+    __tablename__ = "download_daily"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    day: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    ecosystem: Mapped[str] = mapped_column(String(8), nullable=False)
+    package_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    downloads: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    bytes_sent: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    cache_hits: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "day", "ecosystem", "package_name", "kind", name="uq_download_daily"
+        ),
+        Index("ix_dd_day_pkg", "day", "ecosystem", "package_name"),
+    )
+
+
+class DownloadDailyUser(Base):
+    """Which signed-in users downloaded a package on a UTC day.
+
+    Only read for the handful of packages the dashboard lists, through the
+    (ecosystem, package_name, day) key, so its size does not matter to it.
+    Kept apart from ``DownloadDaily`` because a user column there multiplied
+    that table's rows by the number of users.
+    """
+
+    __tablename__ = "download_daily_users"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
+    day: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    ecosystem: Mapped[str] = mapped_column(String(8), nullable=False)
+    package_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "ecosystem", "package_name", "day", "user_id", name="uq_download_daily_users"
+        ),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Container images
 # --------------------------------------------------------------------------- #

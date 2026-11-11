@@ -37,27 +37,28 @@ const cacheHitPercent = computed(() => {
   return rate === null || rate === undefined ? null : Math.round(rate * 100)
 })
 
+// Each panel loads on its own and renders as soon as its data arrives. They
+// used to wait on one Promise.all, so the slowest request (the component
+// health check) held back the whole page.
+let generation = 0
 async function load() {
-  loading.value = true
+  const current = ++generation
   error.value = null
-  try {
-    const [o, t, l, tl, h] = await Promise.all([
-      api.statsOverview(days.value),
-      api.topPackages({ days: days.value, limit: 12 }),
-      api.recentLogins(10),
-      api.downloadsTimeline(days.value),
-      api.health().catch(() => null),
-    ])
-    overview.value = o
-    top.value = t.packages
-    logins.value = l.logins
-    timeline.value = tl.points
-    health.value = h
-  } catch (err) {
-    error.value = errorMessage(err, 'Could not load the dashboard.')
-  } finally {
-    loading.value = false
+  if (!overview.value) loading.value = true
+  const fail = (err) => {
+    if (current === generation && !error.value) error.value = errorMessage(err, 'Could not load the dashboard.')
   }
+  const settle = (promise, apply) =>
+    promise.then((value) => current === generation && apply(value)).catch(fail)
+  api.health().then((h) => current === generation && (health.value = h)).catch(() => {})
+  await Promise.all([
+    settle(api.statsOverview(days.value), (o) => (overview.value = o)).finally(() => {
+      if (current === generation) loading.value = false
+    }),
+    settle(api.topPackages({ days: days.value, limit: 12 }), (t) => (top.value = t.packages)),
+    settle(api.recentLogins(10), (l) => (logins.value = l.logins)),
+    settle(api.downloadsTimeline(days.value), (tl) => (timeline.value = tl.points)),
+  ])
 }
 
 onMounted(load)
