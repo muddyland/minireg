@@ -169,16 +169,7 @@ async def package_detail(
     # settings, so this is one load plus in-memory checks per version.
     version_verdicts = {}
     for v in package.versions:
-        version_verdicts[v.id] = await policy.evaluate(
-            ecosystem,
-            package.normalized_name,
-            v.version,
-            max_cvss=v.max_cvss,
-            has_fix=v.has_fix,
-            scanned=bool(v.scanned_at),
-            has_advisories=v.has_advisories,
-            malicious=v.is_malicious,
-        )
+        version_verdicts[v.id] = await policy.evaluate_version(ecosystem, package.normalized_name, v)
 
     return {
         "ecosystem": ecosystem.value,

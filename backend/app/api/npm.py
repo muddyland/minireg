@@ -55,7 +55,7 @@ from ..db import get_session
 from ..models import DistTag, Ecosystem, Package, PackageFile, PackageVersion
 from ..services import artifacts, audit, npm_publish, npm_render, ownership, packages
 from ..services.osv import inline_scan
-from ..services.policy import PolicyEngine
+from ..services.policy import VERSION_FACT_COLUMNS, PolicyEngine
 from ..services.storage import get_store
 
 log = logging.getLogger(__name__)
@@ -184,14 +184,9 @@ async def _version_columns(session: AsyncSession, package_id: int) -> list:
     return list(
         (
             await session.execute(
-                select(
-                    PackageVersion.version,
-                    PackageVersion.max_cvss,
-                    PackageVersion.has_fix,
-                    PackageVersion.has_advisories,
-                    PackageVersion.is_malicious,
-                    PackageVersion.scanned_at,
-                ).where(PackageVersion.package_id == package_id)
+                select(PackageVersion.version, *VERSION_FACT_COLUMNS).where(
+                    PackageVersion.package_id == package_id
+                )
             )
         ).all()
     )
@@ -700,15 +695,11 @@ async def get_tarball(
 
     # Policy is enforced on the artifact path too -- a blocked package must not
     # be downloadable even if a client already has the metadata cached.
-    verdict = await PolicyEngine(session).evaluate(
-        ECOSYSTEM,
-        normalized,
-        version_row.version if version_row else None,
-        max_cvss=version_row.max_cvss if version_row else None,
-        has_fix=bool(version_row and version_row.has_fix),
-        scanned=bool(version_row and version_row.scanned_at),
-        has_advisories=bool(version_row and version_row.has_advisories),
-        malicious=bool(version_row and version_row.is_malicious),
+    engine = PolicyEngine(session)
+    verdict = (
+        await engine.evaluate_version(ECOSYSTEM, normalized, version_row)
+        if version_row is not None
+        else await engine.evaluate(ECOSYSTEM, normalized, None, scanned=False)
     )
     if verdict.blocked:
         audit.record_download(
@@ -1606,16 +1597,7 @@ async def _version_response(
     if version_row is None:
         return npm_error("version not found", status.HTTP_404_NOT_FOUND)
 
-    verdict = await policy.evaluate(
-        ECOSYSTEM,
-        package.normalized_name,
-        resolved,
-        max_cvss=version_row.max_cvss,
-        has_fix=version_row.has_fix,
-        scanned=bool(version_row.scanned_at),
-        has_advisories=version_row.has_advisories,
-        malicious=version_row.is_malicious,
-    )
+    verdict = await policy.evaluate_version(ECOSYSTEM, package.normalized_name, version_row)
     if verdict.blocked:
         return npm_error(verdict.reason or "package is blocked", status.HTTP_403_FORBIDDEN)
 
@@ -1824,16 +1806,7 @@ async def _blocked_from_rows(policy: PolicyEngine, normalized: str, rows) -> set
     ``scanned_at``."""
     blocked: set[str] = set()
     for version_row in rows:
-        verdict = await policy.evaluate(
-            ECOSYSTEM,
-            normalized,
-            version_row.version,
-            max_cvss=version_row.max_cvss,
-            has_fix=version_row.has_fix,
-            scanned=bool(version_row.scanned_at),
-            has_advisories=version_row.has_advisories,
-            malicious=version_row.is_malicious,
-        )
+        verdict = await policy.evaluate_version(ECOSYSTEM, normalized, version_row)
         if verdict.blocked:
             blocked.add(version_row.version)
     return blocked

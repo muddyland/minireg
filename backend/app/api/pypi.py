@@ -256,16 +256,7 @@ async def get_file(
         return PlainTextResponse("Not Found", status_code=status.HTTP_404_NOT_FOUND)
     package, version_row, file_row = located
 
-    verdict = await PolicyEngine(session).evaluate(
-        ECOSYSTEM,
-        package.normalized_name,
-        version_row.version,
-        max_cvss=version_row.max_cvss,
-        has_fix=version_row.has_fix,
-        scanned=bool(version_row.scanned_at),
-        has_advisories=version_row.has_advisories,
-        malicious=version_row.is_malicious,
-    )
+    verdict = await PolicyEngine(session).evaluate_version(ECOSYSTEM, package.normalized_name, version_row)
     if verdict.blocked:
         audit.record_download(
             audit.DownloadEvent(
@@ -338,16 +329,7 @@ async def _get_core_metadata(session: AsyncSession, project: str, filename: str)
 
     # Policy first. Without it this route both described a blocked release and,
     # on a cache miss below, fetched the blocked wheel from upstream to do so.
-    verdict = await PolicyEngine(session).evaluate(
-        ECOSYSTEM,
-        package.normalized_name,
-        version_row.version,
-        max_cvss=version_row.max_cvss,
-        has_fix=version_row.has_fix,
-        scanned=bool(version_row.scanned_at),
-        has_advisories=version_row.has_advisories,
-        malicious=version_row.is_malicious,
-    )
+    verdict = await PolicyEngine(session).evaluate_version(ECOSYSTEM, package.normalized_name, version_row)
     if verdict.blocked:
         return PlainTextResponse(
             verdict.reason or "blocked", status_code=status.HTTP_403_FORBIDDEN
@@ -840,16 +822,7 @@ async def _scan_new_versions(session: AsyncSession, package: Package) -> None:
 async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
     blocked: set[str] = set()
     for version_row in package.versions:
-        verdict = await policy.evaluate(
-            ECOSYSTEM,
-            package.normalized_name,
-            version_row.version,
-            max_cvss=version_row.max_cvss,
-            has_fix=version_row.has_fix,
-            scanned=bool(version_row.scanned_at),
-            has_advisories=version_row.has_advisories,
-            malicious=version_row.is_malicious,
-        )
+        verdict = await policy.evaluate_version(ECOSYSTEM, package.normalized_name, version_row)
         if verdict.blocked:
             blocked.add(version_row.version)
     return blocked

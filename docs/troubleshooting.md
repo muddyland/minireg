@@ -49,8 +49,9 @@ error: failed to select a version for the requirement `time = "=0.3.20"`
 ```
 
 The version almost always exists upstream: it is **blocked by policy** — a
-CVE score in the blocked range, a version-range block rule, or allowlist mode
-— and blocked versions are left out of the metadata the registry serves (cargo
+CVE score in the blocked range, a version-range block rule, allowlist mode,
+or the **hold on new releases** (a release less than 3 days old; a lockfile
+that Dependabot or Renovate bumped this morning hits this) — and blocked versions are left out of the metadata the registry serves (cargo
 sees them as yanked). The client therefore reports "no such version" rather
 than a `403`. Pins and lockfiles written against public npm or PyPI hit this
 first.
@@ -65,7 +66,8 @@ To see which versions are blocked and why:
   against the policy.
 
 Then upgrade to an allowed version, or ask an admin for a rule change or a
-risk acceptance.
+risk acceptance. A held release needs nothing: it is served once it is old
+enough, and an admin can exempt the package if it cannot wait.
 
 A package blocked outright by name does not appear in **Search** for
 non-admins (see [Browsing](usage.md#browsing)). Installing it fails with a

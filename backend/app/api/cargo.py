@@ -218,16 +218,7 @@ async def download(
         return cargo_error("not found", status.HTTP_404_NOT_FOUND)
     package, version_row, file_row = located
 
-    verdict = await PolicyEngine(session).evaluate(
-        ECOSYSTEM,
-        package.normalized_name,
-        version_row.version,
-        max_cvss=version_row.max_cvss,
-        has_fix=version_row.has_fix,
-        scanned=bool(version_row.scanned_at),
-        has_advisories=version_row.has_advisories,
-        malicious=version_row.is_malicious,
-    )
+    verdict = await PolicyEngine(session).evaluate_version(ECOSYSTEM, package.normalized_name, version_row)
     if verdict.blocked:
         audit.record_download(
             audit.DownloadEvent(
@@ -327,16 +318,7 @@ async def _scan_new_versions(session: AsyncSession, package: Package) -> None:
 async def _blocked_versions(policy: PolicyEngine, package: Package) -> set[str]:
     blocked: set[str] = set()
     for version_row in package.versions:
-        verdict = await policy.evaluate(
-            ECOSYSTEM,
-            package.normalized_name,
-            version_row.version,
-            max_cvss=version_row.max_cvss,
-            has_fix=version_row.has_fix,
-            scanned=bool(version_row.scanned_at),
-            has_advisories=version_row.has_advisories,
-            malicious=version_row.is_malicious,
-        )
+        verdict = await policy.evaluate_version(ECOSYSTEM, package.normalized_name, version_row)
         if verdict.blocked:
             blocked.add(version_row.version)
     return blocked

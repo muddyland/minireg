@@ -10,6 +10,8 @@ Evaluation order:
 3. **Malware** — deny versions a malicious-package advisory names. On by default.
 4. **CVE score policy** — deny versions inside the configured score range. On
    by default for high and critical (7.0–10.0).
+5. **Hold on new releases** — deny releases a public registry published less
+   than 3 days ago. On by default.
 
 A fresh install protects its users without anyone opening this page: known
 malware and high/critical CVEs are refused from the first install. Everything
@@ -99,6 +101,57 @@ so blocking errs toward blocking.
 
 When `latest` pointed at a blocked version, it is repointed at the highest
 surviving version rather than left dangling at something that will not install.
+
+---
+
+## Hold on new releases
+
+**Package policy → Hold new releases.** On by default, for 3 days.
+
+A release that a public registry (npmjs, PyPI, crates.io) published less than
+the configured number of days ago is not served: it is left out of the
+packument, the simple index and the dist-tags, and a direct download is
+refused with a `403` that says when it will be served:
+
+```
+held back: 1.1.0 was published 2026-11-10 09:12 UTC, and this registry serves
+new releases 3 days after publication, from 2026-11-13 09:12 UTC. Use an
+earlier version, or ask an admin to exempt this package
+```
+
+That window is when hijacked maintainer accounts, self-spreading npm worms and
+dependency-confusion uploads do their damage: most malicious releases are
+found and pulled within hours to a few days. Nobody in a home lab or a
+classroom is watching advisories in real time, and an AI coding agent installs
+whatever was published a minute ago, so the registry waits instead. `latest`
+falls back to the newest release that is old enough, so `npm install foo`
+keeps working and installs the previous release. For cargo, a held version is
+served as yanked, like any blocked version.
+
+What is never held:
+
+- Packages published to this registry.
+- Releases from an upstream that is not public. A GitLab upstream is private
+  by default (it serves your own people's packages); any upstream can be
+  switched with **Public registry** on its form.
+- A release whose publication time the upstream does not report. npm and
+  crates.io always report it; a PyPI upstream reports it only through the JSON
+  simple API (PEP 700), so an HTML-only private index is never held.
+- **Security fixes**, while **Serve security fixes straight away** is on (the
+  default): a release that an advisory names as the fixed version for an
+  older version of the same package is served at once, so the hold never
+  keeps a vulnerable version in place. The advisory has to be known already;
+  a fix released before its advisory reaches OSV waits like anything else, or
+  until you exempt it.
+
+### Exempt rules
+
+An **exempt** rule (**Add exemption**) skips the hold for what it matches:
+a pattern, optionally a version range, the same as any rule. Use it for a
+package you need on release day, or one you trust enough to take the risk.
+
+An exemption only skips the hold. A block rule, malware and the CVE policy
+still apply: they run first.
 
 ---
 

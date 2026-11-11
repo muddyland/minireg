@@ -10,6 +10,9 @@ Evaluation order (deliberate, and the block list is *always* enforced):
    This is its own switch, on by default, and does not depend on the CVE policy.
 4. CVE policy. A version whose highest CVSS score falls inside the configured
    block range is denied.
+5. Release age. A version a public upstream published less than
+   ``min_days`` ago is held back, unless an ``exempt`` rule covers it or it is
+   the fix for a CVE an older version of the package has.
 
 Rules are cached in Redis and in-process because they are consulted on every
 single request; the cache is invalidated whenever a rule is written.
@@ -20,6 +23,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +31,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..core.cache import cache_delete_prefix, cache_get_json, cache_set_json
 from ..core.naming import _PEP503_RE
 from ..core.semver import is_valid_range, satisfies
-from ..models import Ecosystem, PackageRule, RuleAction, Setting
+from ..models import (
+    Ecosystem,
+    Package,
+    PackageRule,
+    PackageVersion,
+    PackageVulnerability,
+    RuleAction,
+    Setting,
+    Upstream,
+    upstream_is_public,
+)
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +52,7 @@ CACHE_TTL = 60
 # Setting keys
 KEY_ALLOWLIST_MODE = "allowlist_mode"
 KEY_CVE_POLICY = "cve_policy"
+KEY_RELEASE_AGE = "release_age"
 
 
 @dataclass(slots=True)
@@ -45,7 +60,7 @@ class Verdict:
     allowed: bool
     reason: str | None = None
     rule_id: int | None = None
-    # "block_rule" | "allowlist" | "malware" | "cve" | None
+    # "block_rule" | "allowlist" | "malware" | "cve" | "release_age" | None
     source: str | None = None
 
     @property
@@ -138,6 +153,100 @@ class CvePolicy:
             # `enabled` then, and is on for everyone now.
             block_malware=bool(data.get("block_malware", True)),
         )
+
+
+@dataclass(slots=True)
+class ReleaseAgePolicy:
+    """Hold back releases a public upstream published less than ``min_days`` ago.
+
+    Most malicious releases on npm, PyPI and crates.io -- a hijacked
+    maintainer account, a self-spreading worm, a dependency-confusion upload
+    -- are found and pulled within hours to a few days. A registry that waits
+    that long before serving a release keeps its users out of that window,
+    which matters most for the people minireg is for: nobody in a home lab or
+    a classroom is watching advisories in real time, and an AI agent will
+    install whatever was published a minute ago. On by default.
+
+    ``exempt_security_fixes`` lets a release through early when it is the
+    fixed version an advisory names for an older version of the same package,
+    so the hold never keeps a vulnerable version in place.
+    """
+
+    enabled: bool = True
+    min_days: int = 3
+    exempt_security_fixes: bool = True
+
+    def held_until(self, published_at: datetime | None, now: datetime | None = None):
+        """When a release published at ``published_at`` stops being held, or
+        None when it is not held (old enough, policy off, or unknown age)."""
+        if not self.enabled or published_at is None or self.min_days <= 0:
+            return None
+        if published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=UTC)
+        until = published_at + timedelta(days=self.min_days)
+        return until if (now or datetime.now(UTC)) < until else None
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "min_days": self.min_days,
+            "exempt_security_fixes": self.exempt_security_fixes,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> ReleaseAgePolicy:
+        if not data:
+            return cls()
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            min_days=int(data.get("min_days", 3)),
+            exempt_security_fixes=bool(data.get("exempt_security_fixes", True)),
+        )
+
+
+def version_facts(row) -> dict:
+    """The keyword arguments :meth:`PolicyEngine.evaluate` needs for a
+    stored version: a PackageVersion, or a column row carrying the same names.
+
+    Every caller holding a version row goes through this, so a new input to
+    the policy reaches every path at once. Attributes are read directly, not
+    with defaults: a column query that forgot one fails loudly in tests
+    instead of silently skipping a check.
+    """
+    return {
+        "max_cvss": row.max_cvss,
+        "has_fix": bool(row.has_fix),
+        "scanned": row.scanned_at is not None,
+        "has_advisories": row.has_advisories,
+        "malicious": bool(row.is_malicious),
+        "published_at": row.published_at,
+        "upstream_id": row.upstream_id,
+        "is_local": bool(row.is_local),
+    }
+
+
+#: The PackageVersion columns :func:`version_facts` reads, for column queries.
+VERSION_FACT_COLUMNS = (
+    PackageVersion.max_cvss,
+    PackageVersion.has_fix,
+    PackageVersion.scanned_at,
+    PackageVersion.has_advisories,
+    PackageVersion.is_malicious,
+    PackageVersion.published_at,
+    PackageVersion.upstream_id,
+    PackageVersion.is_local,
+)
+
+
+def _same_version(ecosystem: str, a: str, b: str) -> bool:
+    if ecosystem == "pypi":
+        try:
+            from packaging.version import Version
+
+            return Version(a) == Version(b)
+        except Exception:
+            return a.strip().lower() == b.strip().lower()
+    return a.strip().lstrip("v=") == b.strip().lstrip("v=")
 
 
 @dataclass(slots=True)
@@ -242,6 +351,8 @@ class PolicyEngine:
         self.session = session
         self._rules: list[RuleSnapshot] | None = None
         self._settings: dict[str, object] = {}
+        self._public_upstreams: dict[int, bool] | None = None
+        self._security_fixes: dict[tuple[str, str], list[str]] = {}
 
     # -- loading ------------------------------------------------------------ #
     async def _load_rules(self) -> list[RuleSnapshot]:
@@ -289,6 +400,43 @@ class PolicyEngine:
     async def get_cve_policy(self) -> CvePolicy:
         return CvePolicy.from_dict(await self.get_setting(KEY_CVE_POLICY, None))
 
+    async def get_release_age_policy(self) -> ReleaseAgePolicy:
+        return ReleaseAgePolicy.from_dict(await self.get_setting(KEY_RELEASE_AGE, None))
+
+    async def _upstream_public(self, upstream_id: int | None) -> bool:
+        """Whether releases from this upstream are held. A version whose
+        upstream is unknown (deleted, or never recorded) counts as public:
+        that is the safe direction."""
+        if upstream_id is None:
+            return True
+        if self._public_upstreams is None:
+            rows = (await self.session.execute(select(Upstream))).scalars().all()
+            self._public_upstreams = {u.id: upstream_is_public(u) for u in rows}
+        return self._public_upstreams.get(upstream_id, True)
+
+    async def _is_security_fix(self, eco: str, name: str, version: str) -> bool:
+        """Whether ``version`` is the fixed version an advisory names for
+        another version of this package. Loaded once per package, and only
+        for a version that is actually being held."""
+        key = (eco, name)
+        if key not in self._security_fixes:
+            rows = (
+                await self.session.execute(
+                    select(PackageVulnerability.fixed_version)
+                    .join(PackageVersion, PackageVersion.id == PackageVulnerability.version_id)
+                    .join(Package, Package.id == PackageVersion.package_id)
+                    .where(
+                        Package.ecosystem == eco,
+                        Package.normalized_name == name,
+                        PackageVulnerability.fixed_version.is_not(None),
+                        PackageVulnerability.suppressed.is_(False),
+                    )
+                    .distinct()
+                )
+            ).scalars().all()
+            self._security_fixes[key] = [r for r in rows if r]
+        return any(_same_version(eco, version, fixed) for fixed in self._security_fixes[key])
+
     async def allowlist_mode(self) -> bool:
         value = await self.get_setting(KEY_ALLOWLIST_MODE, {"enabled": False})
         if isinstance(value, dict):
@@ -307,6 +455,9 @@ class PolicyEngine:
         scanned: bool = True,
         has_advisories: bool | None = None,
         malicious: bool = False,
+        published_at: datetime | None = None,
+        upstream_id: int | None = None,
+        is_local: bool = False,
         _name_level: bool = False,
     ) -> Verdict:
         eco = ecosystem.value if isinstance(ecosystem, Ecosystem) else str(ecosystem)
@@ -405,7 +556,56 @@ class PolicyEngine:
                 source="cve",
             )
 
+        # 5. Release age. Only what someone else published: a version
+        # published to this registry is the operator's own.
+        if version is not None and not is_local and published_at is not None:
+            hold = await self.get_release_age_policy()
+            until = hold.held_until(published_at)
+            if (
+                until is not None
+                and await self._upstream_public(upstream_id)
+                and not self._exempted(applicable, name, eco, version)
+                and not (
+                    hold.exempt_security_fixes
+                    and await self._is_security_fix(eco, name, version)
+                )
+            ):
+                published = published_at if published_at.tzinfo else published_at.replace(tzinfo=UTC)
+                return Verdict(
+                    allowed=False,
+                    reason=(
+                        f"held back: {version} was published "
+                        f"{published:%Y-%m-%d %H:%M} UTC, and this registry serves new "
+                        f"releases {hold.min_days} days after publication, from "
+                        f"{until:%Y-%m-%d %H:%M} UTC. Use an earlier version, or ask "
+                        "an admin to exempt this package"
+                    ),
+                    source="release_age",
+                )
+
         return ALLOWED
+
+    @staticmethod
+    def _exempted(rules: list[RuleSnapshot], name: str, eco: str, version: str | None) -> bool:
+        """Whether an ``exempt`` rule covers this package version.
+
+        Exempt rules only skip the hold on new releases. They never override a
+        block rule, malware or the CVE policy, which run first.
+        """
+        for rule in rules:
+            if rule.action != RuleAction.exempt.value:
+                continue
+            if _matches_name(rule.pattern, name, eco) and _matches_version(
+                rule.version_spec, eco, version
+            ):
+                return True
+        return False
+
+    async def evaluate_version(
+        self, ecosystem: Ecosystem | str, normalized_name: str, row
+    ) -> Verdict:
+        """:meth:`evaluate` for a stored version row (see :func:`version_facts`)."""
+        return await self.evaluate(ecosystem, normalized_name, row.version, **version_facts(row))
 
     async def is_name_blocked(self, ecosystem: Ecosystem | str, normalized_name: str) -> Verdict:
         """Package-level check with no version context, used before we have

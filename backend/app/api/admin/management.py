@@ -21,12 +21,15 @@ from ...models import (
     ApiToken,
     AuthProvider,
     Ecosystem,
+    Package,
     PackageRule,
+    PackageVersion,
     RuleAction,
     Setting,
     Upstream,
     UpstreamKind,
     User,
+    upstream_is_public,
 )
 from ...services import audit
 from ...services.packages import (
@@ -37,8 +40,10 @@ from ...services.packages import (
 from ...services.policy import (
     KEY_ALLOWLIST_MODE,
     KEY_CVE_POLICY,
+    KEY_RELEASE_AGE,
     CvePolicy,
     PolicyEngine,
+    ReleaseAgePolicy,
     invalidate_policy_cache,
 )
 from ...services.resolver import build_provider
@@ -321,6 +326,8 @@ class UpstreamCreate(BaseModel):
     #: Claiming a pattern stops every other upstream serving those names.
     name_patterns: list[str] = Field(default_factory=list)
     require_digest: bool = True
+    # None derives it from the kind: public registries yes, GitLab no.
+    is_public: bool | None = None
     cache_artifacts: bool = True
     gitlab_project_id: str | None = None
     gitlab_group_id: str | None = None
@@ -347,6 +354,7 @@ class UpstreamUpdate(BaseModel):
     verify_ssl: bool | None = None
     name_patterns: list[str] | None = None
     require_digest: bool | None = None
+    is_public: bool | None = None
     cache_artifacts: bool | None = None
     gitlab_project_id: str | None = None
     gitlab_group_id: str | None = None
@@ -403,6 +411,7 @@ def upstream_payload(upstream: Upstream) -> dict:
         "verify_ssl": upstream.verify_ssl,
         "name_patterns": upstream.name_patterns or [],
         "require_digest": upstream.require_digest,
+        "is_public": upstream_is_public(upstream),
         "cache_artifacts": upstream.cache_artifacts,
         "gitlab_project_id": upstream.gitlab_project_id,
         "gitlab_group_id": upstream.gitlab_group_id,
@@ -1108,8 +1117,29 @@ async def test_rule(
     does what they intended before it bites a CI job."""
     from ...core.naming import normalize_name_for
 
-    verdict = await PolicyEngine(session).evaluate(
-        ecosystem, normalize_name_for(ecosystem.value, name), version
+    normalized = normalize_name_for(ecosystem.value, name)
+    engine = PolicyEngine(session)
+    # A version this registry knows is tested with what it knows about it --
+    # its CVEs, malware flag and publication date -- so the answer matches
+    # what an install would get. An unknown version is tested on rules alone.
+    row = None
+    if version is not None:
+        row = (
+            await session.execute(
+                select(PackageVersion)
+                .join(Package, Package.id == PackageVersion.package_id)
+                .where(
+                    Package.ecosystem == ecosystem,
+                    Package.normalized_name == normalized,
+                    PackageVersion.version == version,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    verdict = (
+        await engine.evaluate_version(ecosystem, normalized, row)
+        if row is not None
+        else await engine.evaluate(ecosystem, normalized, version)
     )
     return {
         "allowed": verdict.allowed,
@@ -1129,6 +1159,12 @@ class CvePolicyUpdate(BaseModel):
     block_unscored: bool = False
     require_fix_available: bool = False
     block_malware: bool = True
+
+
+class ReleaseAgeUpdate(BaseModel):
+    enabled: bool = True
+    min_days: int = Field(default=3, ge=1, le=90)
+    exempt_security_fixes: bool = True
 
 
 class AllowlistModeUpdate(BaseModel):
@@ -1151,6 +1187,7 @@ async def get_settings_(session: AsyncSession = Depends(get_session)) -> dict:
     engine = PolicyEngine(session)
     return {
         "cve_policy": (await engine.get_cve_policy()).to_dict(),
+        "release_age": (await engine.get_release_age_policy()).to_dict(),
         "allowlist_mode": await engine.allowlist_mode(),
     }
 
@@ -1177,6 +1214,30 @@ async def update_cve_policy(
         actor_username=identity.username,
         target_type="setting",
         target_id=KEY_CVE_POLICY,
+        ip=client_ip(request),
+        detail=policy.to_dict(),
+    )
+    await session.commit()
+    await invalidate_policy_cache()
+    return policy.to_dict()
+
+
+@router.put("/settings/release-age")
+async def update_release_age(
+    payload: ReleaseAgeUpdate,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    identity: Identity = Depends(require_admin),
+) -> dict:
+    policy = ReleaseAgePolicy(**payload.model_dump())
+    await _write_setting(session, KEY_RELEASE_AGE, policy.to_dict(), identity)
+    await audit.record_audit(
+        session,
+        audit.SETTING_UPDATED,
+        actor_user_id=identity.user_id,
+        actor_username=identity.username,
+        target_type="setting",
+        target_id=KEY_RELEASE_AGE,
         ip=client_ip(request),
         detail=policy.to_dict(),
     )

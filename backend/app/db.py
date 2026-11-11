@@ -109,6 +109,7 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("package_versions", "has_advisories", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("package_versions", "is_malicious", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("docker_repo_manifests", "push_block_reason", "TEXT"),
+    ("upstreams", "is_public", "BOOLEAN"),
 ]
 
 # Backfills for the columns above, run after them on every start. Each must be
