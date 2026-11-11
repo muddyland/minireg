@@ -923,13 +923,23 @@ async def evict_to(target: int) -> dict:
     locally published file, and blobs read within ``EVICT_GRACE``, are never
     taken.
     """
-    store = get_store()
     async with session_scope() as session:
         used = await _stored_bytes(session)
-    cutoff = datetime.now(UTC) - EVICT_GRACE
+    evicted, freed = await _evict_blobs(
+        datetime.now(UTC) - EVICT_GRACE, lambda freed: used - freed > target
+    )
+    if evicted:
+        log.info("evicted %d cached artifacts (%d bytes) to stay under %d", evicted, freed, target)
+    return {"evicted": evicted, "freed_bytes": freed, "target": target}
+
+
+async def _evict_blobs(cutoff: datetime, more) -> tuple[int, int]:
+    """Evict cached upstream blobs last read before ``cutoff``, oldest
+    first, while ``more(freed_bytes)`` holds. Returns (evicted, freed)."""
+    store = get_store()
     evicted = freed = 0
     last: tuple | None = None
-    while used - freed > target:
+    while more(freed):
         victims: list[str] = []
         async with session_scope() as session:
             query = (
@@ -945,7 +955,7 @@ async def evict_to(target: int) -> dict:
                 break
             for sha, size, accessed in rows:
                 last = (accessed, sha)
-                if used - freed <= target:
+                if not more(freed):
                     break
                 # Lock and re-check: it may have been read, or a local file
                 # may have started sharing it, since the batch was selected.
@@ -975,9 +985,7 @@ async def evict_to(target: int) -> dict:
         for sha in victims:
             store.delete(sha)
         evicted += len(victims)
-    if evicted:
-        log.info("evicted %d cached artifacts (%d bytes) to stay under %d", evicted, freed, target)
-    return {"evicted": evicted, "freed_bytes": freed, "target": target}
+    return evicted, freed
 
 
 async def enforce_quota() -> dict:
@@ -1110,14 +1118,83 @@ async def disk_measurement(session: AsyncSession) -> dict | None:
     return row.value if row is not None and isinstance(row.value, dict) else None
 
 
+CACHE_EXPIRY_KEY = "cache_expiry"
+
+
+@dataclass(slots=True)
+class CacheExpiry:
+    """Drop cached copies nobody has downloaded for a while.
+
+    A cache that only ever grows fills the small disks minireg tends to run
+    on. An expired artifact keeps its metadata and is fetched from its
+    upstream again on the next request, so the cost of expiring something
+    still needed is one slower install. Files published to this registry
+    are never expired: there is nowhere to fetch them from. 0 turns a side
+    off. Container images follow ``images_unused_days`` the same way
+    (``docker.housekeeping``).
+    """
+
+    packages_unused_days: int = 90
+    images_unused_days: int = 90
+
+    def to_dict(self) -> dict:
+        return {
+            "packages_unused_days": self.packages_unused_days,
+            "images_unused_days": self.images_unused_days,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> CacheExpiry:
+        data = data or {}
+        return cls(
+            packages_unused_days=max(0, int(data.get("packages_unused_days", 90))),
+            images_unused_days=max(0, int(data.get("images_unused_days", 90))),
+        )
+
+
+async def load_cache_expiry(session: AsyncSession) -> CacheExpiry:
+    from ..models import Setting
+
+    row = await session.get(Setting, CACHE_EXPIRY_KEY)
+    return CacheExpiry.from_dict(row.value if row is not None else None)
+
+
+#: Blobs examined per housekeeping pass, so a first pass over a large cache
+#: cannot run for an hour; the next pass carries on.
+EXPIRE_MAX_PER_PASS = 20_000
+
+
+async def expire_unused(now: datetime | None = None) -> dict:
+    """Evict cached artifacts last downloaded more than the configured days
+    ago. Same rules as quota eviction: never a blob that backs a file
+    published here or one cached from a disabled upstream."""
+    async with session_scope() as session:
+        days = (await load_cache_expiry(session)).packages_unused_days
+    if not days:
+        return {"unused_days": 0}
+    cutoff = (now or datetime.now(UTC)) - timedelta(days=days)
+    count = {"n": 0}
+
+    def more(_freed: int) -> bool:
+        count["n"] += 1
+        return count["n"] <= EXPIRE_MAX_PER_PASS
+
+    expired, freed = await _evict_blobs(cutoff, more)
+    if expired:
+        log.info("expired %d cached artifacts (%d bytes) unused for %d days", expired, freed, days)
+    return {"expired": expired, "freed_bytes": freed, "unused_days": days}
+
+
 async def run_housekeeping() -> dict:
     """The artifact store's share of the hourly housekeeping pass."""
+    expired = await expire_unused()
     async with session_scope() as session:
         orphan_rows = await collect_orphan_blobs(session)
     orphan_files = await sweep_orphan_files()
     quota = await enforce_quota()
     tmp = get_store().cleanup_tmp()
     return {
+        "expired": expired,
         "orphan_blobs": orphan_rows,
         "orphan_files": orphan_files,
         "quota": quota,

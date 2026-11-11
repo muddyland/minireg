@@ -119,6 +119,8 @@ export const api = {
     request('/api/admin/settings/release-age', { method: 'PUT', body: payload }),
   updateNewPackages: (payload) =>
     request('/api/admin/settings/new-packages', { method: 'PUT', body: payload }),
+  updateCacheExpiry: (payload) =>
+    request('/api/admin/settings/cache-expiry', { method: 'PUT', body: payload }),
   updateAllowlistMode: (enabled) =>
     request('/api/admin/settings/allowlist-mode', { method: 'PUT', body: { enabled } }),
 

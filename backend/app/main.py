@@ -168,6 +168,7 @@ async def _artifact_task() -> None:
     result = await run_housekeeping()
     if (
         result["orphan_blobs"]
+        or result["expired"].get("expired")
         or result["orphan_files"]["files"]
         or result["quota"].get("evicted")
     ):

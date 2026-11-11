@@ -379,7 +379,7 @@ its current policy verdict) and image (repository, tags, platform, package
 inside, fixed version, last pull)
 
 **Settings** — `GET /api/admin/settings`,
-`PUT /api/admin/settings/cve-policy`, `PUT /api/admin/settings/release-age`, `PUT /api/admin/settings/new-packages`, `PUT /api/admin/settings/allowlist-mode`
+`PUT /api/admin/settings/cve-policy`, `PUT /api/admin/settings/release-age`, `PUT /api/admin/settings/new-packages`, `PUT /api/admin/settings/cache-expiry`, `PUT /api/admin/settings/allowlist-mode`
 
 **Stats** — `/api/admin/stats/overview`, `/top-packages`,
 `/downloads-timeline`, `/recent-logins`, `/storage`
