@@ -82,6 +82,13 @@ class TestPackagePageShowsVersionBlocks:
             assert versions[allowed]["block_reason"] is None
 
     async def test_unblocked_package_reports_every_version_allowed(self, widget):
+        # The CVE policy is on out of the box and would block 1.0.1 (9.8).
+        response = await widget.put(
+            "/api/admin/settings/cve-policy",
+            json={"enabled": False},
+            headers=auth(widget, "admin"),
+        )
+        assert response.status_code == 200
         response = await widget.get("/api/packages/npm/widget", headers=auth(widget, "reader"))
         assert response.status_code == 200
         assert not any(v["blocked"] for v in response.json()["versions"])

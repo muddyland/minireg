@@ -60,11 +60,12 @@ watch(
   },
 )
 const cve = ref({
-  enabled: false,
+  enabled: true,
   min_score: 7,
   max_score: 10,
   block_unscored: false,
   require_fix_available: false,
+  block_malware: true,
 })
 const allowlistMode = ref(false)
 
@@ -214,7 +215,7 @@ onMounted(load)
     <div class="grid grid-2 mb">
       <div class="card">
         <div class="card-head">
-          <h3>CVE score policy</h3>
+          <h3>CVE and malware policy</h3>
           <span class="badge" :class="cve.enabled ? 'badge-warn' : ''">
             {{ cve.enabled ? 'enforcing' : 'off' }}
           </span>
@@ -222,8 +223,16 @@ onMounted(load)
         <div class="card-body">
           <p class="dim small mb">
             Blocks any package version whose highest CVSS base score falls inside the range. Scores
-            come from OSV.dev. Malicious-package advisories are always scored critical, whatever
-            severity they carry.
+            come from OSV.dev. On by default for high and critical (7.0–10.0).
+          </p>
+
+          <label class="check">
+            <input v-model="cve.block_malware" type="checkbox" />
+            Block known malware
+          </label>
+          <p class="field-hint">
+            Refuses any version an OSV malicious-package advisory names. Independent of the score
+            policy below; leave it on unless this registry is for studying malware.
           </p>
 
           <label class="check mb">

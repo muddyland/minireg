@@ -650,8 +650,11 @@ class TestCvePolicy:
         # Outside the score range too: malware is not a severity question.
         await self._set_policy(min_score=4.0, max_score=6.9)
         assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 403
-        # The policy switch still governs it.
+        # Turning the score policy off does not serve malware...
         await self._set_policy(enabled=False)
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 403
+        # ...only the malware switch itself does.
+        await self._set_policy(enabled=False, block_malware=False)
         assert (await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")).status_code == 200
 
     async def _score_one_version(self, version, score):
@@ -667,6 +670,21 @@ class TestCvePolicy:
                 .where(PackageVersion.version == version)
                 .values(max_cvss=score, scanned_at=datetime.now(UTC))
             )
+
+    async def test_a_fresh_install_blocks_high_cves_without_any_setup(self, app_client):
+        # Nobody has opened the policy page: no setting row exists.
+        for version in ("1.0.0", "2.0.0"):
+            await app_client.put(
+                "/npm/test-pkg",
+                json=npm_publish_body(version=version),
+                headers=auth(app_client),
+            )
+        await self._score_one_version("1.0.0", 7.5)
+        await self._score_one_version("2.0.0", 6.5)
+        response = await app_client.get("/npm/test-pkg/-/test-pkg-1.0.0.tgz")
+        assert response.status_code == 403
+        assert "CVSS 7.5" in response.text
+        assert (await app_client.get("/npm/test-pkg/-/test-pkg-2.0.0.tgz")).status_code == 200
 
     async def test_only_affected_versions_are_hidden(self, app_client):
         # The realistic case: one bad version among several good ones.

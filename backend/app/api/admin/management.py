@@ -1123,11 +1123,12 @@ async def test_rule(
 # Settings
 # --------------------------------------------------------------------------- #
 class CvePolicyUpdate(BaseModel):
-    enabled: bool = False
+    enabled: bool = True
     min_score: float = Field(default=7.0, ge=0.0, le=10.0)
     max_score: float = Field(default=10.0, ge=0.0, le=10.0)
     block_unscored: bool = False
     require_fix_available: bool = False
+    block_malware: bool = True
 
 
 class AllowlistModeUpdate(BaseModel):

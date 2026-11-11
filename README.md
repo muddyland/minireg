@@ -87,6 +87,8 @@ documentation, matching the version actually running.
   scanned inline, before they are served. Malicious-package advisories
   (`MAL-*`) are always retained and scored critical, whatever the CVE-only
   filter is set to — npm and PyPI malware is rarely assigned a CVE.
+- **Safe out of the box.** Known malware and high/critical CVEs (7.0–10.0)
+  are refused from the first install, with no policy to write first.
 - **Blocks packages** by name glob, by version range, or by CVSS score range.
   Enforced on metadata, downloads, and publishes, without exception.
 - **Audits everything.** Every login and admin action is recorded; every
